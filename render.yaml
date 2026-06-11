@@ -1,0 +1,39 @@
+services:
+  - type: worker
+    name: flintel-worker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python index.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      - key: HUBSPOT_API_KEY
+        sync: false
+      - key: MONGODB_DB
+        value: fx_signals
+      - key: CLIENT_ID
+        value: settla
+      - key: MIN_SCORE_MEDIUM
+        value: 6
+      - key: MIN_SCORE_HIGH
+        value: 8
+      - key: BATCH_SIZE
+        value: 10
+      - key: BATCH_GAP_SECONDS
+        value: 30
+      - key: POLL_INTERVAL
+        value: 60
+      - key: REQUEST_DELAY
+        value: 6.0
+      - key: DAILY_DIGEST_HOUR
+        value: 8
+      - key: WEEKLY_REPORT_DAY
+        value: 0
+      - key: WEEKLY_REPORT_HOUR
+        value: 9
+      - key: REDDIT_USER_AGENT
+        value: FlintelSignalBot/5.1
