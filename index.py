@@ -86,32 +86,32 @@ log = logging.getLogger(__name__)
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-# Reddit — No credentials needed for JSON endpoints
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT")
+def _get(name: str, default=None, cast=str):
+    val = os.getenv(name, default)
+    if val is None:
+        raise RuntimeError(f"Required environment variable '{name}' is not set.")
+    try:
+        return cast(val)
+    except (ValueError, TypeError) as e:
+        raise RuntimeError(f"Env var '{name}' could not be cast to {cast.__name__}: {e}")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+REDDIT_USER_AGENT  = _get("REDDIT_USER_AGENT")
+ANTHROPIC_API_KEY  = _get("ANTHROPIC_API_KEY")
+MONGODB_URI        = _get("MONGODB_URI")
+MONGODB_DB         = _get("MONGODB_DB")
+SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL")   # optional
+HUBSPOT_API_KEY    = os.getenv("HUBSPOT_API_KEY")      # optional
+CLIENT_ID          = _get("CLIENT_ID")
 
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DB  = os.getenv("MONGODB_DB")
-
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
-
-MIN_SCORE_MEDIUM   = int(os.getenv("MIN_SCORE_MEDIUM"))
-MIN_SCORE_HIGH     = int(os.getenv("MIN_SCORE_HIGH"))
-CLIENT_ID          = os.getenv("CLIENT_ID")
-
-# Batch settings
-BATCH_SIZE         = int(os.getenv("BATCH_SIZE"))
-BATCH_GAP_SECONDS  = int(os.getenv("BATCH_GAP_SECONDS"))
-
-# Reddit JSON polling settings
-POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL"))   # seconds between full cycles
-REQUEST_DELAY      = float(os.getenv("REQUEST_DELAY"))  # seconds between each subreddit request (safe for 10/min)
-
-DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR"))
-WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY"))   # 0 = Monday
-WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR"))
+MIN_SCORE_MEDIUM   = _get("MIN_SCORE_MEDIUM",   "6",  int)
+MIN_SCORE_HIGH     = _get("MIN_SCORE_HIGH",     "8",  int)
+BATCH_SIZE         = _get("BATCH_SIZE",         "10", int)
+BATCH_GAP_SECONDS  = _get("BATCH_GAP_SECONDS",  "30", int)
+POLL_INTERVAL      = _get("POLL_INTERVAL",      "60", int)
+REQUEST_DELAY      = _get("REQUEST_DELAY",       "6",  float)
+DAILY_DIGEST_HOUR  = _get("DAILY_DIGEST_HOUR",  "8",  int)
+WEEKLY_REPORT_DAY  = _get("WEEKLY_REPORT_DAY",  "0",  int)
+WEEKLY_REPORT_HOUR = _get("WEEKLY_REPORT_HOUR", "9",  int)
 
 # ─────────────────────────────────────────────
 # TARGET SUBREDDITS
