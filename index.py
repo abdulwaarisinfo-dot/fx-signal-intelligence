@@ -1,7 +1,7 @@
 """
 FX Signal Intelligence System — FLINTEL v6.0
 =============================================
-Platform : Reddit via Apify (reddit-scraper actor)
+Platform : Reddit via Apify (reddit-scraper actor) 
 Pipeline :
   Apify Reddit Scraper (Posts + Comments + Replies)
       → Keyword Pre-Filter        (free, fast — blocks 80%+ noise)
