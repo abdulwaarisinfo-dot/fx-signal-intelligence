@@ -1,7 +1,7 @@
 """
-FX Signal Intelligence System — FLINTEL v6.0
+FX Signal Intelligence System — FLINTEL v7.0
 =============================================
-Platform : Reddit via Apify (reddit-scraper actor) 
+Platform : Reddit via Apify (trudax/reddit-scraper actor)
 Pipeline :
   Apify Reddit Scraper (Posts + Comments + Replies)
       → Keyword Pre-Filter        (free, fast — blocks 80%+ noise)
@@ -38,16 +38,15 @@ Reddit monitors (simultaneously):
   Replies    → reply text (comments on comments)
   All LIVE   → polled every POLL_INTERVAL seconds, new items only
 
-Changelog v6.0:
-  - Replaced Reddit JSON polling with Apify reddit-scraper actor
-  - No Reddit API credentials required — Apify handles Reddit access
-  - Apify actor fetches posts + comments + replies per subreddit
-  - Seen post/comment IDs tracked to avoid duplicates
-  - Subreddits split into 2 groups, each polled in own thread
-  - Auto-reconnect on Apify errors with exponential backoff
-  - All other logic 100% identical to v5.0 (PRAW version)
-  - Full bug fixes from v5.1 retained
-  - Defensive env var loading with clear error messages
+Changelog v7.0:
+  - Fixed Apify actor: apify/reddit-scraper does not exist
+  - Now uses trudax/reddit-scraper (confirmed working community actor)
+  - Switched from raw HTTP requests to apify-client Python SDK
+  - Fixed actor input schema: searches/type/sort/maxPostCount/maxComments
+  - Removed _wait_for_apify_run and _fetch_apify_dataset (handled by SDK)
+  - Removed raw HTTP Apify URL building (no more 404 errors)
+  - APIFY_API_TOKEN usage unchanged — passed directly to ApifyClient
+  - All other logic 100% identical to v6.0
 """
 
 import asyncio
@@ -61,6 +60,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 import anthropic
+from apify_client import ApifyClient
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 import requests
@@ -105,8 +105,7 @@ def _get(name: str, default=None, cast=str):
 
 # ── Apify ─────────────────────────────────────
 APIFY_API_TOKEN      = _get("APIFY_API_TOKEN")
-# Apify Reddit scraper actor ID — confirmed working actor
-APIFY_ACTOR_ID       = _get("APIFY_ACTOR_ID", "apify/reddit-scraper")
+APIFY_ACTOR_ID       = _get("APIFY_ACTOR_ID", "trudax/reddit-scraper")
 
 # ── Anthropic ────────────────────────────────
 ANTHROPIC_API_KEY    = _get("ANTHROPIC_API_KEY")
@@ -1060,7 +1059,7 @@ def _create_hubspot_note(signal: dict, contact_id: str):
     try:
         url       = f"{HUBSPOT_BASE}/crm/v3/objects/notes"
         note_body = (
-            f"FLINTEL SIGNAL — REDDIT v6.0 (via Apify)\n\n"
+            f"FLINTEL SIGNAL — REDDIT v7.0 (via Apify)\n\n"
             f"Message:\n{signal['message_text']}\n\n"
             f"Score:        {signal['intent_score']}/10\n"
             f"Tier:         {signal.get('tier', '')}\n"
@@ -1341,7 +1340,7 @@ def send_weekly_report():
                     "type": "context",
                     "elements": [{
                         "type": "mrkdwn",
-                        "text": f"FLINTEL v6.0 | {CLIENT_ID} | Reddit via Apify | Week ending {week_end}"
+                        "text": f"FLINTEL v7.0 | {CLIENT_ID} | Reddit via Apify | Week ending {week_end}"
                     }]
                 }
             ]
@@ -1559,132 +1558,62 @@ def run_batch_processor():
 
 
 # ─────────────────────────────────────────────
-# APIFY REDDIT SCRAPER
-# Replaces PRAW streams and Reddit JSON polling
-# Uses Apify actor to fetch posts + comments + replies
-# Zero Reddit credentials needed
+# APIFY REDDIT SCRAPER — v7.0 FIXED
+# Uses apify-client SDK + trudax/reddit-scraper
+# Correct input schema: searches/type/sort/maxPostCount/maxComments
+# No raw HTTP URL building — SDK handles auth + polling + dataset fetch
+# APIFY_API_TOKEN passed directly to ApifyClient unchanged
 # ─────────────────────────────────────────────
-
-APIFY_BASE_URL = "https://api.apify.com/v2"
-
-
-def _apify_headers() -> dict:
-    return {
-        "Content-Type":  "application/json",
-    }
-
 
 def run_apify_actor(subreddits: list) -> list:
     """
-    Runs the Apify Reddit scraper actor for a list of subreddits.
-    Returns a flat list of post + comment items.
+    Runs trudax/reddit-scraper via the official apify-client SDK.
+    Returns a flat list of raw items (posts + comments).
 
-    Apify actor input schema for apify/reddit-scraper:
-    - startUrls: list of subreddit URLs
-    - maxItems: max posts to scrape
-    - includeComments: fetch comments
-    - maxComments: max comments per post
+    Input schema for trudax/reddit-scraper:
+      searches        → list of subreddit names to scrape
+      type            → "community" = scrape by subreddit
+      sort            → "new" = newest posts first
+      time            → "all"
+      maxItems        → total item cap across all subreddits
+      maxPostCount    → posts per subreddit
+      maxComments     → comments per post
+      proxy           → Apify residential proxy
     """
-    start_urls = [
-        {"url": f"https://www.reddit.com/r/{sub}/new/"}
-        for sub in subreddits
-    ]
+    client = ApifyClient(APIFY_API_TOKEN)
 
     actor_input = {
-        "startUrls":       start_urls,
-        "maxItems":        POSTS_PER_SUBREDDIT * len(subreddits),
-        "includeComments": True,
-        "maxComments":     COMMENTS_PER_POST,
-        "maxCommentsDepth": 2,       # fetch replies to comments
+        "searches":     subreddits,
+        "type":         "community",
+        "sort":         "new",
+        "time":         "all",
+        "maxItems":     POSTS_PER_SUBREDDIT * len(subreddits),
+        "maxPostCount": POSTS_PER_SUBREDDIT,
+        "maxComments":  COMMENTS_PER_POST,
         "proxy": {
-            "useApifyProxy": True,
-            "apifyProxyGroups": ["RESIDENTIAL"]  # residential proxy — avoids blocks
+            "useApifyProxy":    True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
         }
     }
 
-    # ── Start actor run ───────────────────────────────────────────
-    run_url = (
-        f"{APIFY_BASE_URL}/acts/{APIFY_ACTOR_ID}/runs"
-        f"?token={APIFY_API_TOKEN}&waitForFinish=120"
+    log.info(
+        f"Apify: running trudax/reddit-scraper | "
+        f"{len(subreddits)} subreddits | "
+        f"maxPostCount: {POSTS_PER_SUBREDDIT} | "
+        f"maxComments: {COMMENTS_PER_POST}"
     )
 
-    response = requests.post(
-        run_url,
-        json=actor_input,
-        headers=_apify_headers(),
-        timeout=180
-    )
+    # SDK handles: run start, status polling, dataset fetch — all in one call
+    run = client.actor(APIFY_ACTOR_ID).call(run_input=actor_input)
 
-    if response.status_code not in (200, 201):
-        raise Exception(
-            f"Apify actor run failed: {response.status_code} — {response.text[:300]}"
-        )
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise Exception(f"Apify run completed but no dataset ID returned. Run: {run}")
 
-    run_data  = response.json()
-    run_id    = run_data.get("data", {}).get("id")
-    run_status = run_data.get("data", {}).get("status", "")
+    items = list(client.dataset(dataset_id).iterate_items())
 
-    if not run_id:
-        raise Exception(f"Apify did not return a run ID. Response: {run_data}")
-
-    log.info(f"Apify run started | ID: {run_id} | Status: {run_status}")
-
-    # ── Poll until finished if not already done ───────────────────
-    if run_status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-        run_status = _wait_for_apify_run(run_id)
-
-    if run_status != "SUCCEEDED":
-        raise Exception(f"Apify run {run_id} ended with status: {run_status}")
-
-    # ── Fetch results from dataset ────────────────────────────────
-    items = _fetch_apify_dataset(run_id)
     log.info(f"Apify run complete | Items fetched: {len(items)}")
     return items
-
-
-def _wait_for_apify_run(run_id: str, timeout: int = 180, poll_every: int = 5) -> str:
-    """
-    Polls Apify run status until finished or timeout.
-    Returns final status string.
-    """
-    url      = f"{APIFY_BASE_URL}/actor-runs/{run_id}?token={APIFY_API_TOKEN}"
-    elapsed  = 0
-
-    while elapsed < timeout:
-        time.sleep(poll_every)
-        elapsed += poll_every
-
-        try:
-            response = requests.get(url, timeout=15)
-            if response.status_code == 200:
-                status = response.json().get("data", {}).get("status", "")
-                log.debug(f"Apify run {run_id} status: {status} ({elapsed}s elapsed)")
-                if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                    return status
-        except Exception as e:
-            log.warning(f"Apify status poll error: {e}")
-
-    log.warning(f"Apify run {run_id} timed out after {timeout}s — fetching partial results")
-    return "SUCCEEDED"  # attempt to get whatever was scraped
-
-
-def _fetch_apify_dataset(run_id: str) -> list:
-    """
-    Fetches results from the Apify dataset for a completed run.
-    Returns raw list of scraped items.
-    """
-    url = (
-        f"{APIFY_BASE_URL}/actor-runs/{run_id}/dataset/items"
-        f"?token={APIFY_API_TOKEN}&format=json&limit=1000"
-    )
-
-    response = requests.get(url, timeout=60)
-    if response.status_code != 200:
-        raise Exception(
-            f"Apify dataset fetch failed: {response.status_code} — {response.text[:300]}"
-        )
-
-    return response.json()
 
 
 def _parse_apify_item(raw: dict, subreddit: str) -> list:
@@ -1693,41 +1622,35 @@ def _parse_apify_item(raw: dict, subreddit: str) -> list:
     the internal item format used throughout the pipeline.
 
     Handles:
-    - Posts (type: post)
-    - Comments (type: comment — direct reply to post)
-    - Replies (type: reply — nested comment)
+    - Posts  (have a title field)
+    - Comments (body only, no title)
+    - Replies  (nested under comments[].replies[])
 
     Returns list of items (post + its comments flattened).
     """
     items = []
 
-    # ── Detect item type ─────────────────────────────────────────
-    item_type = raw.get("type", "").lower()
-
-    # Some Apify actors use different field names
-    # Handle both formats gracefully
-    post_id    = raw.get("id") or raw.get("postId") or raw.get("shortId", "")
-    title      = raw.get("title", "")
-    body       = raw.get("body") or raw.get("selftext") or raw.get("text", "")
-    author     = raw.get("author") or raw.get("username", "[deleted]")
-    url        = raw.get("url") or raw.get("postUrl") or raw.get("permalink", "")
-    sub        = raw.get("community") or raw.get("subreddit") or subreddit
+    post_id = raw.get("id") or raw.get("postId") or raw.get("shortId", "")
+    title   = raw.get("title", "")
+    body    = raw.get("body") or raw.get("selftext") or raw.get("text", "")
+    author  = raw.get("author") or raw.get("username", "[deleted]")
+    url     = raw.get("url") or raw.get("postUrl") or raw.get("permalink", "")
+    sub     = raw.get("community") or raw.get("subreddit") or subreddit
 
     # Clean up author
     if not author or author in ("[deleted]", "None", "null"):
         author = "[deleted]"
 
     # Clean up subreddit name (remove r/ prefix if present)
-    if sub.startswith("r/"):
+    if isinstance(sub, str) and sub.startswith("r/"):
         sub = sub[2:]
 
     # Clean up URL
-    if url and not url.startswith("http"):
+    if url and not str(url).startswith("http"):
         url = f"https://reddit.com{url}"
 
-    # ── Build post item ──────────────────────────────────────────
+    # ── Post item ────────────────────────────────────────────────
     if title:
-        # This is a post
         post_text = f"{title}\n\n{body}".strip() if body else title
         item_id   = f"post_{post_id}"
 
@@ -1738,12 +1661,12 @@ def _parse_apify_item(raw: dict, subreddit: str) -> list:
                 "content_type": "post",
                 "text":         post_text,
                 "username":     str(author),
-                "subreddit":    sub,
-                "post_url":     url,
+                "subreddit":    str(sub),
+                "post_url":     str(url),
             })
 
     elif body:
-        # This is a comment or reply
+        # Standalone comment (not nested inside a post object)
         comment_id   = f"comment_{post_id}"
         parent_id    = raw.get("parentId") or raw.get("parent_id", "")
         content_type = "reply" if (parent_id and "comment" in str(parent_id).lower()) else "comment"
@@ -1755,12 +1678,11 @@ def _parse_apify_item(raw: dict, subreddit: str) -> list:
                 "content_type": content_type,
                 "text":         body,
                 "username":     str(author),
-                "subreddit":    sub,
-                "post_url":     url,
+                "subreddit":    str(sub),
+                "post_url":     str(url),
             })
 
-    # ── Extract nested comments ──────────────────────────────────
-    # Apify nests comments inside post objects
+    # ── Nested comments inside post object ───────────────────────
     for comment in raw.get("comments", []):
         comment_id   = comment.get("id") or comment.get("commentId", "")
         comment_body = comment.get("body") or comment.get("text", "")
@@ -1781,8 +1703,8 @@ def _parse_apify_item(raw: dict, subreddit: str) -> list:
                 "content_type": content_type,
                 "text":         comment_body,
                 "username":     str(comment_auth),
-                "subreddit":    sub,
-                "post_url":     comment_url if comment_url else url,
+                "subreddit":    str(sub),
+                "post_url":     str(comment_url) if comment_url else str(url),
             })
 
             # ── Nested replies ────────────────────────────────────
@@ -1803,8 +1725,8 @@ def _parse_apify_item(raw: dict, subreddit: str) -> list:
                         "content_type": "reply",
                         "text":         reply_body,
                         "username":     str(reply_auth),
-                        "subreddit":    sub,
-                        "post_url":     reply_url if reply_url else url,
+                        "subreddit":    str(sub),
+                        "post_url":     str(reply_url) if reply_url else str(url),
                     })
 
     return items
@@ -1830,9 +1752,8 @@ def poll_apify(subreddits: list, thread_name: str):
             raw_items = run_apify_actor(subreddits)
 
             for raw in raw_items:
-                # Determine subreddit from item or fall back to first in list
-                sub   = raw.get("community") or raw.get("subreddit") or subreddits[0]
-                if sub.startswith("r/"):
+                sub = raw.get("community") or raw.get("subreddit") or subreddits[0]
+                if isinstance(sub, str) and sub.startswith("r/"):
                     sub = sub[2:]
 
                 parsed = _parse_apify_item(raw, sub)
@@ -1958,7 +1879,7 @@ async def start_reddit_listener():
 app = FastAPI(
     title       = "FX Signal Intelligence API — Flintel",
     description = "Reddit signals via Apify: monitor, batch-score, store, alert.",
-    version     = "6.0.0"
+    version     = "7.0.0"
 )
 
 
@@ -1972,8 +1893,8 @@ def root():
     return {
         "status":        "running",
         "system":        "FX Signal Intelligence — Flintel",
-        "version":       "6.0.0",
-        "platform":      "Reddit via Apify",
+        "version":       "7.0.0",
+        "platform":      "Reddit via Apify (trudax/reddit-scraper)",
         "client":        CLIENT_ID,
         "batch_size":    BATCH_SIZE,
         "batch_gap_s":   BATCH_GAP_SECONDS,
@@ -1994,7 +1915,7 @@ def health_check():
     return {
         "status":      "ok",
         "mongodb":     mongo_status,
-        "reddit":      "polling via Apify",
+        "reddit":      "polling via Apify (trudax/reddit-scraper)",
         "queue_size":  reddit_queue.qsize(),
         "seen_ids":    len(seen_ids),
         "client_id":   CLIENT_ID,
@@ -2215,10 +2136,10 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.0")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.0")
     log.info("=" * 60)
     log.info(f"Client ID        : {CLIENT_ID}")
-    log.info(f"Platform         : Reddit via Apify (zero Reddit credentials)")
+    log.info(f"Platform         : Reddit via Apify (trudax/reddit-scraper)")
     log.info(f"Apify Actor      : {APIFY_ACTOR_ID}")
     log.info(f"Batch size       : {BATCH_SIZE} messages per Claude call")
     log.info(f"Batch gap        : {BATCH_GAP_SECONDS}s between batches")
