@@ -3,37 +3,75 @@ services:
     name: flintel-worker
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python index.py
+    startCommand: python main.py
     envVars:
+
+      # ── Anthropic ─────────────────────────────
       - key: ANTHROPIC_API_KEY
         sync: false
+
+      # ── Reddit ────────────────────────────────
+      - key: REDDIT_CLIENT_ID
+        sync: false
+      - key: REDDIT_CLIENT_SECRET
+        sync: false
+      - key: REDDIT_USERNAME
+        sync: false
+      - key: REDDIT_PASSWORD
+        sync: false
+      - key: REDDIT_USER_AGENT
+        value: FlintelSignalBot/6.0
+
+      # ── Twitter / X ───────────────────────────
+      - key: TWITTER_API_KEY
+        sync: false
+      - key: TWITTER_API_SECRET
+        sync: false
+      - key: TWITTER_BEARER_TOKEN
+        sync: false
+      - key: TWITTER_ACCESS_TOKEN
+        sync: false
+      - key: TWITTER_ACCESS_TOKEN_SECRET
+        sync: false
+
+      # ── MongoDB ───────────────────────────────
       - key: MONGODB_URI
         sync: false
+      - key: MONGODB_DB
+        value: fx_signals
+
+      # ── Delivery ──────────────────────────────
       - key: SLACK_WEBHOOK_URL
         sync: false
       - key: HUBSPOT_API_KEY
         sync: false
-      - key: MONGODB_DB
-        value: fx_signals
+
+      # ── Client ────────────────────────────────
       - key: CLIENT_ID
         value: settla
+
+      # ── Score thresholds ──────────────────────
       - key: MIN_SCORE_MEDIUM
-        value: 6
+        value: "6"
       - key: MIN_SCORE_HIGH
-        value: 8
-      - key: BATCH_SIZE
-        value: 10
+        value: "8"
+
+      # ── Batch settings ────────────────────────
+      - key: REDDIT_BATCH_SIZE
+        value: "10"
+      - key: TWITTER_BATCH_SIZE
+        value: "50"
       - key: BATCH_GAP_SECONDS
-        value: 30
-      - key: POLL_INTERVAL
-        value: 60
-      - key: REQUEST_DELAY
-        value: 6.0
+        value: "30"
+
+      # ── Twitter polling ───────────────────────
+      - key: TWITTER_POLL_INTERVAL
+        value: "60"
+
+      # ── Schedulers ────────────────────────────
       - key: DAILY_DIGEST_HOUR
-        value: 8
+        value: "8"
       - key: WEEKLY_REPORT_DAY
-        value: 0
+        value: "0"
       - key: WEEKLY_REPORT_HOUR
-        value: 9
-      - key: REDDIT_USER_AGENT
-        value: FlintelSignalBot/5.1
+        value: "9"
