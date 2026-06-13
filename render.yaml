@@ -67,6 +67,10 @@ services:
       # ── Twitter polling ───────────────────────
       - key: TWITTER_POLL_INTERVAL
         value: "60"
+      # Set to "true" only if you have Twitter Basic plan ($100/mo)
+      # Free tier: uses mentions timeline only (default: false)
+      - key: TWITTER_USE_SEARCH
+        value: "false"
 
       # ── Schedulers ────────────────────────────
       - key: DAILY_DIGEST_HOUR
