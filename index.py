@@ -125,8 +125,7 @@ REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.0")
 TWITTER_API_KEY            = os.getenv("TWITTER_API_KEY")            # Customer Key
 TWITTER_API_SECRET         = os.getenv("TWITTER_API_SECRET")         # Customer Secret
 TWITTER_BEARER_TOKEN       = os.getenv("TWITTER_BEARER_TOKEN")       # Bearer Token
-TWITTER_ACCESS_TOKEN       = os.getenv("TWITTER_ACCESS_TOKEN")       # Access Token
-TWITTER_ACCESS_TOKEN_SECRET= os.getenv("TWITTER_ACCESS_TOKEN_SECRET")# Access Token Secret
+
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -1134,46 +1133,16 @@ def run_batch_processor(
 # REDDIT STREAMS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_reddit_client() -> praw.Reddit | None:
-    """
-    Builds and validates the Reddit client.
-    Returns None (does not raise) if credentials are missing or invalid.
-    All required env vars must be set; if any is missing, Reddit is disabled
-    cleanly so the rest of the system keeps running.
-    """
-    missing = [
-        name for name, val in [
-            ("REDDIT_CLIENT_ID",     REDDIT_CLIENT_ID),
-            ("REDDIT_CLIENT_SECRET", REDDIT_CLIENT_SECRET),
-            ("REDDIT_USERNAME",      REDDIT_USERNAME),
-            ("REDDIT_PASSWORD",      REDDIT_PASSWORD),
-        ] if not val
-    ]
-    if missing:
-        log.warning(
-            f"Reddit DISABLED — missing env vars: {', '.join(missing)}. "
-            f"Set them in Render → Environment to enable Reddit monitoring."
-        )
-        return None
-
-    try:
-        r = praw.Reddit(
-            client_id     = REDDIT_CLIENT_ID,
-            client_secret = REDDIT_CLIENT_SECRET,
-            username      = REDDIT_USERNAME,
-            password      = REDDIT_PASSWORD,
-            user_agent    = REDDIT_USER_AGENT,
-        )
-        # Validate credentials with a lightweight API call
-        _ = r.user.me()
-        log.info(f"Reddit authenticated as u/{REDDIT_USERNAME}")
-        return r
-    except praw.exceptions.PRAWException as exc:
-        log.error(f"Reddit auth failed: {exc} — Reddit disabled.")
-        return None
-    except Exception as exc:
-        log.error(f"Reddit client error: {exc} — Reddit disabled.")
-        return None
+def build_reddit_client() -> praw.Reddit:
+    r = praw.Reddit(
+        client_id     = REDDIT_CLIENT_ID,
+        client_secret = REDDIT_CLIENT_SECRET,
+        username      = REDDIT_USERNAME,
+        password      = REDDIT_PASSWORD,
+        user_agent    = REDDIT_USER_AGENT,
+    )
+    log.info(f"Reddit authenticated as u/{REDDIT_USERNAME}")
+    return r
 
 
 def stream_posts(reddit: praw.Reddit):
@@ -1276,8 +1245,6 @@ def build_twitter_client() -> tweepy.Client | None:
             bearer_token        = TWITTER_BEARER_TOKEN,
             consumer_key        = TWITTER_API_KEY,
             consumer_secret     = TWITTER_API_SECRET,
-            access_token        = TWITTER_ACCESS_TOKEN,
-            access_token_secret = TWITTER_ACCESS_TOKEN_SECRET,
             wait_on_rate_limit  = True,   # tweepy handles rate limiting automatically
         )
         log.info("Twitter/X client initialised.")
@@ -1289,101 +1256,52 @@ def build_twitter_client() -> tweepy.Client | None:
 
 def poll_twitter(client: tweepy.Client):
     """
-    Polls Twitter using get_recent_tweets_count-free endpoints only.
-
-    FREE TIER strategy (no search_recent_tweets — that requires Basic $100/mo):
-      — get_users_mentions()  : tweets that mention your @account (free)
-      — Falls back cleanly if 402/403 with a clear log message
-
-    If you upgrade to Twitter Basic or Pro tier, set:
-      TWITTER_USE_SEARCH=true
-    in your Render env vars to re-enable search_recent_tweets.
-
-    Free tier gives: 500k tweet reads/month, mentions timeline, home timeline.
-    Basic tier gives: search_recent_tweets (50 results/request).
+    Polls Twitter search every TWITTER_POLL_INTERVAL seconds.
+    Fetches up to 50 tweets per poll. Deduplicates by tweet ID.
+    Pushes unique, keyword-matching tweets to twitter_queue.
+    Rate-limit: wait_on_rate_limit=True in tweepy client — safe by default.
     """
-    use_search  = os.getenv("TWITTER_USE_SEARCH", "false").lower() == "true"
     seen_ids: set = set()
-    disabled      = False
-
-    log.info(
-        f"Twitter poll started | mode:{'search' if use_search else 'mentions'} | "
-        f"{'⚠️  search_recent_tweets requires Twitter Basic ($100/mo)' if not use_search else 'search enabled'}"
-    )
-
-    # Resolve our own user ID once (needed for mentions endpoint)
-    own_user_id: str | None = None
-    if not use_search:
-        try:
-            me = client.get_me()
-            if me and me.data:
-                own_user_id = str(me.data.id)
-                log.info(f"Twitter: own user ID resolved → {own_user_id}")
-            else:
-                log.error("Twitter: could not resolve own user ID — mentions disabled.")
-                disabled = True
-        except Exception as exc:
-            log.error(f"Twitter: get_me() failed: {exc} — mentions disabled.")
-            disabled = True
+    log.info("Twitter poll started.")
 
     while True:
-        if disabled:
-            # Sit idle — do not spam errors every 60s
-            time.sleep(3600)
-            continue
-
         try:
-            tweets = []
+            response = client.search_recent_tweets(
+                query           = TWITTER_SEARCH_QUERY,
+                max_results     = 50,             # 50 per block as required
+                tweet_fields    = ["author_id", "created_at", "text", "conversation_id"],
+                expansions      = ["author_id"],
+                user_fields     = ["username", "name"],
+            )
 
-            if use_search:
-                # ── SEARCH (Basic / Pro tier) ──────────────────────────────
-                response = client.search_recent_tweets(
-                    query       = TWITTER_SEARCH_QUERY,
-                    max_results = 50,
-                    tweet_fields= ["author_id", "created_at", "text"],
-                    expansions  = ["author_id"],
-                    user_fields = ["username"],
-                )
-                user_map: dict = {}
-                if response.includes and "users" in response.includes:
-                    for u in response.includes["users"]:
-                        user_map[u.id] = u.username
-                if response.data:
-                    for t in response.data:
-                        tweets.append((str(t.id), t.text or "", user_map.get(t.author_id, f"user_{t.author_id}")))
+            if not response or not response.data:
+                log.debug("Twitter: no results this cycle.")
+                time.sleep(TWITTER_POLL_INTERVAL)
+                continue
 
-            else:
-                # ── MENTIONS TIMELINE (Free tier) ──────────────────────────
-                # Returns tweets that mention @youraccount — up to 5 per request on free tier
-                # This is the only read endpoint available on free tier
-                if not own_user_id:
-                    time.sleep(TWITTER_POLL_INTERVAL)
-                    continue
+            # Build author_id → username map from includes
+            user_map: dict = {}
+            if response.includes and "users" in response.includes:
+                for u in response.includes["users"]:
+                    user_map[u.id] = u.username
 
-                response = client.get_users_mentions(
-                    id           = own_user_id,
-                    max_results  = 50,
-                    tweet_fields = ["author_id", "created_at", "text"],
-                    expansions   = ["author_id"],
-                    user_fields  = ["username"],
-                )
-                user_map = {}
-                if response.includes and "users" in response.includes:
-                    for u in response.includes["users"]:
-                        user_map[u.id] = u.username
-                if response.data:
-                    for t in response.data:
-                        tweets.append((str(t.id), t.text or "", user_map.get(t.author_id, f"user_{t.author_id}")))
-
-            # ── Deduplicate + enqueue ──────────────────────────────────────
             new_count = 0
-            for tweet_id, text, username in tweets:
+            for tweet in response.data:
+                tweet_id = str(tweet.id)
+
+                # Deduplicate
                 if tweet_id in seen_ids:
                     continue
                 seen_ids.add(tweet_id)
+
+                # Cap seen_ids memory usage
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
+                text     = tweet.text or ""
+                username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
+
+                # Only enqueue — keyword filter runs in batch processor
                 twitter_queue.put({
                     "message_id":   f"twitter_{tweet_id}",
                     "platform":     "twitter",
@@ -1396,37 +1314,10 @@ def poll_twitter(client: tweepy.Client):
                 new_count += 1
 
             if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue:{twitter_queue.qsize()}")
-            else:
-                log.debug("Twitter: no new tweets this cycle.")
-
-        except tweepy.errors.Forbidden as exc:
-            # 403 — endpoint not available on your plan
-            log.error(
-                f"Twitter 403 Forbidden: {exc}\n"
-                f"  → Your Twitter app does not have permission for this endpoint.\n"
-                f"  → Free tier only supports mentions timeline.\n"
-                f"  → Set TWITTER_USE_SEARCH=false in Render env vars.\n"
-                f"  → Twitter monitoring paused for 1 hour."
-            )
-            time.sleep(3600)
-
-        except tweepy.errors.PaymentRequired as exc:
-            # 402 — Free tier account has no search credits
-            log.error(
-                f"Twitter 402 Payment Required: {exc}\n"
-                f"  → search_recent_tweets requires Twitter Basic plan ($100/mo).\n"
-                f"  → To fix: set TWITTER_USE_SEARCH=false in Render env vars\n"
-                f"    to use mentions timeline instead (free).\n"
-                f"  → OR upgrade your Twitter developer account to Basic plan.\n"
-                f"  → Twitter monitoring disabled for this session."
-            )
-            disabled = True
-            continue
+                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
 
         except tweepy.errors.TweepyException as exc:
             log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
-
         except Exception as exc:
             log.error(f"Twitter unexpected error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
 
@@ -1596,11 +1487,6 @@ async def run_scheduler():
 
 async def start_reddit_listener():
     reddit = build_reddit_client()
-    if reddit is None:
-        log.warning("Reddit listener not started — credentials missing or invalid.")
-        # Keep coroutine alive so asyncio.gather doesn't lose it
-        while True:
-            await asyncio.sleep(300)
 
     post_thread = threading.Thread(target=stream_posts,    args=(reddit,), daemon=True, name="Reddit-Posts")
     cmnt_thread = threading.Thread(target=stream_comments, args=(reddit,), daemon=True, name="Reddit-Comments")
@@ -1920,9 +1806,8 @@ if __name__ == "__main__":
     log.info(f"  Subreddits       : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Keywords         : {len(KEYWORDS)} filters active")
     log.info(f"  MongoDB          : {MONGODB_DB}")
-    log.info(f"  Reddit account   : u/{REDDIT_USERNAME or 'NOT SET — Reddit disabled'}")
-    twitter_mode = "search (Basic/Pro tier)" if os.getenv("TWITTER_USE_SEARCH","false").lower()=="true" else "mentions timeline (Free tier)"
-    log.info(f"  Twitter          : {'enabled — mode: ' + twitter_mode if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
+    log.info(f"  Reddit account   : u/{REDDIT_USERNAME}")
+    log.info(f"  Twitter          : {'enabled' if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
     log.info(f"  HubSpot          : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack            : {'enabled' if SLACK_WEBHOOK_URL else 'DISABLED — set SLACK_WEBHOOK_URL'}")
     log.info("=" * 65)
