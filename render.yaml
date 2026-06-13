@@ -29,11 +29,7 @@ services:
         sync: false
       - key: TWITTER_BEARER_TOKEN
         sync: false
-      - key: TWITTER_ACCESS_TOKEN
-        sync: false
-      - key: TWITTER_ACCESS_TOKEN_SECRET
-        sync: false
-
+ 
       # ── MongoDB ───────────────────────────────
       - key: MONGODB_URI
         sync: false
