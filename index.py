@@ -1,5 +1,5 @@
 """
-FX Signal Intelligence System — FLINTEL v6.0
+FX Signal Intelligence System — FLINTEL v6.1
 =============================================
 Platforms : Reddit (PRAW) + Twitter/X (tweepy v2)
 Pipeline  :
@@ -7,6 +7,8 @@ Pipeline  :
   Twitter → Fetch mentions / search / replies (rate-limit safe, 50/block)
       ↓
   Keyword Pre-Filter        (free, fast — drops 80%+ noise)
+      ↓
+  Persistent Queue (MongoDB)  ← NEW v6.1 — restart-safe, no item loss
       ↓
   Batch Collector           (10 items per Claude call — Reddit)
                             (50 items per Claude call — Twitter)
@@ -47,6 +49,22 @@ Twitter batch rules:
   → 50 matched items → one Claude prompt
   → 30s gap between batches
   → Unknown / irrelevant content never reaches Claude
+
+Changelog v6.1:
+  - NEW: Persistent MongoDB-backed queue (db.pending_items collection)
+    Every keyword-matched item is persisted to MongoDB the moment it is
+    queued (status="pending"). Items are only marked status="done" (and
+    removed) AFTER they have been successfully scored by Claude and
+    processed by process_scored_item.
+  - NEW: On startup, load_pending_items_from_db() re-loads any items left
+    in status="pending" (from a crash/update/restart mid-batch) back into
+    the in-memory queues BEFORE the live streams start. Nothing queued is
+    ever lost on restart/update, even mid-batch.
+  - NEW: db.pending_items indexes on platform + status + created_at.
+  - All existing logic, scoring rules, batch sizes, gaps, Slack/HubSpot/
+    FastAPI/schedulers, keyword list, system prompt — UNCHANGED (v6.0).
+  - Twitter polling cycle (60s, 50/block) — UNCHANGED, by design (this is
+    expected polling behaviour, not a bug).
 
 Changelog v6.0:
   - Added Twitter/X platform (tweepy v2, Bearer Token + OAuth1)
@@ -119,7 +137,7 @@ REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.0")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.1")
 
 # Twitter / X
 TWITTER_API_KEY            = os.getenv("TWITTER_API_KEY")            # Customer Key
@@ -174,6 +192,12 @@ TARGET_SUBREDDITS = [
 # reddit_queue : items from Reddit streams
 # twitter_queue: items from Twitter polling
 # Both read by their respective batch processors
+#
+# v6.1: These are now backed by db.pending_items — every item pushed onto
+# these queues is ALSO persisted to MongoDB (status="pending"). Only after
+# an item is fully scored + processed is it marked status="done"/removed.
+# On startup, any leftover "pending" items are reloaded into these queues
+# BEFORE live streams start, so nothing queued is lost on restart/update.
 # ─────────────────────────────────────────────────────────────────────────────
 
 reddit_queue:  queue.Queue = queue.Queue()
@@ -1265,6 +1289,15 @@ def get_database():
         ]:
             db.signals.create_index([(field, ASCENDING)])
 
+        # ── v6.1: persistent queue collection ──────────────────────────────
+        # Stores every keyword-matched item the moment it is queued.
+        # status: "pending"  -> not yet scored by Claude (survives restarts)
+        # status: "done"     -> scored + processed, safe to ignore/remove
+        db.pending_items.create_index([("message_id", ASCENDING)], unique=True, name="pending_message_id_unique")
+        db.pending_items.create_index([("platform", ASCENDING)], name="pending_platform")
+        db.pending_items.create_index([("status", ASCENDING)], name="pending_status")
+        db.pending_items.create_index([("created_at", ASCENDING)], name="pending_created_at")
+
         log.info("MongoDB connected.")
         return db
     except Exception as exc:
@@ -1273,6 +1306,89 @@ def get_database():
 
 
 db = get_database()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT QUEUE HELPERS  (v6.1)
+#
+# Every item placed on reddit_queue / twitter_queue is ALSO written to
+# db.pending_items with status="pending". Only after the item has been
+# scored by Claude AND passed to process_scored_item do we mark it
+# status="done" (and remove it). This guarantees that an update/restart —
+# even mid-batch — never silently drops an item: on the next startup,
+# load_pending_items_from_db() re-queues anything still "pending".
+# ─────────────────────────────────────────────────────────────────────────────
+
+def enqueue_item(q: queue.Queue, item: dict):
+    """
+    Persist item to db.pending_items (status="pending") and put it on the
+    in-memory queue. If the item already exists (duplicate message_id —
+    e.g. re-loaded after restart, or seen again), it is still placed on the
+    in-memory queue but the DB write is a safe no-op (duplicate key ignored).
+    """
+    try:
+        doc = dict(item)
+        doc["status"] = "pending"
+        doc.setdefault("created_at", datetime.now(timezone.utc))
+        db.pending_items.update_one(
+            {"message_id": item["message_id"]},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.error(f"enqueue_item persist error: {exc}")
+
+    q.put(item)
+
+
+def mark_item_done(message_id: str):
+    """
+    Mark an item as fully processed (scored by Claude + run through
+    process_scored_item). Removes it from db.pending_items so it will
+    never be re-loaded on a future restart.
+    """
+    try:
+        db.pending_items.delete_one({"message_id": message_id})
+    except Exception as exc:
+        log.error(f"mark_item_done error for {message_id}: {exc}")
+
+
+def load_pending_items_from_db():
+    """
+    Called once at startup, BEFORE the live Reddit/Twitter streams begin.
+    Re-loads any items left with status="pending" from a previous run
+    (crash, update, restart — even mid-batch) back into the in-memory
+    queues, oldest first, so they are processed in the next batch(es)
+    exactly like fresh items.
+    """
+    try:
+        reddit_pending = list(
+            db.pending_items.find({"status": "pending", "platform": "reddit"})
+            .sort("created_at", ASCENDING)
+        )
+        for doc in reddit_pending:
+            doc.pop("_id", None)
+            doc.pop("status", None)
+            reddit_queue.put(doc)
+
+        twitter_pending = list(
+            db.pending_items.find({"status": "pending", "platform": "twitter"})
+            .sort("created_at", ASCENDING)
+        )
+        for doc in twitter_pending:
+            doc.pop("_id", None)
+            doc.pop("status", None)
+            twitter_queue.put(doc)
+
+        if reddit_pending or twitter_pending:
+            log.info(
+                f"Persistent queue restore | reddit:{len(reddit_pending)} "
+                f"twitter:{len(twitter_pending)} items reloaded from MongoDB."
+            )
+        else:
+            log.info("Persistent queue restore | nothing pending — clean start.")
+    except Exception as exc:
+        log.error(f"load_pending_items_from_db error: {exc}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANTHROPIC CLIENT
@@ -1649,7 +1765,7 @@ def _hs_create_contact(data: dict) -> str | None:
 def _hs_create_note(data: dict, contact_id: str):
     try:
         note = (
-            f"FLINTEL SIGNAL — v6.0\n\n"
+            f"FLINTEL SIGNAL — v6.1\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1719,6 +1835,10 @@ def process_scored_item(item: dict, score_result: dict):
     """
     Receives one item + its Claude score. Runs full delivery pipeline.
     Identical logic for Reddit and Twitter items.
+
+    v6.1: At the very end (success or discard), mark_item_done() is called
+    so this item is removed from db.pending_items and will never be
+    re-loaded on a future restart.
     """
     score = score_result.get("intent_score", 0)
 
@@ -1727,6 +1847,7 @@ def process_scored_item(item: dict, score_result: dict):
             f"DISCARD | Score:{score} | {item.get('platform','?').upper()} | "
             f"u/{item.get('username')} | {item.get('content_type','')}"
         )
+        mark_item_done(item["message_id"])
         return
 
     data = {
@@ -1760,6 +1881,7 @@ def process_scored_item(item: dict, score_result: dict):
 
     saved = save_signal(data)
     if not saved:
+        mark_item_done(item["message_id"])
         return  # Duplicate — skip delivery
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
@@ -1777,6 +1899,8 @@ def process_scored_item(item: dict, score_result: dict):
         if cid:
             mark_hubspot_alerted(data["message_id"], cid)
 
+    mark_item_done(item["message_id"])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERIC BATCH PROCESSOR  (shared logic for both platforms)
@@ -1792,6 +1916,13 @@ def run_batch_processor(
     Collects keyword-matched items into batches of batch_size.
     Sends each full batch to Claude, then runs process_scored_item per item.
     30s gap between batches.
+
+    v6.1: Items that don't pass the basic checks or keyword filter are
+    marked done immediately (mark_item_done) so they don't linger in
+    db.pending_items. Items that DO match stay "pending" in MongoDB until
+    they are scored + processed (process_scored_item calls mark_item_done).
+    This means a partially-filled current_batch is fully recoverable on
+    restart via load_pending_items_from_db().
     """
     log.info(f"Batch processor [{platform_label}] started | batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s")
 
@@ -1812,6 +1943,7 @@ def run_batch_processor(
             text = item.get("text", "").strip()
 
             if not text or len(text) < 10:
+                mark_item_done(item.get("message_id", ""))
                 q.task_done()
                 continue
 
@@ -1821,6 +1953,7 @@ def run_batch_processor(
                     f"[{platform_label}] FILTERED | u/{item.get('username')} | "
                     f"{item.get('content_type','?')}"
                 )
+                mark_item_done(item.get("message_id", ""))
                 q.task_done()
                 continue
 
@@ -1895,7 +2028,7 @@ def stream_posts(reddit: praw.Reddit):
                 if post.selftext and post.selftext.strip():
                     text = f"{post.title}\n\n{post.selftext}"
                 author = str(post.author) if post.author else "[deleted]"
-                reddit_queue.put({
+                enqueue_item(reddit_queue, {
                     "message_id":   f"reddit_post_{post.id}",
                     "platform":     "reddit",
                     "content_type": "post",
@@ -1924,7 +2057,7 @@ def stream_comments(reddit: praw.Reddit):
                     continue
                 ctype  = "reply" if comment.parent_id.startswith("t1_") else "comment"
                 author = str(comment.author) if comment.author else "[deleted]"
-                reddit_queue.put({
+                enqueue_item(reddit_queue, {
                     "message_id":   f"reddit_comment_{comment.id}",
                     "platform":     "reddit",
                     "content_type": ctype,
@@ -1954,6 +2087,11 @@ def stream_comments(reddit: praw.Reddit):
 #   — Rate-limit safe: 1 request per poll cycle (well within 15 req/15 min)
 #   — 50 tweets max per request (Twitter v2 max_results=100, we cap at 50)
 #   — Items pushed to twitter_queue → batch processor → Claude (50/block)
+#
+# NOTE (v6.1): This polling behaviour (every 60s, search returns a rotating
+# top-50 "recent tweets" window) is EXPECTED Twitter v2 API behaviour, not a
+# bug. Tweets "cycling"/changing between polls reflects Twitter's own search
+# index turnover. Logic kept exactly as-is per requirements.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Top-tier search query for Twitter (must be ≤512 chars combined)
@@ -2038,7 +2176,7 @@ def poll_twitter(client: tweepy.Client):
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
                 # Only enqueue — keyword filter runs in batch processor
-                twitter_queue.put({
+                enqueue_item(twitter_queue, {
                     "message_id":   f"twitter_{tweet_id}",
                     "platform":     "twitter",
                     "content_type": "tweet",
@@ -2110,7 +2248,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.0 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.1 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
         ]
 
         result = retry_with_backoff(
@@ -2181,7 +2319,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.0 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.1 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2293,9 +2431,9 @@ async def start_twitter_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v6.0",
+    title       = "FX Signal Intelligence API — Flintel v6.1",
     description = "Reddit + Twitter signals: monitor, score, store, alert.",
-    version     = "6.0.0",
+    version     = "6.1.0",
 )
 
 
@@ -2312,7 +2450,7 @@ def _serialise(signals: list) -> list:
 def root():
     return {
         "status":              "running",
-        "system":              "FLINTEL v6.0",
+        "system":              "FLINTEL v6.1",
         "client":              CLIENT_ID,
         "platforms":           ["reddit", "twitter"],
         "reddit_batch_size":   REDDIT_BATCH_SIZE,
@@ -2330,6 +2468,11 @@ def health():
         mongo = "connected"
     except Exception:
         mongo = "disconnected"
+    try:
+        pending_reddit  = db.pending_items.count_documents({"status": "pending", "platform": "reddit"})
+        pending_twitter = db.pending_items.count_documents({"status": "pending", "platform": "twitter"})
+    except Exception:
+        pending_reddit = pending_twitter = -1
     return {
         "status":             "ok",
         "mongodb":            mongo,
@@ -2337,6 +2480,8 @@ def health():
         "twitter":            "polling" if TWITTER_BEARER_TOKEN else "disabled",
         "reddit_queue_size":  reddit_queue.qsize(),
         "twitter_queue_size": twitter_queue.qsize(),
+        "pending_reddit_db":  pending_reddit,
+        "pending_twitter_db": pending_twitter,
         "client_id":          CLIENT_ID,
         "timestamp":          datetime.now(timezone.utc).isoformat(),
     }
@@ -2504,6 +2649,32 @@ def get_watchlist(limit: int = 50):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/signals/pending")
+def get_pending(limit: int = 100):
+    """
+    v6.1: Inspect items currently sitting in the persistent queue
+    (status="pending") — i.e. matched items waiting to be batched/scored.
+    Useful for debugging restart-safety.
+    """
+    try:
+        items = list(
+            db.pending_items.find({"status": "pending"}, {"_id": 0})
+            .sort("created_at", ASCENDING).limit(limit)
+        )
+        for it in items:
+            if "created_at" in it:
+                it["created_at"] = it["created_at"].isoformat()
+        reddit_count  = db.pending_items.count_documents({"status": "pending", "platform": "reddit"})
+        twitter_count = db.pending_items.count_documents({"status": "pending", "platform": "twitter"})
+        return {
+            "reddit_pending":  reddit_count,
+            "twitter_pending": twitter_count,
+            "items": items,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def run_fastapi():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
@@ -2513,6 +2684,11 @@ def run_fastapi():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def main():
+    # v6.1: restore any items left "pending" from a previous run BEFORE
+    # starting the live streams, so they get processed in upcoming batches
+    # alongside new items — nothing queued is ever lost on restart/update.
+    load_pending_items_from_db()
+
     api_thread = threading.Thread(target=run_fastapi, daemon=True, name="FastAPI")
     api_thread.start()
     log.info("FastAPI running at http://0.0.0.0:8000")
@@ -2526,7 +2702,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.0")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.1")
     log.info("=" * 65)
     log.info(f"  Client           : {CLIENT_ID}")
     log.info(f"  Platforms        : Reddit + Twitter/X")
@@ -2542,6 +2718,7 @@ if __name__ == "__main__":
     log.info(f"  Subreddits       : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Keywords         : {len(KEYWORDS)} filters active")
     log.info(f"  MongoDB          : {MONGODB_DB}")
+    log.info(f"  Persistent queue : db.pending_items (restart-safe)")
     log.info(f"  Reddit account   : u/{REDDIT_USERNAME}")
     log.info(f"  Twitter          : {'enabled' if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
     log.info(f"  HubSpot          : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
