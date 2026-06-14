@@ -145,7 +145,7 @@ CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
 
 # Batch settings
 REDDIT_BATCH_SIZE  = int(os.getenv("REDDIT_BATCH_SIZE",  "10"))
-TWITTER_BATCH_SIZE = int(os.getenv("TWITTER_BATCH_SIZE", "10"))
+TWITTER_BATCH_SIZE = int(os.getenv("TWITTER_BATCH_SIZE", "20"))
 BATCH_GAP_SECONDS  = int(os.getenv("BATCH_GAP_SECONDS",  "30"))
 
 # Schedulers
