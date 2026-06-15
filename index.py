@@ -1,32 +1,28 @@
 """
-FX Signal Intelligence System — FLINTEL v6.2
+FX Signal Intelligence System — FLINTEL v7.0
 =============================================
-Platforms : Reddit (PRAW) + Twitter/X (tweepy v2) + Telegram SOURCE (Telethon)
-            + Telegram DELIVERY (Bot API alerts)
+Platforms : Reddit (PRAW) + Twitter/X (tweepy v2) + Telegram (Telethon)
 Pipeline  :
   Reddit   → Stream posts / comments / replies
   Twitter  → Fetch mentions / search / replies (rate-limit safe, 50/block)
-  Telegram → Listen public groups (Telethon MTProto, messages + replies)
+  Telegram → Listen to group messages (human account, Telethon, read-only)
       ↓
   Keyword Pre-Filter        (free, fast — drops 80%+ noise)
       ↓
-  Batch Collector           (10 items per Claude call — Reddit)
-                            (50 items per Claude call — Twitter)
-                            (10 items per Claude call — Telegram source)
+  Batch Collector:
+    Reddit   — 10 items per Claude call  (or 120s timeout)
+    Twitter  — 50 items per Claude call  (or 120s timeout)
+    Telegram — 10 items per Claude call  (or 120s timeout)
       ↓
   30-Second Gap             (between each batch)
       ↓
-  Batch Timeout Flush       (v6.1 — if batch not full within
-                              BATCH_TIMEOUT_SECONDS, flush whatever
-                              has been collected so far.)
-      ↓
   Claude AI Intent Scorer   (single merged prompt per batch)
       ↓
-  MongoDB Storage           (ALL scores 1-10 saved)
+  MongoDB Storage           (ALL scores 1-10 saved — nothing discarded)
       ↓
-  Slack Alert                ┐
-  Telegram Alert (delivery)  ├─ score 5-10, professional/plain blocks
-  HubSpot CRM                ┘  score 5-10
+  Slack Alert               (score 6-10, professional blocks)
+      ↓
+  HubSpot CRM               (score 8-10 only)
       ↓
   FastAPI REST Endpoints
       ↓
@@ -34,84 +30,47 @@ Pipeline  :
       ↓
   Weekly Report Scheduler   (all signals, Monday 09:00 UTC)
 
-Score rules (v6.2 — unchanged from v6.1):
-  0     → DISCARD  — never stored, never alerted
-  1-4   → LOW      — MongoDB only (saved for analytics / watchlist)
-  5-10  → ALERTED  — MongoDB + Slack + Telegram delivery + HubSpot
+Score rules:
+  1-5  → SAVED to MongoDB only — never alerted
+  6-7  → MEDIUM  — MongoDB + Slack only
+  8-10 → HIGH    — MongoDB + Slack + HubSpot
 
-Telegram SOURCE rules (NEW v6.2):
-  → Telethon MTProto user account (phone number login, NOT bot)
-  → Listens ONLY — never sends, reacts, or joins conversations
-  → Monitors TARGET_TELEGRAM_GROUPS (public group usernames/links)
-  → Auto-joins groups on startup after TELEGRAM_JOIN_DELAY_SECONDS (default 30s)
-    per group, staggered to avoid Telegram flood limits
-  → Captures: messages + replies (comment threads)
-  → content_type: "message" for top-level, "reply" for threaded replies
-  → Keyword pre-filter applied before queueing (same KEYWORDS list)
-  → 10 matched items → one Claude prompt (same as Reddit batch size)
-  → OR BATCH_TIMEOUT_SECONDS elapsed → flush partial batch
-  → 30s gap between batches
-  → Deduplication by message ID (telegram_{chat_id}_{message_id})
-  → Session stored in TELETHON_SESSION_FILE (default: flintel_telegram.session)
-  → Platform label: "telegram_source" (distinct from "telegram" delivery)
-
-Telegram DELIVERY rules (unchanged from v6.1):
-  → Bot API sendMessage to TELEGRAM_CHAT_ID
-  → Triggered for scores 5-10 alongside Slack + HubSpot
-
-Reddit batch rules (unchanged from v6.1):
+Reddit batch rules:
   → Continuous stream (posts + comments + replies)
   → Keyword filter applied to every item
-  → 10 matched items → one Claude prompt
-  → OR BATCH_TIMEOUT_SECONDS elapsed → flush partial batch
+  → 10 matched items OR 120s timeout → one Claude prompt
   → 30s gap between batches
+  → Non-matching items dropped immediately
 
-Twitter batch rules (unchanged from v6.1):
+Twitter batch rules:
   → Polling every 60s (rate-limit safe)
   → Search query built from top-tier keywords
   → Deduplication by tweet ID before filter
   → Keyword filter applied to every tweet
-  → 50 matched items → one Claude prompt
-  → OR BATCH_TIMEOUT_SECONDS elapsed → flush partial batch
+  → 50 matched items OR 120s timeout → one Claude prompt
   → 30s gap between batches
+  → Unknown / irrelevant content never reaches Claude
 
-Data ordering guarantee (v6.2):
-  → Each platform has its OWN dedicated queue and batch processor thread
-  → Batches from different platforms never mix — Claude sees only one
-    platform per prompt, keeping scores clean and unambiguous
-  → MongoDB inserts are sequential within each platform thread
-  → message_id unique index prevents cross-platform duplicates
+Telegram batch rules:
+  → Telethon client (human account via API ID + API Hash + Phone)
+  → Auto-join TARGET_TELEGRAM_GROUPS with 30s gap between joins
+  → Read-only listener — NO reactions, replies, likes, forwards
+  → Keyword filter applied to every message
+  → 10 matched items OR 120s timeout → one Claude prompt
+  → 30s gap between batches
+  → Data NEVER mixed with Reddit or Twitter
 
-Changelog v6.2 (on top of v6.1):
-  - NEW: Telegram as a SOURCE platform via Telethon MTProto
-  - NEW: stream_telegram_groups() — async event handler, listen-only
-  - NEW: start_telegram_source_listener() — thread wrapper + auto-restart
-  - NEW: telegram_source_queue (dedicated, separate from reddit/twitter queues)
-  - NEW: Telethon auto-join public groups on startup, staggered 30s per group
-  - NEW: TELEGRAM_SOURCE_GROUPS env var (comma-separated group usernames)
-  - NEW: TELETHON_API_ID, TELETHON_API_HASH, TELETHON_PHONE env vars
-  - NEW: TELETHON_SESSION_FILE env var (default: flintel_telegram.session)
-  - NEW: TELEGRAM_JOIN_DELAY_SECONDS env var (default: 30)
-  - NEW: TELEGRAM_SOURCE_BATCH_SIZE env var (default: 10, same as Reddit)
-  - NEW: /signals/telegram endpoint in FastAPI
-  - NEW: telegram_source_signals count in /signals/stats
-  - NEW: telegram_source_queue_size in / root + /health endpoints
-  - FIX: platform label "telegram_source" used for all source items so
-    delivery Telegram alerts are never confused with source platform data
-  - All v6.1 behaviour (Reddit, Twitter, Slack, Telegram delivery, HubSpot,
-    MongoDB, schedulers, FastAPI, keyword list, Claude prompt) is
-    100% unchanged.
-
-Changelog v6.1 (carried forward):
-  - FIX: batch timeout flush — items never stuck in partial batches
-  - MongoDB: ALL scored items (1-10) saved
-  - Delivery threshold lowered to score 5 (Slack + Telegram + HubSpot)
-  - Added Telegram delivery (send_telegram_alert)
-  - Added env vars: BATCH_TIMEOUT_SECONDS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-
-Changelog v6.0 (carried forward):
-  - Added Twitter/X platform (tweepy v2)
-  - Upgraded system prompt, keyword list, Slack blocks, HubSpot fields
+Changelog v7.0:
+  - Added Telegram platform (Telethon, human account, read-only listener)
+  - TARGET_TELEGRAM_GROUPS list (mirrors TARGET_SUBREDDITS pattern)
+  - Auto-join Telegram groups on startup with 30s gap between joins
+  - Telegram batch processor: 10/batch, 120s timeout (same as Reddit)
+  - MongoDB now stores ALL scores 1-10 (nothing silently discarded)
+  - BATCH_TIMEOUT_SECONDS=120: partial batch sent to Claude after timeout
+  - Live counter display per platform: Reddit X/10, Twitter X/50, Telegram X/10
+  - Platform field guaranteed on every document — no cross-platform mixing
+  - FastAPI: /signals/telegram endpoint added
+  - All original Reddit + Twitter logic 100% unchanged
   - Claude model: claude-sonnet-4-6
 """
 
@@ -129,23 +88,20 @@ import praw
 import praw.exceptions
 import anthropic
 import tweepy
+from telethon import TelegramClient, events
+from telethon.errors import (
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    ChannelPrivateError,
+    FloodWaitError,
+)
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.types import PeerChannel
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 import requests
 from fastapi import FastAPI, HTTPException
 import uvicorn
-
-# Telethon — Telegram MTProto client (source listener)
-try:
-    from telethon import TelegramClient, events
-    from telethon.tl.types import Message
-    from telethon.errors import (
-        FloodWaitError, UserAlreadyParticipantError,
-        ChannelPrivateError, InviteHashExpiredError,
-    )
-    TELETHON_AVAILABLE = True
-except ImportError:
-    TELETHON_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV
@@ -173,12 +129,18 @@ REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.2")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/7.0")
 
 # Twitter / X
-TWITTER_API_KEY        = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET     = os.getenv("TWITTER_API_SECRET")
-TWITTER_BEARER_TOKEN   = os.getenv("TWITTER_BEARER_TOKEN")
+TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+
+# Telegram (Telethon — human account)
+TELEGRAM_API_ID      = int(os.getenv("TELEGRAM_API_ID", "0"))   # from my.telegram.org
+TELEGRAM_API_HASH    = os.getenv("TELEGRAM_API_HASH", "")        # from my.telegram.org
+TELEGRAM_PHONE       = os.getenv("TELEGRAM_PHONE", "")           # your phone number e.g. +923001234567
+TELEGRAM_SESSION     = os.getenv("TELEGRAM_SESSION", "flintel_telegram")  # session file name
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -187,56 +149,37 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 
-# Delivery channels
-SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL")
-HUBSPOT_API_KEY    = os.getenv("HUBSPOT_API_KEY")
+# Delivery
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
 
-# Telegram DELIVERY (Bot API — unchanged from v6.1)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-
-# ── Telegram SOURCE (NEW v6.2 — Telethon MTProto user account) ───────────────
-# Get API credentials from https://my.telegram.org → "API development tools"
-TELETHON_API_ID      = os.getenv("TELETHON_API_ID")       # integer string
-TELETHON_API_HASH    = os.getenv("TELETHON_API_HASH")     # hex string
-TELETHON_PHONE       = os.getenv("TELETHON_PHONE")        # e.g. +14155551234
-TELETHON_SESSION_FILE = os.getenv("TELETHON_SESSION_FILE", "flintel_telegram")
-
-# Comma-separated public group usernames or t.me links
-# e.g. "nigeriansincanada,pakistanidiaspora,t.me/diasporabusiness"
-TELEGRAM_SOURCE_GROUPS_RAW = os.getenv("TELEGRAM_SOURCE_GROUPS", "")
-TARGET_TELEGRAM_GROUPS = [
-    g.strip().lstrip("@").replace("https://t.me/", "").replace("t.me/", "")
-    for g in TELEGRAM_SOURCE_GROUPS_RAW.split(",")
-    if g.strip()
-]
-
-# Seconds to wait between joining each group on startup (avoids Telegram flood)
-TELEGRAM_JOIN_DELAY_SECONDS = int(os.getenv("TELEGRAM_JOIN_DELAY_SECONDS", "30"))
-
-# ── Thresholds ────────────────────────────────────────────────────────────────
-MIN_SCORE_ALERT  = int(os.getenv("MIN_SCORE_ALERT",  "5"))
-MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "6"))
-MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
+# Thresholds
+MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "6"))   # 6-7 → Slack only
+MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))   # 8-10 → Slack + HubSpot
 CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
 
-# ── Batch settings ────────────────────────────────────────────────────────────
-REDDIT_BATCH_SIZE          = int(os.getenv("REDDIT_BATCH_SIZE",          "10"))
-TWITTER_BATCH_SIZE         = int(os.getenv("TWITTER_BATCH_SIZE",         "50"))
-TELEGRAM_SOURCE_BATCH_SIZE = int(os.getenv("TELEGRAM_SOURCE_BATCH_SIZE", "10"))
-BATCH_GAP_SECONDS          = int(os.getenv("BATCH_GAP_SECONDS",          "30"))
-BATCH_TIMEOUT_SECONDS      = int(os.getenv("BATCH_TIMEOUT_SECONDS",      "120"))
+# Batch settings
+REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
+TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
+TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
+BATCH_GAP_SECONDS   = int(os.getenv("BATCH_GAP_SECONDS",   "30"))
 
-# ── Schedulers ────────────────────────────────────────────────────────────────
+# Batch timeout — send partial batch after this many seconds even if not full
+BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "120"))
+
+# Schedulers
 DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
 WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))   # 0 = Monday
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 
-# ── Twitter polling ───────────────────────────────────────────────────────────
+# Twitter polling
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
+# Telegram group auto-join gap
+TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TARGET SUBREDDITS — UNCHANGED
+# TARGET SUBREDDITS
 # ─────────────────────────────────────────────────────────────────────────────
 
 TARGET_SUBREDDITS = [
@@ -249,48 +192,105 @@ TARGET_SUBREDDITS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — one per platform, never mixed
-# reddit_queue          : Reddit posts / comments / replies
-# twitter_queue         : Twitter/X tweets
-# telegram_source_queue : Telegram group messages / replies  (NEW v6.2)
-# Each queue feeds its own dedicated batch processor thread.
+# TARGET TELEGRAM GROUPS
+# Format: group username (e.g. "@groupname") OR invite link OR group ID
+# Bot will auto-join these on startup with TELEGRAM_JOIN_GAP_SECONDS gap
+# READ-ONLY — no replies, reactions, or interactions of any kind
 # ─────────────────────────────────────────────────────────────────────────────
 
-reddit_queue:          queue.Queue = queue.Queue()
-twitter_queue:         queue.Queue = queue.Queue()
-telegram_source_queue: queue.Queue = queue.Queue()   # NEW v6.2
+TARGET_TELEGRAM_GROUPS = [
+    # Nigerian diaspora & business groups
+    "nigeriansincanada",
+    "nigeriansinuk",
+    "nigeriansinusa",
+    "nigeriansinaustralia",
+    "nigeriandiaspora",
+    "nigerianentrepreneurs",
+    "lagosBusinessNetwork",
+    "nigeriafinance",
+    # Pakistani diaspora & business groups
+    "pakistanisincanada",
+    "pakistanisinuk",
+    "pakistanisinusa",
+    "pakistanidiaspora",
+    "pakistanibusiness",
+    "karachi_business",
+    # FX & remittance groups
+    "remittancetalk",
+    "moneytransfertips",
+    "fxtraders_ng",
+    "diaspora_finance",
+    "crossborderpayments",
+    # African business groups
+    "africabusiness",
+    "africaentrepreneurs",
+    "africatrade",
+    "africafintech",
+    # General diaspora finance
+    "expatfinance",
+    "diasporamoney",
+    "internationaltransfer",
+    "wisealternatives",
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER — 350+ signals — UNCHANGED from v6.1
+# SHARED QUEUES — platform-isolated, never mixed
+# reddit_queue  : items from Reddit streams ONLY
+# twitter_queue : items from Twitter polling ONLY
+# telegram_queue: items from Telegram listening ONLY
+# ─────────────────────────────────────────────────────────────────────────────
+
+reddit_queue:   queue.Queue = queue.Queue()
+twitter_queue:  queue.Queue = queue.Queue()
+telegram_queue: queue.Queue = queue.Queue()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE COUNTERS — per platform batch progress display
+# ─────────────────────────────────────────────────────────────────────────────
+
+_reddit_batch_counter   = 0
+_twitter_batch_counter  = 0
+_telegram_batch_counter = 0
+_counter_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYWORD PRE-FILTER — 350+ signals
+# Applied to EVERY item before Claude ever sees it
+# Zero API cost — runs in microseconds
+# SAME keywords for all 3 platforms
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # Sending money
+    # ── SENDING MONEY ────────────────────────────────────────────────────────
     "send money to", "sending money to", "transfer money to",
     "transferring money to", "wire money to", "wiring money to",
-    "move money to", "moving money to", "remit money to", "remitting money to",
-    "pay my supplier", "paying my supplier", "pay a supplier", "paying a supplier",
-    "pay my vendor", "paying my vendor", "pay my manufacturer", "pay my factory",
-    "pay my partner", "pay my contractor", "pay an invoice", "paying an invoice",
-    "settle an invoice", "settling an invoice", "pay a business",
-    "business payment to", "supplier payment to", "vendor payment to",
-    "invoice payment to", "international payment to", "overseas payment to",
-    "cross border payment", "cross-border payment", "cross border transfer",
-    "cross-border transfer", "international transfer", "international wire",
-    "international wire transfer", "foreign wire transfer", "overseas wire transfer",
-    "overseas transfer", "global payment", "global transfer",
-    "b2b payment", "b2b transfer", "business to business payment",
+    "move money to", "moving money to", "remit money to",
+    "remitting money to", "pay my supplier", "paying my supplier",
+    "pay a supplier", "paying a supplier", "pay my vendor",
+    "paying my vendor", "pay my manufacturer", "pay my factory",
+    "pay my partner", "pay my contractor", "pay an invoice",
+    "paying an invoice", "settle an invoice", "settling an invoice",
+    "pay a business", "business payment to", "supplier payment to",
+    "vendor payment to", "invoice payment to", "international payment to",
+    "overseas payment to", "cross border payment", "cross-border payment",
+    "cross border transfer", "cross-border transfer",
+    "international transfer", "international wire",
+    "international wire transfer", "foreign wire transfer",
+    "overseas wire transfer", "overseas transfer", "global payment",
+    "global transfer", "b2b payment", "b2b transfer",
+    "business to business payment",
 
-    # Bank blocking
+    # ── BANK BLOCKING ────────────────────────────────────────────────────────
     "bank blocked my", "bank blocked my transfer", "bank blocked my payment",
-    "bank blocked my wire", "bank blocked my transaction", "bank flagged my",
-    "bank flagged my transfer", "bank flagged my payment", "bank rejected my",
-    "bank rejected my transfer", "bank rejected my payment", "bank declined my",
-    "bank declined my transfer", "bank won't let me transfer",
-    "bank won't let me send", "bank refuses to", "bank holding my",
-    "bank holding my funds", "bank holding my money", "bank froze my",
-    "account frozen", "funds frozen", "money frozen", "transfer frozen",
-    "payment frozen", "transfer blocked", "payment blocked", "wire blocked",
+    "bank blocked my wire", "bank blocked my transaction",
+    "bank flagged my", "bank flagged my transfer", "bank flagged my payment",
+    "bank rejected my", "bank rejected my transfer", "bank rejected my payment",
+    "bank declined my", "bank declined my transfer",
+    "bank won't let me transfer", "bank won't let me send",
+    "bank refuses to", "bank holding my", "bank holding my funds",
+    "bank holding my money", "bank froze my", "account frozen",
+    "funds frozen", "money frozen", "transfer frozen", "payment frozen",
+    "transfer blocked", "payment blocked", "wire blocked",
     "transaction blocked", "transfer rejected", "payment rejected",
     "wire rejected", "transfer declined", "payment declined",
     "transfer failed", "payment failed", "wire failed",
@@ -300,86 +300,93 @@ KEYWORDS = [
     "compliance hold", "compliance review", "compliance check",
     "AML hold", "AML review", "AML flag", "flagged for review",
     "flagged as suspicious", "suspicious activity", "suspicious transaction",
-    "frozen for review", "under review", "transfer delayed", "payment delayed",
-    "wire delayed", "transfer pending", "stuck in pending",
-    "days to process", "weeks to process", "10-14 days", "10 to 14 days",
-    "two weeks to transfer", "transfer taking forever", "payment taking forever",
-    "money hasn't arrived", "money still hasn't arrived", "payment hasn't arrived",
-    "where is my transfer", "where is my payment", "where is my money",
-    "where did my money go", "money disappeared", "payment disappeared",
-    "transfer disappeared", "no tracking", "can't track my transfer",
-    "can't track my payment", "no update on my transfer", "no update on my payment",
+    "frozen for review", "under review", "transfer delayed",
+    "payment delayed", "wire delayed", "transfer pending",
+    "stuck in pending", "days to process", "weeks to process",
+    "10-14 days", "10 to 14 days", "two weeks to transfer",
+    "transfer taking forever", "payment taking forever",
+    "money hasn't arrived", "money still hasn't arrived",
+    "payment hasn't arrived", "where is my transfer",
+    "where is my payment", "where is my money", "where did my money go",
+    "money disappeared", "payment disappeared", "transfer disappeared",
+    "no tracking", "can't track my transfer", "can't track my payment",
+    "no update on my transfer", "no update on my payment",
 
-    # Fee frustration
-    "SWIFT fees", "SWIFT charges", "wire transfer fees", "wire transfer charges",
-    "international transfer fees", "international wire fees",
-    "transfer fees too high", "transfer fees killing", "fees killing my margins",
+    # ── FEE FRUSTRATION ──────────────────────────────────────────────────────
+    "SWIFT fees", "SWIFT charges", "wire transfer fees",
+    "wire transfer charges", "international transfer fees",
+    "international wire fees", "transfer fees too high",
+    "transfer fees killing", "fees killing my margins",
     "fees eating my margins", "fees eating my profit",
     "exchange rate terrible", "exchange rate awful", "exchange rate bad",
     "terrible exchange rate", "awful exchange rate", "bad exchange rate",
     "worst exchange rate", "exchange rate ripoff", "exchange rate rip off",
-    "hidden fees", "hidden charges", "unexpected fees", "unexpected charges",
-    "FX fees", "FX charges", "FX markup", "FX spread",
-    "currency conversion fee", "currency conversion charge",
+    "hidden fees", "hidden charges", "unexpected fees",
+    "unexpected charges", "FX fees", "FX charges", "FX markup",
+    "FX spread", "currency conversion fee", "currency conversion charge",
     "conversion fee too high", "conversion markup",
-    "losing money on transfer", "losing money on fees", "losing money to fees",
-    "losing money exchanging", "percentage on transfer", "percentage on payment",
+    "losing money on transfer", "losing money on fees",
+    "losing money to fees", "losing money exchanging",
+    "percentage on transfer", "percentage on payment",
     "ripping me off", "highway robbery", "daylight robbery",
-    "absolute ripoff", "total ripoff", "complete ripoff", "charging too much",
-    "too expensive to send", "too expensive to transfer",
+    "absolute ripoff", "total ripoff", "complete ripoff",
+    "charging too much", "too expensive to send", "too expensive to transfer",
     "cheapest way to send", "cheapest way to transfer",
     "cheapest international transfer", "cheapest cross border",
     "better rate than", "better rates than", "cheaper than SWIFT",
     "cheaper than wire", "SWIFT alternative", "alternative to SWIFT",
-    "avoid SWIFT fees", "avoid wire fees",
-    "correspondent bank fees", "intermediary bank fees", "intermediary fees",
+    "avoid SWIFT fees", "avoid wire fees", "correspondent bank fees",
+    "intermediary bank fees", "intermediary fees",
 
-    # Competitor mentions
-    "Wise Business", "Wise business account", "Wise transfer", "Wise payment",
-    "Wise blocked", "Wise restricted", "Wise suspended",
+    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
+    "Wise Business", "Wise business account", "Wise transfer",
+    "Wise payment", "Wise blocked", "Wise restricted", "Wise suspended",
     "Wise account restricted", "Wise account suspended",
-    "Wise account blocked", "Wise account closed", "Wise limit", "Wise holding",
-    "leaving Wise", "left Wise", "moving off Wise", "moved off Wise",
-    "switching from Wise", "switched from Wise", "never using Wise",
-    "done with Wise", "Wise is terrible", "Wise is awful", "Wise is a joke",
-    "hate Wise", "Wise disappointed", "TransferWise",
-    "Remitly blocked", "Remitly restricted", "Remitly limit", "Remitly failed",
-    "leaving Remitly", "switching from Remitly", "Remitly alternative",
+    "Wise account blocked", "Wise account closed", "Wise limit",
+    "Wise holding", "leaving Wise", "left Wise", "moving off Wise",
+    "moved off Wise", "switching from Wise", "switched from Wise",
+    "never using Wise", "done with Wise", "Wise is terrible",
+    "Wise is awful", "Wise is a joke", "hate Wise", "Wise disappointed",
+    "TransferWise",
+    "Remitly blocked", "Remitly restricted", "Remitly limit",
+    "Remitly failed", "leaving Remitly", "switching from Remitly",
+    "Remitly alternative",
     "Payoneer blocked", "Payoneer restricted", "Payoneer suspended",
     "Payoneer account blocked", "Payoneer account restricted",
     "Payoneer account suspended", "Payoneer limit", "Payoneer holding",
-    "leaving Payoneer", "switching from Payoneer",
-    "Payoneer alternative", "alternative to Payoneer",
+    "leaving Payoneer", "switching from Payoneer", "Payoneer alternative",
+    "alternative to Payoneer",
     "WorldRemit failed", "WorldRemit blocked", "WorldRemit problem",
     "WorldRemit issue", "WorldRemit terrible",
-    "Western Union failed", "Western Union blocked", "Western Union delayed",
-    "Western Union problem", "leaving Western Union", "WU failed", "WU blocked",
+    "Western Union failed", "Western Union blocked",
+    "Western Union delayed", "Western Union problem",
+    "leaving Western Union", "WU failed", "WU blocked",
     "OFX failed", "OFX blocked", "OFX problem", "OFX issue",
     "Revolut blocked", "Revolut restricted", "Revolut suspended",
     "Revolut Business blocked", "Revolut Business restricted",
     "Revolut account blocked", "Revolut account restricted",
     "Revolut holding", "leaving Revolut", "switching from Revolut",
-    "Stripe blocked", "Stripe restricted",
-    "Stripe account blocked", "Stripe account restricted",
+    "Stripe blocked", "Stripe restricted", "Stripe account blocked",
+    "Stripe account restricted",
     "Mercury blocked", "Mercury restricted", "Mercury bank blocked",
     "LemFi failed", "LemFi blocked", "LemFi problem",
     "Grey Finance failed", "Grey Finance blocked", "Grey Finance problem",
     "NALA failed", "NALA blocked", "NALA problem",
     "Chipper Cash failed", "Chipper Cash blocked", "Chipper Cash problem",
-    "alternative to Wise", "alternative to Remitly", "alternative to Payoneer",
-    "alternative to WorldRemit", "alternative to Western Union",
-    "alternative to Revolut", "better than Wise", "better than Remitly",
-    "better than Payoneer", "better than WorldRemit", "better than Western Union",
+    "alternative to Wise", "alternative to Remitly",
+    "alternative to Payoneer", "alternative to WorldRemit",
+    "alternative to Western Union", "alternative to Revolut",
+    "better than Wise", "better than Remitly", "better than Payoneer",
+    "better than WorldRemit", "better than Western Union",
     "competitors to Wise", "Wise competitors", "Payoneer competitors",
 
-    # Recommendation requests
+    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
     "recommend a payment", "recommend a transfer", "recommend a service",
     "recommend a platform", "recommend an app", "recommend a provider",
     "recommend a solution", "anyone recommend", "can anyone recommend",
     "does anyone recommend", "what payment service", "what transfer service",
-    "what payment platform", "what transfer platform",
-    "what payment app", "what transfer app",
-    "which payment service", "which transfer service",
+    "what payment platform", "what transfer platform", "what payment app",
+    "what transfer app", "which payment service", "which transfer service",
     "which payment platform", "which transfer platform",
     "which payment app", "which transfer app", "which payment provider",
     "which service is best", "which platform is best", "which app is best",
@@ -391,55 +398,59 @@ KEYWORDS = [
     "how do I send", "how do I transfer", "how do I pay",
     "how can I send", "how can I transfer", "how can I pay",
     "looking for a payment", "looking for a transfer",
-    "looking for a platform", "looking for a service", "looking for a solution",
-    "searching for a payment", "need a payment solution",
-    "need a transfer solution", "need a payment platform",
-    "need a transfer platform", "anyone using", "does anyone use",
-    "has anyone used", "who uses", "who do you use",
-    "what do you use", "what are you using",
+    "looking for a platform", "looking for a service",
+    "looking for a solution", "searching for a payment",
+    "need a payment solution", "need a transfer solution",
+    "need a payment platform", "need a transfer platform",
+    "anyone using", "does anyone use", "has anyone used",
+    "who uses", "who do you use", "what do you use", "what are you using",
     "tried everything", "tried so many", "tried multiple", "tried several",
-    "nothing works", "none of them work",
-    "still haven't found", "still looking for", "still searching for",
+    "nothing works", "none of them work", "still haven't found",
+    "still looking for", "still searching for",
 
-    # Business context
+    # ── BUSINESS CONTEXT ─────────────────────────────────────────────────────
     "my supplier", "my suppliers", "our supplier", "our suppliers",
     "my vendor", "my vendors", "our vendor", "our vendors",
     "my manufacturer", "my manufacturers", "our manufacturer",
-    "my factory", "our factory", "my business partner", "our business partner",
-    "my contractor", "our contractor", "my client overseas", "our client overseas",
-    "import business", "importing business", "export business", "exporting business",
-    "import export", "import/export", "importing goods", "exporting goods",
-    "importing products", "exporting products",
-    "buying from overseas", "buying from abroad",
+    "my factory", "our factory", "my business partner",
+    "our business partner", "my contractor", "our contractor",
+    "my client overseas", "our client overseas",
+    "import business", "importing business", "export business",
+    "exporting business", "import export", "import/export",
+    "importing goods", "exporting goods", "importing products",
+    "exporting products", "buying from overseas", "buying from abroad",
     "sourcing from", "sourcing overseas", "sourcing abroad",
-    "purchase order", "business invoice", "supplier invoice", "vendor invoice",
-    "trade finance", "trade payment", "trade financing",
-    "supply chain payment", "supply chain finance",
+    "purchase order", "business invoice", "supplier invoice",
+    "vendor invoice", "trade finance", "trade payment",
+    "trade financing", "supply chain payment", "supply chain finance",
     "diaspora business", "diaspora entrepreneur",
     "running a business", "my business needs", "for my business",
     "business account", "business transfer", "business wire",
     "corporate payment", "corporate transfer", "corporate wire",
-    "company payment", "company transfer",
-    "B2B payment", "B2B transfer", "B2B transaction", "business to business",
+    "company payment", "company transfer", "B2B payment", "B2B transfer",
+    "B2B transaction", "business to business",
 
-    # Corridors
+    # ── CORRIDOR KEYWORDS ────────────────────────────────────────────────────
     "to Nigeria", "to Lagos", "to Abuja", "from Nigeria",
     "Nigeria payment", "Nigeria transfer", "Nigeria wire",
-    "Nigerian supplier", "Nigerian vendor", "Nigerian manufacturer", "Nigeria business",
-    "CAD to NGN", "GBP to NGN", "USD to NGN", "EUR to NGN", "AUD to NGN",
-    "naira payment", "naira transfer", "send naira", "receive naira",
-    "to Pakistan", "to Karachi", "to Lahore", "to Islamabad", "from Pakistan",
-    "Pakistan payment", "Pakistan transfer", "Pakistan wire",
-    "Pakistani supplier", "Pakistani vendor", "Pakistani manufacturer",
-    "CAD to PKR", "GBP to PKR", "USD to PKR", "rupee payment", "rupee transfer",
+    "Nigerian supplier", "Nigerian vendor", "Nigerian manufacturer",
+    "Nigeria business", "CAD to NGN", "GBP to NGN", "USD to NGN",
+    "EUR to NGN", "AUD to NGN", "naira payment", "naira transfer",
+    "send naira", "receive naira",
+    "to Pakistan", "to Karachi", "to Lahore", "to Islamabad",
+    "from Pakistan", "Pakistan payment", "Pakistan transfer",
+    "Pakistan wire", "Pakistani supplier", "Pakistani vendor",
+    "Pakistani manufacturer", "CAD to PKR", "GBP to PKR", "USD to PKR",
+    "rupee payment", "rupee transfer",
     "to India", "to Mumbai", "to Delhi", "to Bangalore", "from India",
     "India payment", "India transfer", "India wire",
     "Indian supplier", "Indian vendor", "Indian manufacturer",
     "CAD to INR", "GBP to INR", "USD to INR",
-    "to Ghana", "to Accra", "from Ghana", "Ghana payment", "Ghana transfer",
-    "Ghanaian supplier", "GHS payment", "cedi payment",
-    "to Kenya", "to Nairobi", "from Kenya", "Kenya payment", "Kenya transfer",
-    "Kenyan supplier", "KES payment", "M-Pesa business", "Mpesa business",
+    "to Ghana", "to Accra", "from Ghana", "Ghana payment",
+    "Ghana transfer", "Ghanaian supplier", "GHS payment", "cedi payment",
+    "to Kenya", "to Nairobi", "from Kenya", "Kenya payment",
+    "Kenya transfer", "Kenyan supplier", "KES payment",
+    "M-Pesa business", "Mpesa business",
     "to Ethiopia", "to Senegal", "to Ivory Coast", "to Cameroon",
     "to Tanzania", "to Uganda", "to Zimbabwe", "to South Africa",
     "to Johannesburg", "African supplier", "African vendor",
@@ -447,11 +458,11 @@ KEYWORDS = [
     "from Canada", "from Toronto", "from Vancouver", "from Calgary",
     "from Ottawa", "from Montreal", "from UK", "from London",
     "from Manchester", "from Birmingham", "from Glasgow",
-    "from USA", "from New York", "from Houston", "from Atlanta", "from Washington",
-    "from Australia", "from Sydney", "from Melbourne", "from Perth",
-    "from UAE", "from Dubai", "from Abu Dhabi",
+    "from USA", "from New York", "from Houston", "from Atlanta",
+    "from Washington", "from Australia", "from Sydney", "from Melbourne",
+    "from Perth", "from UAE", "from Dubai", "from Abu Dhabi",
 
-    # Amount signals
+    # ── AMOUNT SIGNALS ───────────────────────────────────────────────────────
     "$10,000", "$10k", "10 thousand", "$15,000", "$15k", "15 thousand",
     "$20,000", "$20k", "20 thousand", "$25,000", "$25k", "25 thousand",
     "$30,000", "$30k", "30 thousand", "$40,000", "$40k", "40 thousand",
@@ -460,7 +471,8 @@ KEYWORDS = [
     "$80,000", "$80k", "80 thousand", "$100,000", "$100k", "100 thousand",
     "$150,000", "$150k", "150 thousand", "$200,000", "$200k", "200 thousand",
     "$250,000", "$250k", "250 thousand", "$500,000", "$500k", "500 thousand",
-    "$750,000", "$750k", "750 thousand", "$1 million", "$1m", "one million",
+    "$750,000", "$750k", "750 thousand",
+    "$1 million", "$1m", "one million",
     "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
     "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
     "£100,000", "£100k", "£200,000", "£200k",
@@ -469,7 +481,7 @@ KEYWORDS = [
     "big transfer", "big payment", "six figures", "seven figures",
     "six-figure", "seven-figure", "monthly volume", "weekly volume",
 
-    # Compliance pain
+    # ── COMPLIANCE PAIN ──────────────────────────────────────────────────────
     "KYC rejected", "KYC failed", "KYC verification failed",
     "KYC problem", "KYC issue", "KYC nightmare",
     "AML rejected", "AML flagged", "AML hold", "AML review",
@@ -485,27 +497,27 @@ KEYWORDS = [
     "asking for documents again", "same documents again",
     "keep asking for documents", "keep rejecting documents",
     "third time submitting", "fourth time submitting",
-    "rejected again", "blocked again", "failed again", "happening again",
-    "third time", "fourth time", "keep blocking", "keeps blocking",
-    "keeps rejecting", "keeps failing", "always blocks", "always rejects",
-    "always fails",
+    "rejected again", "blocked again", "failed again",
+    "happening again", "third time", "fourth time",
+    "keep blocking", "keeps blocking", "keeps rejecting", "keeps failing",
+    "always blocks", "always rejects", "always fails",
 
-    # Urgency
-    "urgently", "urgent", "desperately", "desperate", "ASAP",
-    "as soon as possible", "right now", "today", "this week",
-    "by Friday", "by Monday", "by end of week", "by end of month",
-    "deadline", "time sensitive", "need it done", "need it now",
-    "need it today", "need it urgently", "waiting on payment",
-    "supplier is waiting", "supplier waiting", "vendor is waiting",
-    "vendor waiting", "manufacturer waiting", "partner waiting",
-    "been waiting", "already delayed", "already late", "overdue", "past due",
-    "losing the contract", "losing my supplier", "losing my vendor",
-    "threatening to cancel", "might cancel", "going to cancel",
-    "cancelling the order", "losing the deal", "deal at risk",
-    "relationship at risk", "can't wait any longer",
-    "running out of time", "no more time",
+    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
+    "urgently", "urgent", "desperately", "desperate",
+    "ASAP", "as soon as possible", "right now", "today",
+    "this week", "by Friday", "by Monday", "by end of week",
+    "by end of month", "deadline", "time sensitive",
+    "need it done", "need it now", "need it today", "need it urgently",
+    "waiting on payment", "supplier is waiting", "supplier waiting",
+    "vendor is waiting", "vendor waiting", "manufacturer waiting",
+    "partner waiting", "been waiting", "already delayed", "already late",
+    "overdue", "past due", "losing the contract", "losing my supplier",
+    "losing my vendor", "threatening to cancel", "might cancel",
+    "going to cancel", "cancelling the order", "losing the deal",
+    "deal at risk", "relationship at risk",
+    "can't wait any longer", "running out of time", "no more time",
 
-    # Expansion signals
+    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
     "just signed a supplier", "signed a new supplier", "found a supplier",
     "new supplier in", "signed a contract with", "new contract with",
     "starting to import", "starting an import", "starting to export",
@@ -514,16 +526,16 @@ KEYWORDS = [
     "need to set up payments", "need to transfer money",
     "will need to send", "will need to transfer", "going to need",
     "starting a business", "new business", "import business",
-    "export business", "trading company",
-    "sourcing products from", "sourcing goods from",
-    "buying products from", "buying goods from", "manufacturing in", "producing in",
+    "export business", "trading company", "sourcing products from",
+    "sourcing goods from", "buying products from", "buying goods from",
+    "manufacturing in", "producing in",
 
-    # Treasury / FX management
+    # ── TREASURY & FX ────────────────────────────────────────────────────────
     "treasury management", "cash management", "liquidity management",
     "FX management", "FX exposure", "FX risk", "FX hedging",
     "currency hedging", "currency risk", "currency exposure",
-    "FX solution", "FX platform", "FX tool", "treasury solution",
-    "treasury platform", "cash flow management",
+    "FX solution", "FX platform", "FX tool",
+    "treasury solution", "treasury platform", "cash flow management",
     "multi currency", "multi-currency", "multicurrency",
     "currency account", "foreign currency account",
     "international banking", "international bank account",
@@ -537,7 +549,7 @@ KEYWORDS = [
     "cash pooling", "cash concentration",
     "intercompany payment", "intercompany transfer",
 
-    # Job signals
+    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
     "treasury manager", "treasury analyst", "FX manager", "FX analyst",
     "FX trader", "treasury director", "head of treasury", "VP treasury",
     "international payments manager", "global payments manager",
@@ -547,21 +559,6 @@ KEYWORDS = [
     "head of payments", "director of payments", "VP payments",
     "chief financial officer", "head of finance", "finance director",
     "controller international", "global controller",
-
-    # Negative / consumer signals (still listed — Claude uses them to lower score)
-    "send to my mum", "send to my mom", "send to my parents",
-    "send to my family", "send to my sister", "send to my brother",
-    "school fees", "rent money", "personal money", "pocket money",
-    "allowance", "birthday gift", "wedding gift",
-    "PayPal personal", "Cash App", "Venmo", "Zelle", "Apple Pay", "Google Pay",
-    "$50", "$100", "$200", "$300", "$500",
-    "£50", "£100", "£200", "£300", "£500",
-    "crypto trading", "bitcoin trading", "ethereum trading",
-    "altcoin", "NFT", "DeFi yield", "staking", "mining",
-    "Netflix", "Spotify", "BeatStars", "subscription payment",
-    "monthly subscription", "stock market", "shares", "dividend",
-    "mortgage", "car payment", "car loan", "student loan",
-    "credit card", "insurance claim", "tax refund",
 ]
 
 
@@ -569,17 +566,18 @@ def passes_keyword_filter(text: str) -> bool:
     """
     Returns True if text contains at least one target keyword.
     Case-insensitive. Zero API cost. Runs in microseconds.
-    Applied to ALL content: posts, comments, replies, tweets, Telegram messages.
+    Applied to ALL content: posts, comments, replies, tweets, telegram messages.
+    SAME keyword list for all 3 platforms — no mixing of items.
     """
     t = text.lower()
     for kw in KEYWORDS:
-        if kw in t:
+        if kw.lower() in t:
             return True
     return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE SYSTEM PROMPT — UNCHANGED from v6.1
+# CLAUDE SYSTEM PROMPT — v7 (Telegram added, all 3 platforms)
 # ─────────────────────────────────────────────────────────────────────────────
 
 CLAUDE_SYSTEM_PROMPT = """
@@ -600,6 +598,12 @@ Settla is NOT for personal remittances, family transfers, or amounts under $2,00
 Primary corridors: Canada→Nigeria, UK→Nigeria, USA→Nigeria,
 Canada→Pakistan, UK→Pakistan, Canada→India, Canada→Ghana,
 UK→Ghana, Australia→Nigeria, UAE→Nigeria — and all diaspora business corridors.
+
+━━━ PLATFORMS ━━━
+
+You will receive messages from 3 platforms: REDDIT, TWITTER, TELEGRAM.
+Each message is labelled with its platform. Score identically regardless of platform.
+Do NOT confuse or mix platform contexts.
 
 ━━━ 8 PAIN TYPES ━━━
 
@@ -635,7 +639,7 @@ SCORE 3-4 → tier: watchlist
 Future potential, 30-60 days.
 — Launching soon, new supplier found, contract signed
 
-SCORE 0-2 → tier: discard
+SCORE 1-2 → tier: discard
 Consumer, personal, wrong context.
 — Sending money home to family
 — Small personal amounts under $2,000
@@ -646,8 +650,9 @@ AUTO +1: business identity confirmed, large amount ($10k+), multiple pain points
          negative competitor mention, urgency words, active block, supplier at risk
 AUTO -1: personal/family context, amount under $2k, no business bio, commentary only
 
-AUTO DISCARD: consumer subscriptions, personal PayPal/CashApp, competitor outreach accounts,
-              content creators, crypto trading, news reposts without personal pain
+AUTO DISCARD (score 1): consumer subscriptions, personal PayPal/CashApp,
+              competitor outreach accounts, content creators, crypto trading,
+              news reposts without personal pain
 
 ━━━ COMPETITOR INTELLIGENCE ━━━
 
@@ -656,7 +661,7 @@ Known competitors: Wise, Remitly, WorldRemit, Western Union, MoneyGram, Payoneer
 OFX, XE, Revolut, LemFi, NALA, Grey Finance, Chipper Cash, Sendwave, TransferGo,
 Azimo, Xoom, OneDosh, Flutterwave, Duplo, Mercury, TD Bank, RBC, HSBC, Barclays.
 
-If post IS FROM a competitor doing outreach: score=0, set competitor_outreach_detected=true.
+If post IS FROM a competitor doing outreach: score=1, set competitor_outreach_detected=true.
 
 ━━━ OUTREACH SCRIPTS (score 5+ only; null below 5) ━━━
 
@@ -665,8 +670,8 @@ Max 3 sentences each. Sound like a founder, not a sales rep.
 Never start with "I". Never say "I hope this message finds you well".
 Never list features — pitch the outcome. End with one soft question.
 
-twitter_reply  — 2 sentences max, public tone
-twitter_dm     — 3 sentences max, personal tone
+twitter_reply   — 2 sentences max, public tone
+twitter_dm      — 3 sentences max, personal tone
 linkedin_message — 3 sentences max, professional but human
 
 ━━━ RETURN FORMAT ━━━
@@ -676,7 +681,7 @@ Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON 
 [
   {
     "index": <1-based integer matching message number>,
-    "intent_score": <0-10>,
+    "intent_score": <1-10>,
     "signal_category": <"high_intent" | "mid_intent" | "low_intent" | "discard">,
     "tier": <"immediate" | "digest" | "watchlist" | "discard">,
     "is_business": <true | false>,
@@ -698,11 +703,12 @@ Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON 
 ]
 
 Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
+MINIMUM score is 1 — never return 0.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — UNCHANGED from v6.1
+# MONGODB
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
@@ -731,13 +737,13 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — UNCHANGED
+# ANTHROPIC CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RETRY WITH EXPONENTIAL BACKOFF — UNCHANGED
+# RETRY WITH EXPONENTIAL BACKOFF
 # ─────────────────────────────────────────────────────────────────────────────
 
 def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
@@ -756,18 +762,18 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — UNCHANGED from v6.1
+# CLAUDE BATCH SCORER (shared by Reddit + Twitter + Telegram)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
     lines = []
     for i, item in enumerate(batch, start=1):
-        ctype    = item.get("content_type", "unknown").upper()
-        platform = item.get("platform", "unknown").upper()
+        ctype     = item.get("content_type", "unknown").upper()
+        platform  = item.get("platform", "unknown").upper()
         subreddit = item.get("subreddit", "")
-        group    = item.get("group", "")
-        username = item.get("username", "unknown")
-        text     = item.get("text", "")[:800]
+        group     = item.get("telegram_group", "")
+        username  = item.get("username", "unknown")
+        text      = item.get("text", "")[:800]  # 800-char cap — cost reduction
 
         if subreddit:
             location = f"r/{subreddit}"
@@ -786,7 +792,7 @@ def _build_batch_prompt(batch: list) -> str:
 
 def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
     return {
-        "index": index, "intent_score": 0,
+        "index": index, "intent_score": 1,
         "signal_category": "discard", "tier": "discard",
         "is_business": False, "business_size": "unknown",
         "corridor": None, "estimated_amount": None,
@@ -816,10 +822,7 @@ def _call_claude_batch(batch: list) -> list:
     if not isinstance(results, list):
         raise ValueError("Claude returned non-list.")
 
-    required = {
-        "index", "intent_score", "signal_category", "tier",
-        "is_business", "reason", "suggested_action",
-    }
+    required = {"index", "intent_score", "signal_category", "tier", "is_business", "reason", "suggested_action"}
     optional_defaults = {
         "business_size": "unknown", "corridor": None, "estimated_amount": None,
         "competitor_mentioned": None, "competitor_outreach_detected": False,
@@ -833,6 +836,9 @@ def _call_claude_batch(batch: list) -> list:
             raise ValueError(f"Missing keys in Claude response: {missing}")
         for k, v in optional_defaults.items():
             r.setdefault(k, v)
+        # Enforce minimum score of 1
+        if r.get("intent_score", 1) < 1:
+            r["intent_score"] = 1
 
     return results
 
@@ -848,17 +854,24 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE — UNCHANGED from v6.1
+# MONGODB STORAGE — saves ALL scores 1-10 (nothing discarded)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
+    """
+    Saves ALL signals 1-10 to MongoDB.
+    Score 1-5 are saved but never alerted.
+    Score 6-7 → Slack only.
+    Score 8-10 → Slack + HubSpot.
+    Platform field is always set — no cross-platform mixing.
+    """
     try:
         doc = {
             "message_id":                   data["message_id"],
-            "platform":                     data.get("platform", "unknown"),
+            "platform":                     data.get("platform", "unknown"),   # ALWAYS set
             "content_type":                 data.get("content_type", "unknown"),
             "subreddit":                    data.get("subreddit", ""),
-            "group":                        data.get("group", ""),     # Telegram group name
+            "telegram_group":               data.get("telegram_group", ""),
             "post_url":                     data.get("post_url", ""),
             "username":                     data.get("username", "unknown"),
             "message_text":                 data["message_text"],
@@ -882,19 +895,23 @@ def save_signal(data: dict) -> bool:
             "watchlist_reason":             data.get("watchlist_reason"),
             "client_id":                    CLIENT_ID,
             "alerted_slack":                False,
-            "alerted_telegram":             False,
             "alerted_hubspot":              False,
             "digest_included":              False,
             "created_at":                   datetime.now(timezone.utc),
         }
         db.signals.insert_one(doc)
-        group_label = f"tg/{data['group']}" if data.get("group") else ""
-        sub_label   = f"r/{data['subreddit']}" if data.get("subreddit") else ""
-        source      = group_label or sub_label or data.get("platform", "?").upper()
+
+        platform = data.get("platform", "?").upper()
+        score    = data["intent_score"]
+        user     = data.get("username", "?")
+        ctype    = data.get("content_type", "")
+        sub      = data.get("subreddit", "")
+        grp      = data.get("telegram_group", "")
+        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
+
         log.info(
-            f"SAVED | {data.get('platform','?').upper()} | "
-            f"Score:{data['intent_score']} | Tier:{data.get('tier','?')} | "
-            f"u/{data.get('username')} | {data.get('content_type','')} | {source}"
+            f"SAVED [{platform}] | Score:{score} | Tier:{data.get('tier','?')} | "
+            f"u/{user} | {ctype} | {source}"
         )
         return True
     except DuplicateKeyError:
@@ -915,16 +932,6 @@ def mark_slack_alerted(message_id: str):
         log.error(f"mark_slack_alerted error: {exc}")
 
 
-def mark_telegram_alerted(message_id: str):
-    try:
-        db.signals.update_one(
-            {"message_id": message_id},
-            {"$set": {"alerted_telegram": True, "alerted_telegram_at": datetime.now(timezone.utc)}},
-        )
-    except Exception as exc:
-        log.error(f"mark_telegram_alerted error: {exc}")
-
-
 def mark_hubspot_alerted(message_id: str, contact_id: str):
     try:
         db.signals.update_one(
@@ -940,7 +947,7 @@ def mark_hubspot_alerted(message_id: str, contact_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY — UNCHANGED from v6.1
+# SLACK DELIVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -961,23 +968,23 @@ def send_slack_alert(data: dict) -> bool:
         log.warning("SLACK_WEBHOOK_URL not set — skipping.")
         return False
 
-    score      = data["intent_score"]
-    platform   = data.get("platform", "unknown").upper()
-    ctype      = data.get("content_type", "post").upper()
-    subreddit  = data.get("subreddit", "")
-    group      = data.get("group", "")
-    post_url   = data.get("post_url", "")
-    username   = data.get("username", "unknown")
-    tier       = data.get("tier", "").upper()
-    category   = data.get("signal_category", "").replace("_", " ").upper()
-    is_biz     = data.get("is_business", False)
-    corridor   = data.get("corridor") or "Unknown"
-    amount     = data.get("estimated_amount") or "—"
-    pain       = data.get("pain_type") or "—"
-    competitor = data.get("competitor_mentioned") or "—"
-    urgency    = data.get("urgency", "none").upper()
-    outreach   = data.get("twitter_reply") or data.get("twitter_dm") or ""
-    timestamp  = data.get("timestamp", "—")
+    score       = data["intent_score"]
+    platform    = data.get("platform", "unknown").upper()
+    ctype       = data.get("content_type", "post").upper()
+    subreddit   = data.get("subreddit", "")
+    tg_group    = data.get("telegram_group", "")
+    post_url    = data.get("post_url", "")
+    username    = data.get("username", "unknown")
+    tier        = data.get("tier", "").upper()
+    category    = data.get("signal_category", "").replace("_", " ").upper()
+    is_biz      = data.get("is_business", False)
+    corridor    = data.get("corridor") or "Unknown"
+    amount      = data.get("estimated_amount") or "—"
+    pain        = data.get("pain_type") or "—"
+    competitor  = data.get("competitor_mentioned") or "—"
+    urgency     = data.get("urgency", "none").upper()
+    outreach    = data.get("twitter_reply") or data.get("twitter_dm") or ""
+    timestamp   = data.get("timestamp", "—")
 
     if score >= 9:
         urgency_tag = "⚡ RESPOND WITHIN 30 MINUTES"
@@ -993,8 +1000,8 @@ def send_slack_alert(data: dict) -> bool:
 
     if subreddit:
         source_label = f"r/{subreddit}"
-    elif group:
-        source_label = f"tg/{group}"
+    elif tg_group:
+        source_label = f"tg/{tg_group}"
     else:
         source_label = platform
 
@@ -1070,121 +1077,14 @@ def send_slack_alert(data: dict) -> bool:
         retries=3, delay=2, label="Slack",
     )
     if result:
-        log.info(f"Slack sent | {username} | Score:{score}")
+        log.info(f"Slack sent | {platform} | u/{username} | Score:{score}")
         return True
     log.error("Slack delivery failed after all retries.")
     return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM DELIVERY — UNCHANGED from v6.1
-# ─────────────────────────────────────────────────────────────────────────────
-
-TELEGRAM_API_BASE = "https://api.telegram.org"
-
-
-def _post_to_telegram(payload: dict):
-    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json=payload, timeout=10)
-    if r.status_code != 200:
-        raise Exception(f"Telegram {r.status_code}: {r.text}")
-    return r
-
-
-def _esc_html(text: str) -> str:
-    if not text:
-        return "—"
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-    )
-
-
-def send_telegram_alert(data: dict) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping.")
-        return False
-
-    score      = data["intent_score"]
-    platform   = data.get("platform", "unknown").upper()
-    ctype      = data.get("content_type", "post").upper()
-    subreddit  = data.get("subreddit", "")
-    group      = data.get("group", "")
-    post_url   = data.get("post_url", "")
-    username   = data.get("username", "unknown")
-    tier       = data.get("tier", "").upper()
-    category   = data.get("signal_category", "").replace("_", " ").upper()
-    is_biz     = data.get("is_business", False)
-    corridor   = data.get("corridor") or "Unknown"
-    amount     = data.get("estimated_amount") or "—"
-    pain       = data.get("pain_type") or "—"
-    competitor = data.get("competitor_mentioned") or "—"
-    urgency    = data.get("urgency", "none").upper()
-    outreach   = data.get("twitter_reply") or data.get("twitter_dm") or ""
-    timestamp  = data.get("timestamp", "—")
-
-    if subreddit:
-        source_label = f"r/{subreddit}"
-    elif group:
-        source_label = f"tg/{group}"
-    else:
-        source_label = platform
-
-    header_emoji = "🚨" if score >= 8 else "⚠️"
-
-    lines = [
-        f"{header_emoji} <b>{_esc_html(category)} — Score {score}/10 | {_esc_html(tier)}</b>",
-        "",
-        f"<b>Platform:</b> {_esc_html(platform)}",
-        f"<b>Source:</b> {_esc_html(source_label)}",
-        f"<b>Content Type:</b> {_esc_html(ctype)}",
-        f"<b>User:</b> {_esc_html(username)}",
-        f"<b>Profile:</b> {'✅ Business' if is_biz else '👤 Individual'}",
-        f"<b>Timestamp:</b> {_esc_html(timestamp)}",
-        "",
-        f"<b>Corridor:</b> {_esc_html(corridor)}",
-        f"<b>Estimated Amount:</b> {_esc_html(amount)}",
-        f"<b>Pain Type:</b> {_esc_html(pain)}",
-        f"<b>Competitor:</b> {_esc_html(competitor)}",
-        f"<b>Urgency:</b> {_esc_html(urgency)}",
-        "",
-        f"<b>Message:</b>\n{_esc_html(_safe(data['message_text'], 400))}",
-        "",
-        f"<b>Reason:</b> {_esc_html(_safe(data['reason'], 300))}",
-        "",
-        f"🎯 <b>Recommended Action:</b> {_esc_html(_safe(data['suggested_action'], 300))}",
-    ]
-
-    if outreach:
-        lines += ["", f"💬 <b>Outreach Script:</b>\n{_esc_html(_safe(outreach, 600))}"]
-
-    if post_url:
-        lines += ["", f"🔗 {post_url}"]
-
-    text = "\n".join(lines)
-    text = text[:4090] + ("…" if len(text) > 4090 else "")
-
-    payload = {
-        "chat_id":                  TELEGRAM_CHAT_ID,
-        "text":                     text,
-        "parse_mode":               "HTML",
-        "disable_web_page_preview": False,
-    }
-
-    result = retry_with_backoff(
-        _post_to_telegram, payload,
-        retries=3, delay=2, label="Telegram-Delivery",
-    )
-    if result:
-        log.info(f"Telegram alert sent | {username} | Score:{score}")
-        return True
-    log.error("Telegram delivery failed after all retries.")
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM — UNCHANGED from v6.1
+# HUBSPOT CRM
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -1198,9 +1098,7 @@ def _hs_find_contact(username: str) -> str | None:
     try:
         r = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
-            json={"filterGroups": [{"filters": [
-                {"propertyName": "firstname", "operator": "EQ", "value": username}
-            ]}]},
+            json={"filterGroups": [{"filters": [{"propertyName": "firstname", "operator": "EQ", "value": username}]}]},
             headers=_hs_headers(), timeout=10,
         )
         r.raise_for_status()
@@ -1213,13 +1111,12 @@ def _hs_find_contact(username: str) -> str | None:
 
 def _hs_create_contact(data: dict) -> str | None:
     try:
-        platform    = data.get("platform", "?").upper()
-        source_comm = data.get("group", "") or data.get("subreddit", "") or platform
+        sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         r = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/contacts",
             json={"properties": {
-                "firstname":           data.get("username", "unknown"),
-                "lastname":            f"{platform} Signal",
+                "firstname":           f"{data.get('username','unknown')}",
+                "lastname":            f"{data.get('platform','?').upper()} Signal",
                 "fx_intent_score":     str(data["intent_score"]),
                 "fx_signal_category":  data["signal_category"],
                 "fx_tier":             data.get("tier", ""),
@@ -1227,7 +1124,7 @@ def _hs_create_contact(data: dict) -> str | None:
                 "fx_pain_type":        data.get("pain_type") or "",
                 "fx_competitor":       data.get("competitor_mentioned") or "",
                 "fx_platform":         data.get("platform", ""),
-                "fx_source_community": source_comm,
+                "fx_source_community": sub,
                 "fx_signal_reason":    data["reason"],
                 "fx_suggested_action": data["suggested_action"],
             }},
@@ -1242,9 +1139,9 @@ def _hs_create_contact(data: dict) -> str | None:
 
 def _hs_create_note(data: dict, contact_id: str):
     try:
-        source = data.get("group", "") or data.get("subreddit", "") or data.get("platform", "")
+        sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         note = (
-            f"FLINTEL SIGNAL — v6.2\n\n"
+            f"FLINTEL SIGNAL — v7.0\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1257,7 +1154,7 @@ def _hs_create_note(data: dict, contact_id: str):
             f"Pain Type:    {data.get('pain_type') or 'Unknown'}\n"
             f"Urgency:      {data.get('urgency', 'none')}\n"
             f"Content Type: {data.get('content_type','unknown')}\n"
-            f"Source:       {source}\n"
+            f"Source:       {sub}\n"
             f"URL:          {data.get('post_url','N/A')}\n"
             f"Username:     {data.get('username','unknown')}\n"
             f"Timestamp:    {data.get('timestamp','N/A')}\n\n"
@@ -1298,7 +1195,7 @@ def _send_to_hubspot(data: dict) -> str | None:
     if not contact_id:
         return None
     _hs_create_note(data, contact_id)
-    log.info(f"HubSpot note attached | {username} | ID:{contact_id}")
+    log.info(f"HubSpot note attached | u/{username} | ID:{contact_id}")
     return contact_id
 
 
@@ -1307,26 +1204,30 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR — UNCHANGED from v6.1
-# Platform-agnostic. Works identically for Reddit, Twitter, Telegram source.
+# CORE SIGNAL PROCESSOR (platform-agnostic)
+# Saves ALL scores 1-10 to MongoDB
+# Alerts only 6+ to Slack, 8+ also to HubSpot
+# Platform field is always preserved — no mixing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict):
-    score = score_result.get("intent_score", 0)
-
-    if score <= 0:
-        log.debug(
-            f"DISCARD (score 0) | {item.get('platform','?').upper()} | "
-            f"{item.get('username')} | {item.get('content_type','')}"
-        )
-        return
+    """
+    Receives one item + its Claude score. Runs full delivery pipeline.
+    ALL scores 1-10 are saved to MongoDB.
+    Score 1-5  → MongoDB only (silent save)
+    Score 6-7  → MongoDB + Slack
+    Score 8-10 → MongoDB + Slack + HubSpot
+    Platform is always preserved — Reddit/Twitter/Telegram never mixed.
+    """
+    score    = score_result.get("intent_score", 1)
+    platform = item.get("platform", "unknown")
 
     data = {
         "message_id":                   item["message_id"],
-        "platform":                     item.get("platform", "unknown"),
+        "platform":                     platform,                          # ALWAYS set
         "content_type":                 item.get("content_type", "unknown"),
         "subreddit":                    item.get("subreddit", ""),
-        "group":                        item.get("group", ""),
+        "telegram_group":               item.get("telegram_group", ""),
         "post_url":                     item.get("post_url", ""),
         "username":                     item.get("username", "unknown"),
         "message_text":                 item.get("text", ""),
@@ -1351,40 +1252,51 @@ def process_scored_item(item: dict, score_result: dict):
         "timestamp":                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
+    # Save ALL scores 1-10 to MongoDB
     saved = save_signal(data)
     if not saved:
         return  # Duplicate — skip delivery
 
-    if score < MIN_SCORE_ALERT:
-        log.info(
-            f"LOW    | Score:{score} | Stored only | {data['username']} | "
-            f"{data['platform'].upper()}"
+    # Score 1-5 → silent save only
+    if score < MIN_SCORE_MEDIUM:
+        log.debug(
+            f"SILENT SAVE | [{platform.upper()}] Score:{score} | "
+            f"u/{data['username']} | {data['content_type']}"
         )
         return
 
-    log.info(
-        f"ALERT  | Score:{score} | Slack + Telegram + HubSpot | "
-        f"{data['username']} | {data['platform'].upper()}"
-    )
+    # Score 6-7 → Slack only
+    if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
+        log.info(
+            f"MEDIUM | [{platform.upper()}] Score:{score} | Slack only | "
+            f"u/{data['username']}"
+        )
+        ok = send_slack_alert(data)
+        if ok:
+            mark_slack_alerted(data["message_id"])
 
-    ok_slack = send_slack_alert(data)
-    if ok_slack:
-        mark_slack_alerted(data["message_id"])
-
-    ok_telegram = send_telegram_alert(data)
-    if ok_telegram:
-        mark_telegram_alerted(data["message_id"])
-
-    cid = send_to_hubspot(data)
-    if cid:
-        mark_hubspot_alerted(data["message_id"], cid)
+    # Score 8-10 → Slack + HubSpot
+    elif score >= MIN_SCORE_HIGH:
+        log.info(
+            f"HIGH | [{platform.upper()}] Score:{score} | Slack + HubSpot | "
+            f"u/{data['username']}"
+        )
+        ok = send_slack_alert(data)
+        if ok:
+            mark_slack_alerted(data["message_id"])
+        cid = send_to_hubspot(data)
+        if cid:
+            mark_hubspot_alerted(data["message_id"], cid)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — UNCHANGED from v6.1
-# Shared by Reddit, Twitter, and Telegram source — each gets its own thread.
-# Items from different platforms NEVER share the same queue or batch.
-# This guarantees data ordering: MongoDB inserts are sequential per platform.
+# GENERIC BATCH PROCESSOR (shared by all 3 platforms)
+# Features:
+#   - Collects keyword-matched items into batches of batch_size
+#   - BATCH_TIMEOUT_SECONDS: sends partial batch after timeout even if not full
+#   - Live counter display: e.g. [REDDIT] MATCH [7/10] or [TWITTER] MATCH [12/50]
+#   - 30s gap between batches
+#   - Platform isolation guaranteed via item["platform"] field
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -1392,102 +1304,117 @@ def run_batch_processor(
     batch_size: int,
     platform_label: str,
 ):
+    """
+    Reads from queue q (platform-specific — never shared).
+    Collects keyword-matched items into batches of batch_size.
+    Sends batch to Claude when EITHER:
+      (a) batch_size items collected, OR
+      (b) BATCH_TIMEOUT_SECONDS elapsed since first item in current batch
+    30s gap between batches.
+    ALL scored items go to process_scored_item (saves 1-10 to MongoDB).
+    Live counter: [PLATFORM] MATCH [current/target]
+    """
     log.info(
-        f"Batch processor [{platform_label}] started | batch_size:{batch_size} | "
-        f"gap:{BATCH_GAP_SECONDS}s | timeout_flush:{BATCH_TIMEOUT_SECONDS}s"
+        f"Batch processor [{platform_label}] started | "
+        f"batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s | "
+        f"timeout:{BATCH_TIMEOUT_SECONDS}s"
     )
 
-    current_batch   = []
-    batch_opened_at = None
-    total_received  = 0
-    total_matched   = 0
-    total_dropped   = 0
-    total_batches   = 0
-
-    def _send_batch(reason: str):
-        nonlocal current_batch, batch_opened_at, total_batches
-
-        if not current_batch:
-            return
-
-        total_batches += 1
-        batch_to_send  = current_batch
-        current_batch  = []
-        batch_opened_at = None
-
-        log.info(
-            f"[{platform_label}] ━━━ BATCH {total_batches} ({reason}) ━━━ | "
-            f"items:{len(batch_to_send)} | "
-            f"received:{total_received} matched:{total_matched} dropped:{total_dropped}"
-        )
-
-        scores    = score_batch_with_claude(batch_to_send)
-        score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
-
-        for i, it in enumerate(batch_to_send):
-            pos = i + 1
-            sr  = (
-                score_map.get(pos)
-                or (scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch."))
-            )
-            process_scored_item(it, sr)
-
-        log.info(
-            f"[{platform_label}] BATCH {total_batches} DONE | "
-            f"waiting {BATCH_GAP_SECONDS}s..."
-        )
-        time.sleep(BATCH_GAP_SECONDS)
+    current_batch    = []
+    batch_start_time = None
+    total_received   = 0
+    total_matched    = 0
+    total_dropped    = 0
+    total_batches    = 0
 
     while True:
         try:
+            # Determine how long to wait for next item
+            if current_batch and batch_start_time is not None:
+                elapsed   = time.time() - batch_start_time
+                remaining = BATCH_TIMEOUT_SECONDS - elapsed
+                wait_time = max(0.1, remaining)
+            else:
+                wait_time = 1.0
+
             try:
-                item = q.get(timeout=1)
+                item = q.get(timeout=wait_time)
+                got_item = True
             except queue.Empty:
-                if current_batch and batch_opened_at is not None:
-                    age = time.time() - batch_opened_at
-                    if age >= BATCH_TIMEOUT_SECONDS:
-                        _send_batch(reason=f"timeout {age:.0f}s")
-                continue
+                got_item = False
 
-            total_received += 1
-            text = item.get("text", "").strip()
+            if got_item:
+                total_received += 1
+                text = item.get("text", "").strip()
 
-            if not text or len(text) < 10:
-                q.task_done()
-                if current_batch and batch_opened_at is not None:
-                    if time.time() - batch_opened_at >= BATCH_TIMEOUT_SECONDS:
-                        _send_batch(reason="timeout (post-short-item)")
-                continue
+                if not text or len(text) < 10:
+                    q.task_done()
+                    continue
 
-            if not passes_keyword_filter(text):
-                total_dropped += 1
-                log.debug(
-                    f"[{platform_label}] FILTERED | {item.get('username')} | "
-                    f"{item.get('content_type','?')}"
+                if not passes_keyword_filter(text):
+                    total_dropped += 1
+                    log.debug(
+                        f"[{platform_label}] FILTERED | "
+                        f"u/{item.get('username')} | {item.get('content_type','?')}"
+                    )
+                    q.task_done()
+                    continue
+
+                total_matched += 1
+
+                if not current_batch:
+                    batch_start_time = time.time()
+
+                current_batch.append(item)
+
+                log.info(
+                    f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
+                    f"{item.get('content_type','?').upper()} | u/{item.get('username')}"
                 )
+
                 q.task_done()
-                if current_batch and batch_opened_at is not None:
-                    if time.time() - batch_opened_at >= BATCH_TIMEOUT_SECONDS:
-                        _send_batch(reason="timeout (post-filtered)")
-                continue
 
-            total_matched += 1
-            if not current_batch:
-                batch_opened_at = time.time()
-            current_batch.append(item)
-
-            log.info(
-                f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
-                f"{item.get('content_type','?').upper()} | {item.get('username')}"
-            )
-
-            q.task_done()
+            # Check if we should fire the batch
+            should_fire = False
+            fire_reason = ""
 
             if len(current_batch) >= batch_size:
-                _send_batch(reason="full")
-            elif batch_opened_at is not None:
-                if time.time() - batch_opened_at >= BATCH_TIMEOUT_SECONDS:
-                    _send_batch(reason=f"timeout {time.time() - batch_opened_at:.0f}s")
+                should_fire = True
+                fire_reason = f"batch full ({batch_size} items)"
+            elif current_batch and batch_start_time is not None:
+                elapsed = time.time() - batch_start_time
+                if elapsed >= BATCH_TIMEOUT_SECONDS:
+                    should_fire = True
+                    fire_reason = f"timeout ({BATCH_TIMEOUT_SECONDS}s) — partial batch {len(current_batch)}/{batch_size}"
+
+            if should_fire and current_batch:
+                total_batches += 1
+                batch_to_send  = current_batch[:batch_size]
+                current_batch  = current_batch[batch_size:]
+                batch_start_time = None if not current_batch else time.time()
+
+                log.info(
+                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | "
+                    f"reason:{fire_reason} | items:{len(batch_to_send)} | "
+                    f"received:{total_received} matched:{total_matched} dropped:{total_dropped}"
+                )
+
+                scores = score_batch_with_claude(batch_to_send)
+
+                score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
+
+                for i, it in enumerate(batch_to_send):
+                    pos = i + 1
+                    sr  = score_map.get(pos) or (
+                        scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch.")
+                    )
+                    process_scored_item(it, sr)
+
+                log.info(
+                    f"[{platform_label}] BATCH {total_batches} DONE | "
+                    f"waiting {BATCH_GAP_SECONDS}s..."
+                )
+                time.sleep(BATCH_GAP_SECONDS)
 
         except Exception as exc:
             log.error(f"[{platform_label}] batch processor error: {exc}")
@@ -1495,7 +1422,7 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT STREAMS — UNCHANGED from v6.1
+# REDDIT STREAMS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_reddit_client() -> praw.Reddit:
@@ -1525,14 +1452,14 @@ def stream_posts(reddit: praw.Reddit):
                     text = f"{post.title}\n\n{post.selftext}"
                 author = str(post.author) if post.author else "[deleted]"
                 reddit_queue.put({
-                    "message_id":   f"reddit_post_{post.id}",
-                    "platform":     "reddit",
-                    "content_type": "post",
-                    "text":         text,
-                    "username":     author,
-                    "subreddit":    str(post.subreddit),
-                    "group":        "",
-                    "post_url":     f"https://reddit.com{post.permalink}",
+                    "message_id":     f"reddit_post_{post.id}",
+                    "platform":       "reddit",          # NEVER changes
+                    "content_type":   "post",
+                    "text":           text,
+                    "username":       author,
+                    "subreddit":      str(post.subreddit),
+                    "telegram_group": "",
+                    "post_url":       f"https://reddit.com{post.permalink}",
                 })
         except praw.exceptions.PRAWException as exc:
             log.error(f"PRAW post stream error: {exc} — reconnecting in 30s...")
@@ -1555,14 +1482,14 @@ def stream_comments(reddit: praw.Reddit):
                 ctype  = "reply" if comment.parent_id.startswith("t1_") else "comment"
                 author = str(comment.author) if comment.author else "[deleted]"
                 reddit_queue.put({
-                    "message_id":   f"reddit_comment_{comment.id}",
-                    "platform":     "reddit",
-                    "content_type": ctype,
-                    "text":         comment.body,
-                    "username":     author,
-                    "subreddit":    str(comment.subreddit),
-                    "group":        "",
-                    "post_url":     f"https://reddit.com{comment.permalink}",
+                    "message_id":     f"reddit_comment_{comment.id}",
+                    "platform":       "reddit",          # NEVER changes
+                    "content_type":   ctype,
+                    "text":           comment.body,
+                    "username":       author,
+                    "subreddit":      str(comment.subreddit),
+                    "telegram_group": "",
+                    "post_url":       f"https://reddit.com{comment.permalink}",
                 })
         except praw.exceptions.PRAWException as exc:
             log.error(f"PRAW comment stream error: {exc} — reconnecting in 30s...")
@@ -1573,7 +1500,7 @@ def stream_comments(reddit: praw.Reddit):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER — UNCHANGED from v6.1
+# TWITTER / X POLLER
 # ─────────────────────────────────────────────────────────────────────────────
 
 TWITTER_SEARCH_QUERY = (
@@ -1610,6 +1537,11 @@ def build_twitter_client() -> tweepy.Client | None:
 
 
 def poll_twitter(client: tweepy.Client):
+    """
+    Polls Twitter search every TWITTER_POLL_INTERVAL seconds.
+    Fetches up to 50 tweets per poll. Deduplicates by tweet ID.
+    Pushes unique tweets to twitter_queue ONLY — never reddit_queue or telegram_queue.
+    """
     seen_ids: set = set()
     log.info("Twitter poll started.")
 
@@ -1639,26 +1571,30 @@ def poll_twitter(client: tweepy.Client):
                 if tweet_id in seen_ids:
                     continue
                 seen_ids.add(tweet_id)
+
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
                 text     = tweet.text or ""
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
-                twitter_queue.put({
-                    "message_id":   f"twitter_{tweet_id}",
-                    "platform":     "twitter",
-                    "content_type": "tweet",
-                    "text":         text,
-                    "username":     username,
-                    "subreddit":    "",
-                    "group":        "",
-                    "post_url":     f"https://twitter.com/{username}/status/{tweet_id}",
+                twitter_queue.put({           # ONLY twitter_queue — never mixed
+                    "message_id":     f"twitter_{tweet_id}",
+                    "platform":       "twitter",      # NEVER changes
+                    "content_type":   "tweet",
+                    "text":           text,
+                    "username":       username,
+                    "subreddit":      "",
+                    "telegram_group": "",
+                    "post_url":       f"https://twitter.com/{username}/status/{tweet_id}",
                 })
                 new_count += 1
 
             if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
+                log.info(
+                    f"Twitter: {new_count} new tweets queued | "
+                    f"queue_size:{twitter_queue.qsize()}"
+                )
 
         except tweepy.errors.TweepyException as exc:
             log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
@@ -1669,265 +1605,337 @@ def poll_twitter(client: tweepy.Client):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM SOURCE LISTENER — NEW v6.2
+# TELEGRAM LISTENER (Telethon — human account, read-only)
 #
-# Uses Telethon (MTProto) with a NORMAL USER account (not a bot).
-# This means:
-#   - Can listen to public groups without being added by an admin
-#   - Can read message history for groups it joins
-#   - Sees replies / comment threads natively
-#   - NEVER sends, reacts, forwards, or interacts — pure listener
-#
-# Startup sequence (per group, staggered by TELEGRAM_JOIN_DELAY_SECONDS):
-#   1. Attempt to join the group (JoinChannelRequest or resolve username)
-#   2. If already a member — UserAlreadyParticipantError — skip silently
-#   3. If private — ChannelPrivateError — log and skip
-#   4. Wait TELEGRAM_JOIN_DELAY_SECONDS before next group
-#
-# Message handling:
-#   - New messages in any joined group → event handler fires
-#   - reply_to field present → content_type = "reply"
-#   - No reply_to → content_type = "message"
-#   - Username extracted from sender; falls back to sender_id string
-#   - message_id = f"telegram_{chat_id}_{message_id}"
-#   - Pushed to telegram_source_queue (NEVER to reddit or twitter queues)
-#   - Keyword filter runs in the batch processor (same as Reddit/Twitter)
-#
-# Session persistence:
-#   - Telethon creates TELETHON_SESSION_FILE.session on first login
-#   - On subsequent runs, session is reused — no re-auth required
-#   - First run requires interactive phone + OTP in terminal
-#
+# Strategy:
+#   — Telethon client with TELEGRAM_API_ID + TELEGRAM_API_HASH + TELEGRAM_PHONE
+#   — Auto-join TARGET_TELEGRAM_GROUPS on startup with TELEGRAM_JOIN_GAP_SECONDS gap
+#   — Listen ONLY — no replies, no reactions, no forwards, no interactions
+#   — New messages from joined groups → keyword filter → telegram_queue
+#   — telegram_queue is SEPARATE from reddit_queue and twitter_queue (no mixing)
+#   — Session saved to disk (TELEGRAM_SESSION) so re-auth only needed once
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _join_telegram_groups(client: "TelegramClient"):
+def _join_telegram_groups_sync(client: TelegramClient):
     """
-    Join TARGET_TELEGRAM_GROUPS one by one.
-    Staggered by TELEGRAM_JOIN_DELAY_SECONDS per group to avoid flood limits.
-    Only joins public groups — skips private/expired links gracefully.
+    Synchronously joins TARGET_TELEGRAM_GROUPS.
+    Called once at startup via asyncio loop.
+    30s gap between each join to avoid flood limits.
+    Read-only account — joins are purely for listening.
     """
-    if not TARGET_TELEGRAM_GROUPS:
-        log.info("Telegram source: no TARGET_TELEGRAM_GROUPS configured — skipping join.")
-        return
-
-    from telethon.tl.functions.channels import JoinChannelRequest
-
     log.info(
-        f"Telegram source: joining {len(TARGET_TELEGRAM_GROUPS)} group(s) | "
-        f"delay:{TELEGRAM_JOIN_DELAY_SECONDS}s between each"
+        f"Telegram: starting auto-join for {len(TARGET_TELEGRAM_GROUPS)} groups | "
+        f"gap:{TELEGRAM_JOIN_GAP_SECONDS}s"
     )
+    joined   = 0
+    skipped  = 0
+    failed   = 0
 
-    for i, group in enumerate(TARGET_TELEGRAM_GROUPS):
-        try:
-            entity = await client.get_entity(group)
-            await client(JoinChannelRequest(entity))
-            log.info(f"Telegram source: joined '{group}' ✅")
-        except UserAlreadyParticipantError:
-            log.info(f"Telegram source: already in '{group}' — skipping join")
-        except ChannelPrivateError:
-            log.warning(f"Telegram source: '{group}' is private — cannot join, skipping")
-        except InviteHashExpiredError:
-            log.warning(f"Telegram source: invite link for '{group}' expired — skipping")
-        except Exception as exc:
-            log.error(f"Telegram source: could not join '{group}': {exc}")
-
-        # Stagger — wait before next group except after the last one
-        if i < len(TARGET_TELEGRAM_GROUPS) - 1:
-            log.info(f"Telegram source: waiting {TELEGRAM_JOIN_DELAY_SECONDS}s before next group...")
-            await asyncio.sleep(TELEGRAM_JOIN_DELAY_SECONDS)
-
-
-async def stream_telegram_groups(client: "TelegramClient"):
-    """
-    Telethon event handler — fires on every new message in monitored groups.
-    Listen-only: no sends, no reactions, no forwards.
-    Pushes keyword-eligible items to telegram_source_queue.
-    """
-    if not TARGET_TELEGRAM_GROUPS:
-        log.info("Telegram source: no groups configured — listener idle.")
-        return
-
-    # Build a set of resolved chat IDs for fast filtering
-    monitored_ids: set = set()
     for group in TARGET_TELEGRAM_GROUPS:
         try:
-            entity = await client.get_entity(group)
-            monitored_ids.add(entity.id)
+            # Normalise: ensure @ prefix for usernames
+            target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
+            client.loop.run_until_complete(client(JoinChannelRequest(target)))
+            joined += 1
+            log.info(f"Telegram: joined {target} [{joined}/{len(TARGET_TELEGRAM_GROUPS)}]")
+            time.sleep(TELEGRAM_JOIN_GAP_SECONDS)
+        except UserAlreadyParticipantError:
+            skipped += 1
+            log.debug(f"Telegram: already in {group} — skip")
+        except FloodWaitError as e:
+            log.warning(f"Telegram: FloodWait {e.seconds}s for {group} — waiting...")
+            time.sleep(e.seconds + 5)
+            failed += 1
+        except (ChannelPrivateError, InviteHashExpiredError) as exc:
+            log.warning(f"Telegram: cannot join {group} — {exc}")
+            failed += 1
         except Exception as exc:
-            log.error(f"Telegram source: could not resolve '{group}' for monitoring: {exc}")
+            log.error(f"Telegram: join error for {group} — {exc}")
+            failed += 1
 
-    if not monitored_ids:
-        log.error("Telegram source: no groups could be resolved — listener will not fire.")
-        return
+    log.info(
+        f"Telegram auto-join complete | "
+        f"joined:{joined} already_in:{skipped} failed:{failed}"
+    )
 
-    log.info(f"Telegram source: monitoring {len(monitored_ids)} group(s) — listener active")
 
-    @client.on(events.NewMessage(chats=list(monitored_ids)))
-    async def _on_new_message(event):
-        """
-        Fires for every new message in any monitored group.
-        NEVER responds, reacts, or interacts.
-        Pure read-only pipeline push.
-        """
+async def _run_telegram_listener(client: TelegramClient):
+    """
+    Async Telegram listener.
+    Registers a message handler on all chats.
+    Filters only messages from TARGET_TELEGRAM_GROUPS.
+    Pushes keyword-matching messages to telegram_queue ONLY.
+    NO reactions, replies, or any form of interaction.
+    """
+    # Build set of normalised group names for fast lookup
+    target_set = set()
+    for g in TARGET_TELEGRAM_GROUPS:
+        clean = g.lstrip("@").lower()
+        target_set.add(clean)
+
+    @client.on(events.NewMessage)
+    async def _on_message(event):
         try:
-            msg: Message = event.message
+            chat = await event.get_chat()
 
-            # Skip empty / media-only messages with no text
-            text = (msg.message or "").strip()
-            if not text:
+            # Determine group username
+            username_attr = getattr(chat, "username", None)
+            chat_title    = getattr(chat, "title", "") or ""
+
+            if username_attr:
+                group_key = username_attr.lower()
+            else:
+                group_key = chat_title.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+            # Only process messages from our target groups
+            if group_key not in target_set:
                 return
 
-            # Determine content type
-            ctype = "reply" if msg.reply_to else "message"
+            sender    = await event.get_sender()
+            text      = event.raw_text or ""
+            sender_id = getattr(sender, "id", 0)
+            first     = getattr(sender, "first_name", "") or ""
+            last      = getattr(sender, "last_name", "") or ""
+            tg_user   = getattr(sender, "username", None) or f"user_{sender_id}"
+            display   = f"{first} {last}".strip() or tg_user
+            msg_id    = event.id
+            chat_id   = event.chat_id
 
-            # Extract username — sender may be None for channels
-            sender = await event.get_sender()
-            if sender is None:
-                username = f"user_{msg.sender_id}"
-            elif hasattr(sender, "username") and sender.username:
-                username = sender.username
-            elif hasattr(sender, "first_name"):
-                parts = [sender.first_name or "", getattr(sender, "last_name", "") or ""]
-                username = " ".join(p for p in parts if p).strip() or f"user_{msg.sender_id}"
-            else:
-                username = f"user_{msg.sender_id}"
+            if not text or len(text) < 5:
+                return
 
-            # Resolve group name for logging / storage
-            chat = await event.get_chat()
-            group_name = getattr(chat, "username", None) or getattr(chat, "title", str(event.chat_id))
-
-            # Unique message ID
-            message_id = f"telegram_{event.chat_id}_{msg.id}"
-
-            # Push to dedicated queue — batch processor handles keyword filter
-            telegram_source_queue.put({
-                "message_id":   message_id,
-                "platform":     "telegram_source",
-                "content_type": ctype,
-                "text":         text,
-                "username":     username,
-                "subreddit":    "",
-                "group":        group_name,
-                "post_url":     f"https://t.me/{group_name}/{msg.id}" if group_name else "",
+            # Push to telegram_queue ONLY — never redis_queue or twitter_queue
+            telegram_queue.put({
+                "message_id":     f"telegram_{chat_id}_{msg_id}",
+                "platform":       "telegram",      # NEVER changes
+                "content_type":   "message",
+                "text":           text,
+                "username":       tg_user,
+                "display_name":   display,
+                "subreddit":      "",
+                "telegram_group": username_attr or chat_title,
+                "post_url":       "",              # Telegram links require invite
             })
 
-            log.debug(
-                f"[TELEGRAM-SOURCE] queued | tg/{group_name} | {ctype} | "
-                f"{username} | queue:{telegram_source_queue.qsize()}"
-            )
-
         except Exception as exc:
-            log.error(f"Telegram source message handler error: {exc}")
+            log.error(f"Telegram message handler error: {exc}")
 
-    # Keep the event loop alive — Telethon handles reconnects internally
-    log.info("Telegram source: event handler registered — waiting for messages...")
+    log.info("Telegram listener active — read-only, no interactions.")
     await client.run_until_disconnected()
 
 
-def _run_telegram_source_event_loop():
+def run_telegram_listener_thread():
     """
-    Runs the Telethon async event loop in a dedicated thread.
-    Telethon is natively async; we create a new event loop for this thread.
-    On disconnect or error, sleeps 30s then restarts.
+    Runs in a dedicated thread.
+    Creates Telethon client, joins groups, then starts async listener.
     """
-    if not TELETHON_AVAILABLE:
-        log.error(
-            "Telegram source: telethon not installed. "
-            "Run: pip install telethon --break-system-packages"
-        )
-        return
-
-    if not TELETHON_API_ID or not TELETHON_API_HASH or not TELETHON_PHONE:
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
         log.warning(
-            "Telegram source: TELETHON_API_ID / TELETHON_API_HASH / TELETHON_PHONE "
-            "not set — Telegram source listener disabled."
+            "Telegram disabled — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE"
         )
         return
 
-    while True:
-        loop = asyncio.new_event_loop()
+    try:
+        loop   = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        try:
-            client = TelegramClient(
-                TELETHON_SESSION_FILE,
-                int(TELETHON_API_ID),
-                TELETHON_API_HASH,
-                loop=loop,
-            )
 
-            async def _run():
-                await client.start(phone=TELETHON_PHONE)
-                log.info("Telegram source: Telethon connected ✅")
-                await _join_telegram_groups(client)
-                await stream_telegram_groups(client)
+        client = TelegramClient(
+            TELEGRAM_SESSION,
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+            loop=loop,
+        )
 
-            loop.run_until_complete(_run())
+        loop.run_until_complete(client.start(phone=TELEGRAM_PHONE))
+        me = loop.run_until_complete(client.get_me())
+        log.info(
+            f"Telegram authenticated as {me.first_name} "
+            f"(@{me.username or me.id})"
+        )
 
-        except Exception as exc:
-            log.error(f"Telegram source event loop error: {exc} — restarting in 30s...")
-            time.sleep(30)
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
+        # Auto-join groups with 30s gap
+        _join_telegram_groups_sync(client)
 
+        # Start read-only listener
+        loop.run_until_complete(_run_telegram_listener(client))
 
-async def start_telegram_source_listener():
-    """
-    Starts the Telegram source listener in a daemon thread.
-    Also starts the dedicated telegram_source batch processor thread.
-    Auto-restarts both threads if they die (checked every 60s).
-    """
-    if not TELETHON_AVAILABLE:
-        log.warning("Telegram source: telethon not installed — skipping.")
-        return
-    if not (TELETHON_API_ID and TELETHON_API_HASH and TELETHON_PHONE):
-        log.warning("Telegram source: credentials not set — skipping.")
-        return
-
-    # Thread 1: Telethon event loop (runs async inside a sync thread)
-    tg_src_thread = threading.Thread(
-        target=_run_telegram_source_event_loop,
-        daemon=True,
-        name="Telegram-Source",
-    )
-
-    # Thread 2: batch processor (reads from telegram_source_queue)
-    tg_btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(telegram_source_queue, TELEGRAM_SOURCE_BATCH_SIZE, "TELEGRAM-SOURCE"),
-        daemon=True,
-        name="Telegram-Source-Batch",
-    )
-
-    tg_src_thread.start()
-    tg_btch_thread.start()
-    log.info("Telegram source threads running: Listener ✅ | Batch ✅")
-
-    while True:
-        await asyncio.sleep(60)
-        if not tg_src_thread.is_alive():
-            log.error("Telegram source listener thread died — restarting...")
-            tg_src_thread = threading.Thread(
-                target=_run_telegram_source_event_loop,
-                daemon=True,
-                name="Telegram-Source",
-            )
-            tg_src_thread.start()
-        if not tg_btch_thread.is_alive():
-            log.error("Telegram source batch thread died — restarting...")
-            tg_btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(telegram_source_queue, TELEGRAM_SOURCE_BATCH_SIZE, "TELEGRAM-SOURCE"),
-                daemon=True,
-                name="Telegram-Source-Batch",
-            )
-            tg_btch_thread.start()
+    except Exception as exc:
+        log.error(f"Telegram listener thread error: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT LISTENER — UNCHANGED from v6.1
+# SCHEDULERS — Daily Digest + Weekly Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_daily_digest():
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        signals = list(
+            db.signals.find({
+                "client_id":    CLIENT_ID,
+                "intent_score": {"$gte": 6, "$lte": 7},
+                "created_at":   {"$gte": since},
+                "digest_included": False,
+            }).sort("intent_score", -1)
+        )
+
+        if not signals:
+            log.info("Daily digest: no medium signals in past 24h.")
+            return
+
+        lines = []
+        for s in signals:
+            preview  = s["message_text"][:120]
+            if len(s["message_text"]) > 120:
+                preview += "..."
+            corridor = s.get("corridor") or "—"
+            pain     = s.get("pain_type") or "—"
+            platform = s.get("platform", "?").upper()
+            sub      = s.get("subreddit", "")
+            grp      = s.get("telegram_group", "")
+            source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
+            lines.append(
+                f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
+                f"| {platform} | {source}\n"
+                f"  Corridor: {corridor} | Pain: {pain}\n"
+                f"  _{preview}_\n"
+                f"  ↳ {s['suggested_action']}"
+            )
+
+        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
+        joined   = "\n\n".join(lines)
+        chunks   = [joined[i:i+2900] for i in range(0, len(joined), 2900)]
+
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"📋 Daily Signal Digest — {date_str}", "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{len(signals)} medium intent signals* (score 6–7) in the past 24 hours:"}},
+        ]
+        for chunk in chunks:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+        blocks += [
+            {"type": "divider"},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+        ]
+
+        result = retry_with_backoff(
+            _post_to_slack, {"text": f"📋 Daily Signal Digest — {date_str}", "blocks": blocks},
+            retries=3, delay=2, label="Digest",
+        )
+        if result:
+            ids = [s["message_id"] for s in signals]
+            db.signals.update_many({"message_id": {"$in": ids}}, {"$set": {"digest_included": True}})
+            log.info(f"Daily digest sent | {len(signals)} signals.")
+
+    except Exception as exc:
+        log.error(f"Daily digest error: {exc}")
+
+
+def send_weekly_report():
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        since        = datetime.now(timezone.utc) - timedelta(days=7)
+        all_signals  = list(db.signals.find({"client_id": CLIENT_ID, "created_at": {"$gte": since}}))
+        high         = [s for s in all_signals if s["intent_score"] >= 8]
+        medium       = [s for s in all_signals if 6 <= s["intent_score"] <= 7]
+        business     = [s for s in all_signals if s.get("is_business")]
+        reddit_sigs  = [s for s in all_signals if s.get("platform") == "reddit"]
+        twitter_sigs = [s for s in all_signals if s.get("platform") == "twitter"]
+        telegram_sigs= [s for s in all_signals if s.get("platform") == "telegram"]
+        total        = len(all_signals)
+
+        if total == 0:
+            log.info("Weekly report: no signals this week.")
+            return
+
+        def breakdown(key):
+            counts: dict = {}
+            for s in all_signals:
+                v = s.get(key)
+                if v:
+                    counts[v] = counts.get(v, 0) + 1
+            return "\n".join(
+                f"  • {k}: {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])
+            ) or "_None_"
+
+        top3       = sorted(high, key=lambda x: x["intent_score"], reverse=True)[:3]
+        top3_lines = [
+            f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
+            f"| {s.get('platform','?').upper()} | {s.get('corridor') or 'Unknown corridor'}\n"
+            f"  _{s['message_text'][:100]}{'...' if len(s['message_text'])>100 else ''}_"
+            for s in top3
+        ]
+
+        week_start = since.strftime("%b %d")
+        week_end   = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+        payload = {
+            "text": f"📊 Weekly Signal Report — {week_start} to {week_end}",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": f"📊 Weekly Signal Report — {week_start} to {week_end}", "emoji": True}},
+                {"type": "section", "fields": [
+                    {"type": "mrkdwn", "text": f"*Total Signals*\n{total}"},
+                    {"type": "mrkdwn", "text": f"*High Intent (8–10)*\n{len(high)}"},
+                    {"type": "mrkdwn", "text": f"*Medium Intent (6–7)*\n{len(medium)}"},
+                    {"type": "mrkdwn", "text": f"*Business Owners*\n{len(business)}"},
+                    {"type": "mrkdwn", "text": f"*Reddit*\n{len(reddit_sigs)}"},
+                    {"type": "mrkdwn", "text": f"*Twitter/X*\n{len(twitter_sigs)}"},
+                    {"type": "mrkdwn", "text": f"*Telegram*\n{len(telegram_sigs)}"},
+                ]},
+                {"type": "divider"},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Corridor Breakdown*\n{breakdown('corridor')}"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Competitor Mentions*\n{breakdown('competitor_mentioned')}"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Pain Types*\n{breakdown('pain_type')}"}},
+                {"type": "divider"},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
+                {"type": "divider"},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.0 | {CLIENT_ID} | Week ending {week_end}"}]},
+            ],
+        }
+
+        result = retry_with_backoff(_post_to_slack, payload, retries=3, delay=2, label="WeeklyReport")
+        if result:
+            log.info(
+                f"Weekly report sent | Total:{total} High:{len(high)} Med:{len(medium)} "
+                f"Biz:{len(business)} Reddit:{len(reddit_sigs)} "
+                f"Twitter:{len(twitter_sigs)} Telegram:{len(telegram_sigs)}"
+            )
+
+    except Exception as exc:
+        log.error(f"Weekly report error: {exc}")
+
+
+async def run_scheduler():
+    log.info(
+        f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | "
+        f"report Mon {WEEKLY_REPORT_HOUR}:00 UTC"
+    )
+    last_digest_date = None
+    last_report_week = None
+
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(timezone.utc)
+
+        if now.hour == DAILY_DIGEST_HOUR and now.date() != last_digest_date:
+            log.info("Scheduler: triggering daily digest...")
+            await asyncio.to_thread(send_daily_digest)
+            last_digest_date = now.date()
+
+        if (
+            now.weekday() == WEEKLY_REPORT_DAY
+            and now.hour == WEEKLY_REPORT_HOUR
+            and now.isocalendar()[1] != last_report_week
+        ):
+            log.info("Scheduler: triggering weekly report...")
+            await asyncio.to_thread(send_weekly_report)
+            last_report_week = now.isocalendar()[1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASYNC LISTENERS — thread management + auto-restart
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -1974,10 +1982,6 @@ async def start_reddit_listener():
             btch_thread.start()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TWITTER LISTENER — UNCHANGED from v6.1
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def start_twitter_listener():
     client = build_twitter_client()
     if client is None:
@@ -2015,214 +2019,60 @@ async def start_twitter_listener():
             btch_thread.start()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — UNCHANGED from v6.1
-# ─────────────────────────────────────────────────────────────────────────────
-
-def send_daily_digest():
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
-        signals = list(
-            db.signals.find({
-                "client_id":     CLIENT_ID,
-                "intent_score":  {"$gte": 6, "$lte": 7},
-                "created_at":    {"$gte": since},
-                "digest_included": False,
-            }).sort("intent_score", -1)
+async def start_telegram_listener():
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
+        log.warning(
+            "Telegram listener not started — "
+            "set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE in .env"
         )
-
-        if not signals:
-            log.info("Daily digest: no medium signals in past 24h.")
-            return
-
-        lines = []
-        for s in signals:
-            preview  = s["message_text"][:120]
-            if len(s["message_text"]) > 120:
-                preview += "..."
-            corridor  = s.get("corridor") or "—"
-            pain      = s.get("pain_type") or "—"
-            platform  = s.get("platform", "?").upper()
-            source    = s.get("group") or s.get("subreddit") or platform
-            lines.append(
-                f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
-                f"| {platform} | {s.get('content_type','').upper()}\n"
-                f"  Source: {source} | Corridor: {corridor} | Pain: {pain}\n"
-                f"  _{preview}_\n"
-                f"  ↳ {s['suggested_action']}"
-            )
-
-        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        joined   = "\n\n".join(lines)
-        chunks   = [joined[i:i+2900] for i in range(0, len(joined), 2900)]
-
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"📋 Daily Signal Digest — {date_str}", "emoji": True},
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*{len(signals)} medium intent signals* (score 6–7) in the past 24 hours:"},
-            },
-        ]
-        for chunk in chunks:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
-        blocks += [
-            {"type": "divider"},
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}],
-            },
-        ]
-
-        result = retry_with_backoff(
-            _post_to_slack, {"text": f"📋 Daily Signal Digest — {date_str}", "blocks": blocks},
-            retries=3, delay=2, label="Digest",
-        )
-        if result:
-            ids = [s["message_id"] for s in signals]
-            db.signals.update_many(
-                {"message_id": {"$in": ids}},
-                {"$set": {"digest_included": True}},
-            )
-            log.info(f"Daily digest sent | {len(signals)} signals.")
-
-    except Exception as exc:
-        log.error(f"Daily digest error: {exc}")
-
-
-def send_weekly_report():
-    if not SLACK_WEBHOOK_URL:
         return
-    try:
-        since        = datetime.now(timezone.utc) - timedelta(days=7)
-        all_signals  = list(db.signals.find({"client_id": CLIENT_ID, "created_at": {"$gte": since}}))
-        high         = [s for s in all_signals if s["intent_score"] >= 8]
-        medium       = [s for s in all_signals if 6 <= s["intent_score"] <= 7]
-        business     = [s for s in all_signals if s.get("is_business")]
-        reddit_sigs  = [s for s in all_signals if s.get("platform") == "reddit"]
-        twitter_sigs = [s for s in all_signals if s.get("platform") == "twitter"]
-        tg_sigs      = [s for s in all_signals if s.get("platform") == "telegram_source"]
-        total        = len(all_signals)
 
-        if total == 0:
-            log.info("Weekly report: no signals this week.")
-            return
-
-        def breakdown(key):
-            counts: dict = {}
-            for s in all_signals:
-                v = s.get(key)
-                if v:
-                    counts[v] = counts.get(v, 0) + 1
-            return (
-                "\n".join(f"  • {k}: {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
-                or "_None_"
-            )
-
-        top3 = sorted(high, key=lambda x: x["intent_score"], reverse=True)[:3]
-        top3_lines = [
-            f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
-            f"| {s.get('platform','?').upper()} | {s.get('corridor') or 'Unknown corridor'}\n"
-            f"  _{s['message_text'][:100]}{'...' if len(s['message_text'])>100 else ''}_"
-            for s in top3
-        ]
-
-        week_start = since.strftime("%b %d")
-        week_end   = datetime.now(timezone.utc).strftime("%b %d, %Y")
-
-        payload = {
-            "text": f"📊 Weekly Signal Report — {week_start} to {week_end}",
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {"type": "plain_text", "text": f"📊 Weekly Signal Report — {week_start} to {week_end}", "emoji": True},
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*Total Signals*\n{total}"},
-                        {"type": "mrkdwn", "text": f"*High Intent (8–10)*\n{len(high)}"},
-                        {"type": "mrkdwn", "text": f"*Medium Intent (6–7)*\n{len(medium)}"},
-                        {"type": "mrkdwn", "text": f"*Business Owners*\n{len(business)}"},
-                        {"type": "mrkdwn", "text": f"*Reddit*\n{len(reddit_sigs)}"},
-                        {"type": "mrkdwn", "text": f"*Twitter/X*\n{len(twitter_sigs)}"},
-                        {"type": "mrkdwn", "text": f"*Telegram Groups*\n{len(tg_sigs)}"},
-                    ],
-                },
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Corridor Breakdown*\n{breakdown('corridor')}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Competitor Mentions*\n{breakdown('competitor_mentioned')}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Pain Types*\n{breakdown('pain_type')}"}},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
-                {"type": "divider"},
-                {
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | {CLIENT_ID} | Week ending {week_end}"}],
-                },
-            ],
-        }
-
-        result = retry_with_backoff(_post_to_slack, payload, retries=3, delay=2, label="WeeklyReport")
-        if result:
-            log.info(
-                f"Weekly report sent | Total:{total} High:{len(high)} "
-                f"Med:{len(medium)} Biz:{len(business)} TG:{len(tg_sigs)}"
-            )
-
-    except Exception as exc:
-        log.error(f"Weekly report error: {exc}")
-
-
-async def run_scheduler():
-    log.info(
-        f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | "
-        f"report Mon {WEEKLY_REPORT_HOUR}:00 UTC"
+    tg_thread = threading.Thread(
+        target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
     )
-    last_digest_date = None
-    last_report_week = None
+    btch_thread = threading.Thread(
+        target=run_batch_processor,
+        args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM"),
+        daemon=True, name="Telegram-Batch",
+    )
+
+    tg_thread.start()
+    btch_thread.start()
+    log.info("Telegram threads running: Listener ✅ | Batch ✅")
 
     while True:
         await asyncio.sleep(60)
-        now = datetime.now(timezone.utc)
-
-        if now.hour == DAILY_DIGEST_HOUR and now.date() != last_digest_date:
-            log.info("Scheduler: triggering daily digest...")
-            await asyncio.to_thread(send_daily_digest)
-            last_digest_date = now.date()
-
-        if (
-            now.weekday() == WEEKLY_REPORT_DAY
-            and now.hour == WEEKLY_REPORT_HOUR
-            and now.isocalendar()[1] != last_report_week
-        ):
-            log.info("Scheduler: triggering weekly report...")
-            await asyncio.to_thread(send_weekly_report)
-            last_report_week = now.isocalendar()[1]
+        if not tg_thread.is_alive():
+            log.error("Telegram listener thread died — restarting...")
+            tg_thread = threading.Thread(
+                target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
+            )
+            tg_thread.start()
+        if not btch_thread.is_alive():
+            log.error("Telegram batch thread died — restarting...")
+            btch_thread = threading.Thread(
+                target=run_batch_processor,
+                args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM"),
+                daemon=True, name="Telegram-Batch",
+            )
+            btch_thread.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API — updated with Telegram source endpoints
+# FASTAPI — REST API
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v6.2",
-    description = (
-        "Reddit + Twitter + Telegram source signals: "
-        "monitor, score, store, alert (Slack + Telegram delivery + HubSpot)."
-    ),
-    version     = "6.2.0",
+    title       = "FX Signal Intelligence API — Flintel v7.0",
+    description = "Reddit + Twitter + Telegram signals: monitor, score, store, alert.",
+    version     = "7.0.0",
 )
 
 
 def _serialise(signals: list) -> list:
     for s in signals:
         s.pop("_id", None)
-        for f in ["created_at", "alerted_slack_at", "alerted_telegram_at", "alerted_hubspot_at"]:
+        for f in ["created_at", "alerted_slack_at", "alerted_hubspot_at"]:
             if f in s:
                 s[f] = s[f].isoformat()
     return signals
@@ -2230,30 +2080,20 @@ def _serialise(signals: list) -> list:
 
 @app.get("/")
 def root():
-    tg_source_enabled = bool(
-        TELETHON_AVAILABLE
-        and TELETHON_API_ID
-        and TELETHON_API_HASH
-        and TELETHON_PHONE
-    )
     return {
-        "status":                     "running",
-        "system":                     "FLINTEL v6.2",
-        "client":                     CLIENT_ID,
-        "platforms":                  ["reddit", "twitter", "telegram_source"],
-        "delivery_channels":          ["slack", "telegram_delivery", "hubspot"],
-        "min_score_alert":            MIN_SCORE_ALERT,
-        "reddit_batch_size":          REDDIT_BATCH_SIZE,
-        "twitter_batch_size":         TWITTER_BATCH_SIZE,
-        "telegram_source_batch_size": TELEGRAM_SOURCE_BATCH_SIZE,
-        "batch_gap_s":                BATCH_GAP_SECONDS,
-        "batch_timeout_s":            BATCH_TIMEOUT_SECONDS,
-        "telegram_join_delay_s":      TELEGRAM_JOIN_DELAY_SECONDS,
-        "telegram_source_groups":     len(TARGET_TELEGRAM_GROUPS),
-        "telegram_source_enabled":    tg_source_enabled,
-        "reddit_queue_size":          reddit_queue.qsize(),
-        "twitter_queue_size":         twitter_queue.qsize(),
-        "telegram_source_queue_size": telegram_source_queue.qsize(),
+        "status":               "running",
+        "system":               "FLINTEL v7.0",
+        "client":               CLIENT_ID,
+        "platforms":            ["reddit", "twitter", "telegram"],
+        "reddit_batch_size":    REDDIT_BATCH_SIZE,
+        "twitter_batch_size":   TWITTER_BATCH_SIZE,
+        "telegram_batch_size":  TELEGRAM_BATCH_SIZE,
+        "batch_gap_s":          BATCH_GAP_SECONDS,
+        "batch_timeout_s":      BATCH_TIMEOUT_SECONDS,
+        "reddit_queue_size":    reddit_queue.qsize(),
+        "twitter_queue_size":   twitter_queue.qsize(),
+        "telegram_queue_size":  telegram_queue.qsize(),
+        "telegram_groups":      len(TARGET_TELEGRAM_GROUPS),
     }
 
 
@@ -2264,25 +2104,17 @@ def health():
         mongo = "connected"
     except Exception:
         mongo = "disconnected"
-
-    tg_src_enabled = bool(
-        TELETHON_AVAILABLE
-        and TELETHON_API_ID
-        and TELETHON_API_HASH
-        and TELETHON_PHONE
-    )
     return {
-        "status":                     "ok",
-        "mongodb":                    mongo,
-        "reddit":                     "streaming",
-        "twitter":                    "polling" if TWITTER_BEARER_TOKEN else "disabled",
-        "telegram_source":            f"listening ({len(TARGET_TELEGRAM_GROUPS)} groups)" if tg_src_enabled else "disabled",
-        "telegram_delivery":          "enabled" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
-        "reddit_queue_size":          reddit_queue.qsize(),
-        "twitter_queue_size":         twitter_queue.qsize(),
-        "telegram_source_queue_size": telegram_source_queue.qsize(),
-        "client_id":                  CLIENT_ID,
-        "timestamp":                  datetime.now(timezone.utc).isoformat(),
+        "status":               "ok",
+        "mongodb":              mongo,
+        "reddit":               "streaming",
+        "twitter":              "polling"   if TWITTER_BEARER_TOKEN else "disabled",
+        "telegram":             "listening" if TELEGRAM_API_ID else "disabled",
+        "reddit_queue_size":    reddit_queue.qsize(),
+        "twitter_queue_size":   twitter_queue.qsize(),
+        "telegram_queue_size":  telegram_queue.qsize(),
+        "client_id":            CLIENT_ID,
+        "timestamp":            datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -2293,7 +2125,7 @@ def get_signals(
     category:    str  = None,
     min_score:   int  = None,
     subreddit:   str  = None,
-    group:       str  = None,
+    tg_group:    str  = None,
     tier:        str  = None,
     corridor:    str  = None,
     pain_type:   str  = None,
@@ -2301,15 +2133,15 @@ def get_signals(
 ):
     try:
         q: dict = {"client_id": CLIENT_ID}
-        if platform:              q["platform"]        = platform
-        if category:              q["signal_category"] = category
-        if min_score is not None: q["intent_score"]    = {"$gte": min_score}
-        if subreddit:             q["subreddit"]       = subreddit
-        if group:                 q["group"]           = {"$regex": group, "$options": "i"}
-        if tier:                  q["tier"]            = tier
-        if corridor:              q["corridor"]        = {"$regex": corridor, "$options": "i"}
-        if pain_type:             q["pain_type"]       = pain_type
-        if is_business is not None: q["is_business"]   = is_business
+        if platform:    q["platform"]        = platform
+        if category:    q["signal_category"] = category
+        if min_score is not None: q["intent_score"] = {"$gte": min_score}
+        if subreddit:   q["subreddit"]       = subreddit
+        if tg_group:    q["telegram_group"]  = {"$regex": tg_group, "$options": "i"}
+        if tier:        q["tier"]            = tier
+        if corridor:    q["corridor"]        = {"$regex": corridor, "$options": "i"}
+        if pain_type:   q["pain_type"]       = pain_type
+        if is_business is not None: q["is_business"] = is_business
 
         signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
         return {"count": len(signals), "signals": _serialise(signals)}
@@ -2324,7 +2156,7 @@ def get_stats():
         biz      = db.signals.count_documents({"client_id": CLIENT_ID, "is_business": True})
         reddit   = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "reddit"})
         twitter  = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "twitter"})
-        tg_src   = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram_source"})
+        telegram = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram"})
 
         def agg(group_field):
             return list(db.signals.aggregate([
@@ -2334,18 +2166,18 @@ def get_stats():
             ]))
 
         return {
-            "total_signals":              total,
-            "business_owners":            biz,
-            "reddit_signals":             reddit,
-            "twitter_signals":            twitter,
-            "telegram_source_signals":    tg_src,
-            "corridors":                  agg("corridor"),
-            "pain_types":                 agg("pain_type"),
-            "competitors":                agg("competitor_mentioned"),
-            "tiers":                      agg("tier"),
-            "reddit_queue":               reddit_queue.qsize(),
-            "twitter_queue":              twitter_queue.qsize(),
-            "telegram_source_queue":      telegram_source_queue.qsize(),
+            "total_signals":    total,
+            "business_owners":  biz,
+            "reddit_signals":   reddit,
+            "twitter_signals":  twitter,
+            "telegram_signals": telegram,
+            "corridors":        agg("corridor"),
+            "pain_types":       agg("pain_type"),
+            "competitors":      agg("competitor_mentioned"),
+            "tiers":            agg("tier"),
+            "reddit_queue":     reddit_queue.qsize(),
+            "twitter_queue":    twitter_queue.qsize(),
+            "telegram_queue":   telegram_queue.qsize(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -2355,8 +2187,9 @@ def get_stats():
 def get_high_intent(limit: int = 20):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "intent_score": {"$gte": 8}}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "intent_score": {"$gte": 8}}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2368,8 +2201,7 @@ def get_digest(limit: int = 50):
     try:
         signals = list(
             db.signals.find(
-                {"client_id": CLIENT_ID, "intent_score": {"$gte": 6, "$lte": 7}},
-                {"_id": 0},
+                {"client_id": CLIENT_ID, "intent_score": {"$gte": 6, "$lte": 7}}, {"_id": 0}
             ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
@@ -2381,8 +2213,9 @@ def get_digest(limit: int = 50):
 def get_business(limit: int = 20):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "is_business": True}, {"_id": 0})
-            .sort("intent_score", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "is_business": True}, {"_id": 0}
+            ).sort("intent_score", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2438,13 +2271,13 @@ def get_reddit_signals(limit: int = 50, min_score: int = None):
 
 @app.get("/signals/telegram")
 def get_telegram_signals(limit: int = 50, min_score: int = None, group: str = None):
-    """Signals sourced from Telegram groups."""
+    """Telegram-only signals. Optional filter by group name."""
     try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "telegram_source"}
+        q: dict = {"client_id": CLIENT_ID, "platform": "telegram"}
         if min_score is not None:
             q["intent_score"] = {"$gte": min_score}
         if group:
-            q["group"] = {"$regex": group, "$options": "i"}
+            q["telegram_group"] = {"$regex": group, "$options": "i"}
         signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2469,8 +2302,23 @@ def get_by_corridor(corridor: str, limit: int = 20):
 def get_watchlist(limit: int = 50):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "watchlist": True}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "watchlist": True}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
+        )
+        return {"count": len(signals), "signals": _serialise(signals)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/signals/silent")
+def get_silent_signals(limit: int = 50):
+    """Score 1-5 signals — saved to MongoDB but never alerted."""
+    try:
+        signals = list(
+            db.signals.find(
+                {"client_id": CLIENT_ID, "intent_score": {"$lte": 5}}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2493,53 +2341,40 @@ async def main():
     await asyncio.gather(
         start_reddit_listener(),
         start_twitter_listener(),
-        start_telegram_source_listener(),
+        start_telegram_listener(),
         run_scheduler(),
     )
 
 
 if __name__ == "__main__":
-    tg_src_enabled = bool(
-        TELETHON_AVAILABLE
-        and TELETHON_API_ID
-        and TELETHON_API_HASH
-        and TELETHON_PHONE
-    )
-
-    log.info("=" * 65)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.2")
-    log.info("=" * 65)
-    log.info(f"  Client                : {CLIENT_ID}")
-    log.info(f"  Source Platforms      : Reddit + Twitter/X + Telegram Groups")
-    log.info(f"  Delivery Channels     : Slack + Telegram (Bot) + HubSpot")
-    log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items → 1 Claude call")
-    log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items → 1 Claude call")
-    log.info(f"  Telegram source batch : {TELEGRAM_SOURCE_BATCH_SIZE} items → 1 Claude call")
-    log.info(f"  Batch gap             : {BATCH_GAP_SECONDS}s between calls")
-    log.info(f"  Batch timeout         : {BATCH_TIMEOUT_SECONDS}s flush (partial batches)")
-    log.info(f"  Twitter poll          : every {TWITTER_POLL_INTERVAL}s (rate-limit safe)")
-    log.info(f"  TG join delay         : {TELEGRAM_JOIN_DELAY_SECONDS}s between group joins")
-    log.info(f"  Score 0               : DISCARD — never stored")
-    log.info(f"  Score 1-4             : LOW     — MongoDB only")
-    log.info(f"  Score 5-10            : ALERTED — MongoDB + Slack + Telegram + HubSpot")
-    log.info(f"  Daily digest          : {DAILY_DIGEST_HOUR}:00 UTC (score 6-7 band)")
-    log.info(f"  Weekly report         : Monday {WEEKLY_REPORT_HOUR}:00 UTC (all signals)")
-    log.info(f"  Subreddits            : {len(TARGET_SUBREDDITS)} monitored")
-    log.info(f"  Telegram groups       : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    if TARGET_TELEGRAM_GROUPS:
-        for g in TARGET_TELEGRAM_GROUPS:
-            log.info(f"                          → {g}")
-    log.info(f"  Keywords              : {len(KEYWORDS)} filters active")
-    log.info(f"  MongoDB               : {MONGODB_DB}")
-    log.info(f"  Reddit account        : u/{REDDIT_USERNAME}")
-    log.info(f"  Twitter               : {'enabled' if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
-    log.info(f"  Telegram source       : {'enabled (MTProto user account)' if tg_src_enabled else 'DISABLED — set TELETHON_API_ID / TELETHON_API_HASH / TELETHON_PHONE'}")
-    log.info(f"  Telegram delivery     : {'enabled' if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else 'DISABLED — set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID'}")
-    log.info(f"  HubSpot               : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
-    log.info(f"  Slack                 : {'enabled' if SLACK_WEBHOOK_URL else 'DISABLED — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  Telethon session      : {TELETHON_SESSION_FILE}.session")
-    log.info(f"  Listen only           : YES — Telegram source never sends or reacts")
-    log.info(f"  Data ordering         : Each platform has its own queue (never mixed)")
-    log.info("=" * 65)
+    log.info("=" * 70)
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.0")
+    log.info("=" * 70)
+    log.info(f"  Client            : {CLIENT_ID}")
+    log.info(f"  Platforms         : Reddit + Twitter/X + Telegram")
+    log.info(f"  Reddit batch      : {REDDIT_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
+    log.info(f"  Twitter batch     : {TWITTER_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
+    log.info(f"  Telegram batch    : {TELEGRAM_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
+    log.info(f"  Batch gap         : {BATCH_GAP_SECONDS}s between calls")
+    log.info(f"  Batch timeout     : {BATCH_TIMEOUT_SECONDS}s (partial batch fires after timeout)")
+    log.info(f"  Twitter poll      : every {TWITTER_POLL_INTERVAL}s (rate-limit safe)")
+    log.info(f"  Telegram join gap : {TELEGRAM_JOIN_GAP_SECONDS}s between group joins")
+    log.info(f"  Score 1-5         : SILENT SAVE — MongoDB only, no alerts")
+    log.info(f"  Score 6-7         : MEDIUM — MongoDB + Slack")
+    log.info(f"  Score 8-10        : HIGH   — MongoDB + Slack + HubSpot")
+    log.info(f"  MongoDB           : ALL scores 1-10 saved, nothing discarded")
+    log.info(f"  Platform isolation: Reddit / Twitter / Telegram NEVER mixed")
+    log.info(f"  Daily digest      : {DAILY_DIGEST_HOUR}:00 UTC")
+    log.info(f"  Weekly report     : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
+    log.info(f"  Subreddits        : {len(TARGET_SUBREDDITS)} monitored")
+    log.info(f"  Telegram groups   : {len(TARGET_TELEGRAM_GROUPS)} configured")
+    log.info(f"  Keywords          : {len(KEYWORDS)} filters (same for all 3 platforms)")
+    log.info(f"  MongoDB DB        : {MONGODB_DB}")
+    log.info(f"  Reddit account    : u/{REDDIT_USERNAME}")
+    log.info(f"  Twitter           : {'enabled' if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
+    log.info(f"  Telegram          : {'enabled' if TELEGRAM_API_ID else 'DISABLED — set TELEGRAM_API_ID + TELEGRAM_API_HASH + TELEGRAM_PHONE'}")
+    log.info(f"  HubSpot           : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
+    log.info(f"  Slack             : {'enabled' if SLACK_WEBHOOK_URL else 'DISABLED — set SLACK_WEBHOOK_URL'}")
+    log.info("=" * 70)
 
     asyncio.run(main())
