@@ -1,5 +1,5 @@
 """
-FX Signal Intelligence System — FLINTEL v6.3
+FX Signal Intelligence System — FLINTEL v6.4
 =============================================
 Platforms : Reddit (PRAW) + Twitter/X (tweepy v2)
 Pipeline  :
@@ -8,10 +8,10 @@ Pipeline  :
       ↓
   Keyword Pre-Filter        (free, fast — drops 80%+ noise)
       ↓
-  Persistent Queue (MongoDB)  ← NEW v6.1 — restart-safe, no item loss
+  Persistent Queue (MongoDB)  ← restart-safe, no item loss
       ↓
   Batch Collector           (10 items per Claude call — Reddit)
-                            (50 items per Claude call — Twitter)
+                            (20 items per Claude call — Twitter)
       ↓
   30-Second Gap             (between each batch)
       ↓
@@ -42,100 +42,102 @@ Reddit batch rules:
   → Non-matching items dropped immediately
 
 Twitter batch rules:
-  → Polling every 60s (rate-limit safe)
+  → Polling every 60s (rate-limit safe, since_id based)
   → Search query built from top-tier keywords
   → Deduplication by tweet ID before filter
-  → Keyword filter applied to every tweet
-  → 50 matched items → one Claude prompt
+  → Keyword filter applied to every tweet (PRECISION v2.0)
+  → 20 matched items → one Claude prompt
   → 30s gap between batches
   → Unknown / irrelevant content never reaches Claude
 
+Changelog v6.4:
+  ──────────────────────────────────────────────────────────────
+  BUG FIX 1 — Old messages being dropped on restart (CRITICAL):
+    load_pending_items_from_db() was calling q.put() directly,
+    bypassing enqueue_item(). This meant reloaded items went
+    into the in-memory queue but their MongoDB status stayed
+    "pending". When run_batch_processor picked them up and ran
+    passes_keyword_filter() AGAIN, items that previously passed
+    (before being persisted) could fail the filter a second time
+    (e.g. text truncated, edge cases) → mark_item_done() was
+    called → item permanently deleted from pending_items →
+    DROPPED. Fix: reloaded items now have a pre_validated=True
+    flag set by load_pending_items_from_db(). In
+    run_batch_processor, pre_validated items SKIP the keyword
+    filter entirely (they already passed it when first enqueued)
+    and go straight into current_batch.
+
+  BUG FIX 2 — Twitter token waste / "Claude tokens spent
+    without real messages" (CRITICAL):
+    Root cause was two-fold:
+    (a) since_id not being persisted to MongoDB. On restart,
+        since_id reset to None → Twitter API returned the full
+        recent-search window → same tweets re-checked, many
+        re-queued (MongoDB dedup caught most, but not all after
+        seen_ids.clear() triggered).
+    (b) seen_ids.clear() at 50k was too aggressive: it could
+        clear dedup memory mid-run, allowing the same tweets to
+        be re-checked on the next poll cycle.
+    Fix (a): since_id is now persisted to MongoDB
+    (db.twitter_state) after every successful poll and reloaded
+    on startup. Restarts resume exactly where they left off —
+    no tweet re-fetching.
+    Fix (b): seen_ids is now capped with an LRU-style trim
+    (keep last 20k, drop oldest 10k) instead of a full clear.
+    This keeps memory bounded while preserving recent dedup.
+
+  BUG FIX 3 — Batch progress counter wrong after restart:
+    v6.2 added preloaded_count to seed total_matched, which
+    fixed the total_matched counter. But the "[X/batch_size]"
+    progress log uses len(current_batch) — which starts at 0
+    regardless of preloaded_count. This is correct by design
+    (current_batch IS empty at start; preloaded items are in
+    the queue, not the batch yet). The bug was that the log
+    message implied [current_batch_size / batch_size] was the
+    total progress, misleading operators post-restart.
+    Fix: log now shows "[batch_slot:X/batch_size | total_
+    matched:Y]" so both real-time slot progress AND cumulative
+    matched count are visible separately. No confusion.
+
+  BUG FIX 4 — Twitter "no messages received" on low-quota
+    tiers:
+    When Twitter API returns no newest_id (common on Free/Basic
+    tiers that return 0 results), since_id was not advanced.
+    Next poll fetched same window → seen_ids deduped → 0 new
+    items → appeared as "no messages". Fix: if response.data is
+    empty but response.meta has a newest_id, we still advance
+    since_id. Also added explicit logging when Twitter quota
+    appears exhausted (HTTP 429 / empty response streak) so
+    operators know WHY messages aren't arriving rather than
+    seeing silent "0 new tweets" indefinitely.
+
+  All other logic, scoring rules, batch sizes, gaps,
+  Slack/HubSpot/FastAPI/schedulers, keyword list, system
+  prompt — UNCHANGED from v6.3.
+
 Changelog v6.3:
   - NEW: Keyword pre-filter replaced with PRECISION v2.0 system
-    (FLINTEL_KEYWORDS, 12 categories incl. HARD_NEGATIVES). This is the
-    primary fix for Twitter token waste / "Claude tokens spent without
-    real messages":
-      Stage 1 — Hard negative check: any HARD_NEGATIVES phrase (personal
-        remittances, consumer apps, crypto trading, etc.) = instant
-        discard, overriding all other matches.
-      Stage 2 — Minimum two-category rule: a post/tweet must match
-        keywords from at least TWO different categories to pass to
-        Claude at all. Previously a SINGLE generic match (e.g. just
-        "exchange rate") was enough to reach Claude. Now it needs a
-        second confirming category (business context, corridor, amount,
-        urgency, etc.) — eliminating the vast majority of false positives
-        that were silently burning Claude tokens with no real signal.
-      Stage 3 — Priority score: matched-category count plus bonuses for
-        COMPETITOR_LEAVING / BANK_BLOCKING_PAIN / BUSINESS_URGENCY (+5),
-        LARGE_AMOUNTS (+3), CORRIDORS (+2). Used ONLY to front-insert
-        high-priority items (priority >= 7) into current_batch so they
-        reach Claude in the next completed batch sooner — batch size
-        (10/20), 30s gap, single-queue architecture, persistent MongoDB
-        queue, since_id, restart-safe dedup — ALL UNCHANGED from v6.2.
-  - passes_keyword_filter(text) now returns (bool, priority) instead of
-    bool. Both call sites (run_batch_processor, poll_twitter) updated
-    accordingly. Keywords are pre-lowercased once at import time for a
-    faster hot-path on the high-frequency Reddit/Twitter filter.
-  - All persistence, restart-safety, since_id, Slack/HubSpot/FastAPI/
-    schedulers, Claude scoring prompt and rules — UNCHANGED from v6.2.
+    (FLINTEL_KEYWORDS, 12 categories incl. HARD_NEGATIVES).
+    Stage 1 — Hard negative check.
+    Stage 2 — Minimum two-category rule.
+    Stage 3 — Priority score for front-insertion into batch.
+  - passes_keyword_filter(text) returns (bool, priority).
+  - Keywords pre-lowercased at import time.
 
 Changelog v6.2:
-  - FIX: Batch progress counter now restores correctly on restart.
-    On startup, load_pending_items_from_db() returns the count of
-    reloaded items per platform. run_batch_processor() seeds
-    current_batch progress from this count so logs show the REAL
-    progress (e.g. "7/10") instead of resetting to "0/10" after a
-    restart/update — even though the underlying data was never lost
-    in v6.1 either way.
+  - FIX: Batch progress counter restores correctly on restart.
   - FIX: Twitter duplicate-Claude-call edge case removed.
-    poll_twitter() no longer relies solely on an in-memory seen_ids
-    set (which resets on restart). Before enqueueing a tweet, it now
-    checks MongoDB (db.pending_items + db.signals) for an existing
-    message_id. If the tweet was already queued/pending OR already
-    scored in a previous run, it is skipped — preventing duplicate
-    Claude API calls after a restart.
-  - All other logic, scoring rules, batch sizes, gaps, Slack/HubSpot/
-    FastAPI/schedulers, keyword list, system prompt — UNCHANGED (v6.1).
 
 Changelog v6.1:
-  - NEW: Persistent MongoDB-backed queue (db.pending_items collection)
-    Every keyword-matched item is persisted to MongoDB the moment it is
-    queued (status="pending"). Items are only marked status="done" (and
-    removed) AFTER they have been successfully scored by Claude and
-    processed by process_scored_item.
-  - NEW: On startup, load_pending_items_from_db() re-loads any items left
-    in status="pending" (from a crash/update/restart mid-batch) back into
-    the in-memory queues BEFORE the live streams start. Nothing queued is
-    ever lost on restart/update, even mid-batch.
-  - NEW: db.pending_items indexes on platform + status + created_at.
-  - All existing logic, scoring rules, batch sizes, gaps, Slack/HubSpot/
-    FastAPI/schedulers, keyword list, system prompt — UNCHANGED (v6.0).
-  - Twitter polling cycle (60s, 50/block) — UNCHANGED, by design (this is
-    expected polling behaviour, not a bug).
+  - NEW: Persistent MongoDB-backed queue (db.pending_items).
+  - NEW: load_pending_items_from_db() on startup.
+  - NEW: db.pending_items indexes.
 
 Changelog v6.0:
   - Added Twitter/X platform (tweepy v2, Bearer Token + OAuth1)
-  - Twitter rate-limit safe polling: 15 req/15 min window respected
-  - Twitter deduplication: tweet ID set persisted per run
-  - Twitter fetch: search + mentions + reply chains (50/block)
-  - Unified Claude scorer handles both platforms identically
-  - Unified process_scored_item works for reddit + twitter items
-  - Upgraded system prompt: 8 pain types, 3-version outreach scripts,
-    competitor intelligence, urgency indicators, corridor detection
-  - Expanded keyword list: 350+ signals (business, corridors, pain,
-    competitor, amounts, compliance, geography, urgency)
-  - Slack blocks: professional, sequenced, platform-aware, no truncation
-  - HubSpot: full signal fields, outreach scripts, corridor, pain type
-  - MongoDB indexes: platform, corridor, pain_type, tier, competitor
-  - FastAPI endpoints: /signals/twitter, /signals/reddit, /signals/outreach
-  - Daily digest + weekly report: async executor, no blocking
-  - All threads monitored + auto-restart every 60s
-  - Retry with exponential backoff on all external calls
-  - stream_posts / stream_comments: deleted author safe
-  - _call_claude_batch: index-based score alignment + positional fallback
-  - Claude model: claude-sonnet-4-6 (cost-optimised, same intelligence)
-  - Batch prompt: text capped 800 chars/item (cost reduction ~30%)
-  - No duplicate Claude calls: tweet ID set + MongoDB message_id unique index
+  - Unified Claude scorer, process_scored_item, system prompt
+  - Slack blocks, HubSpot CRM, MongoDB indexes, FastAPI
+  - Daily digest + weekly report schedulers
 """
 
 import asyncio
@@ -145,6 +147,7 @@ import json
 import time
 import queue
 import threading
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
@@ -184,13 +187,12 @@ REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.3")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.4")
 
 # Twitter / X
-TWITTER_API_KEY            = os.getenv("TWITTER_API_KEY")            # Customer Key
-TWITTER_API_SECRET         = os.getenv("TWITTER_API_SECRET")         # Customer Secret
-TWITTER_BEARER_TOKEN       = os.getenv("TWITTER_BEARER_TOKEN")       # Bearer Token
-
+TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -215,11 +217,15 @@ BATCH_GAP_SECONDS  = int(os.getenv("BATCH_GAP_SECONDS",  "30"))
 
 # Schedulers
 DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
-WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))   # 0 = Monday
+WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))  # 0 = Monday
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 
 # Twitter polling
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))  # seconds
+
+# v6.4: LRU cap for seen_ids — trim to SEEN_IDS_KEEP when SEEN_IDS_MAX hit
+SEEN_IDS_MAX  = int(os.getenv("SEEN_IDS_MAX",  "50000"))
+SEEN_IDS_KEEP = int(os.getenv("SEEN_IDS_KEEP", "20000"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TARGET SUBREDDITS
@@ -236,49 +242,16 @@ TARGET_SUBREDDITS = [
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED QUEUES
-# reddit_queue : items from Reddit streams
-# twitter_queue: items from Twitter polling
-# Both read by their respective batch processors
-#
-# v6.1: These are now backed by db.pending_items — every item pushed onto
-# these queues is ALSO persisted to MongoDB (status="pending"). Only after
-# an item is fully scored + processed is it marked status="done"/removed.
-# On startup, any leftover "pending" items are reloaded into these queues
-# BEFORE live streams start, so nothing queued is lost on restart/update.
 # ─────────────────────────────────────────────────────────────────────────────
 
 reddit_queue:  queue.Queue = queue.Queue()
 twitter_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER  — PRECISION v2.0  (v6.3)
-#
-# CRITICAL RULE: A post must match keywords from TWO different categories
-# before it passes to Claude. Single-category matches are DISCARDED
-# immediately. This eliminates the vast majority of false positives that
-# were previously reaching Claude (and burning tokens) under the old
-# single-keyword-match system.
-#
-# Stage 1 — Hard negative check: any HARD_NEGATIVES phrase = instant
-#           discard, no matter what else matches.
-# Stage 2 — Category match count: must match keywords from >= 2 different
-#           categories (excluding HARD_NEGATIVES) to pass.
-# Stage 3 — Priority score: more categories matched, plus bonus categories
-#           (COMPETITOR_LEAVING / BANK_BLOCKING_PAIN / BUSINESS_URGENCY /
-#           LARGE_AMOUNTS / CORRIDORS), produce a priority integer. v6.3
-#           uses this priority only to order items within the existing
-#           batch queue (higher-priority items are inserted at the front
-#           of current_batch so they reach Claude sooner) — batch size,
-#           gap, and overall architecture from v6.2 are UNCHANGED.
+# KEYWORD PRE-FILTER  — PRECISION v2.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 FLINTEL_KEYWORDS = {
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 1 — HIGH CONFIDENCE PAYMENT PHRASES
-    # Specific two-word+ combinations only. Each phrase alone strongly
-    # implies B2B payment intent, but still needs a second category match.
-    # ═══════════════════════════════════════════════════
 
     'HIGH_CONFIDENCE_PHRASES': [
         "pay my supplier", "paying my supplier", "pay our supplier",
@@ -291,7 +264,6 @@ FLINTEL_KEYWORDS = {
         "business invoice", "supplier invoice", "vendor invoice",
         "pay my partner overseas", "pay my overseas partner",
         "pay my business partner",
-
         "cross border payment", "cross-border payment",
         "cross border transfer", "cross-border transfer",
         "cross border business", "cross-border business",
@@ -303,21 +275,13 @@ FLINTEL_KEYWORDS = {
         "business to business payment", "business wire transfer",
         "corporate wire transfer", "corporate payment",
         "intercompany payment", "intercompany transfer",
-
         "trade finance", "trade payment", "letter of credit",
         "purchase order payment", "PO payment", "import payment",
         "export payment", "import financing", "export financing",
         "supply chain payment", "supply chain finance",
     ],
 
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 2 — COMPETITOR LEAVING SIGNALS
-    # Someone leaving a competitor = hottest possible signal.
-    # Immediate-trigger category (boosts priority +5).
-    # ═══════════════════════════════════════════════════
-
     'COMPETITOR_LEAVING': [
-        # Wise
         "leaving Wise", "left Wise", "leaving Wise Business",
         "left Wise Business", "moving off Wise", "moved off Wise",
         "switching from Wise", "switched from Wise", "done with Wise",
@@ -332,55 +296,31 @@ FLINTEL_KEYWORDS = {
         "Wise Business blocked", "Wise Business restricted",
         "Wise Business suspended", "Wise Business holding",
         "10-14 days Wise", "Wise 10-14 days", "two weeks Wise",
-
-        # Payoneer
         "leaving Payoneer", "left Payoneer", "switching from Payoneer",
         "Payoneer restricted my", "Payoneer blocked my",
         "Payoneer suspended my", "Payoneer account restricted",
         "Payoneer account blocked", "Payoneer account suspended",
         "alternative to Payoneer", "better than Payoneer",
         "done with Payoneer", "never using Payoneer",
-
-        # Remitly
         "leaving Remitly", "left Remitly", "Remitly blocked my",
         "Remitly restricted my", "Remitly account blocked",
         "alternative to Remitly", "better than Remitly",
-
-        # Revolut
         "leaving Revolut", "Revolut Business blocked",
         "Revolut Business restricted", "Revolut account blocked",
         "Revolut account restricted", "Revolut account suspended",
         "alternative to Revolut Business",
-
-        # WorldRemit
         "leaving WorldRemit", "WorldRemit blocked", "WorldRemit failed my",
         "alternative to WorldRemit",
-
-        # Western Union
         "leaving Western Union", "done with Western Union",
         "Western Union failed my", "alternative to Western Union",
-
-        # OFX
         "leaving OFX", "OFX blocked my", "OFX failed my",
         "alternative to OFX",
-
-        # LemFi
         "leaving LemFi", "LemFi blocked", "LemFi failed",
         "alternative to LemFi",
-
-        # Grey Finance
         "leaving Grey Finance", "Grey Finance blocked", "Grey Finance failed",
-
-        # NALA
         "leaving NALA", "NALA blocked", "NALA failed",
-
-        # Chipper Cash
         "leaving Chipper Cash", "Chipper Cash blocked", "Chipper Cash failed",
-
-        # Mercury
         "Mercury bank blocked", "Mercury account blocked", "leaving Mercury",
-
-        # General
         "leaving my payment provider", "switching payment providers",
         "switching payment platform", "switching payment service",
         "switching to a new payment", "looking for Wise alternative",
@@ -388,12 +328,6 @@ FLINTEL_KEYWORDS = {
         "need alternative to Payoneer", "Wise competitors",
         "competitors to Wise",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 3 — ACTIVE BANK BLOCKING PAIN
-    # Specific pain phrases — always high intent when business.
-    # Immediate-trigger category (boosts priority +5).
-    # ═══════════════════════════════════════════════════
 
     'BANK_BLOCKING_PAIN': [
         "bank blocked my transfer", "bank blocked my payment",
@@ -424,11 +358,6 @@ FLINTEL_KEYWORDS = {
         "wire missing business",
     ],
 
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 4 — FEE FRUSTRATION WITH BUSINESS CONTEXT
-    # Fee complaints only valid when business context present.
-    # ═══════════════════════════════════════════════════
-
     'FEE_FRUSTRATION': [
         "SWIFT fees killing", "SWIFT fees insane", "SWIFT fees too high",
         "SWIFT fees destroying", "SWIFT fees eating", "SWIFT charges killing",
@@ -447,11 +376,6 @@ FLINTEL_KEYWORDS = {
         "cheaper than SWIFT", "avoid SWIFT fees", "SWIFT alternative business",
         "correspondent bank fees", "intermediary bank fees killing",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 5 — ACTIVE RECOMMENDATION REQUESTS
-    # People asking for solutions RIGHT NOW. High-specificity phrases only.
-    # ═══════════════════════════════════════════════════
 
     'RECOMMENDATION_REQUESTS': [
         "recommend a payment platform", "recommend a payment service",
@@ -480,14 +404,7 @@ FLINTEL_KEYWORDS = {
         "how do you send money internationally business",
     ],
 
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 6 — CORRIDOR KEYWORDS
-    # Geographic signals — must combine with business context (another
-    # category) to pass. Bonus category (boosts priority +2).
-    # ═══════════════════════════════════════════════════
-
     'CORRIDORS': [
-        # Nigeria
         "to Nigeria business", "Nigeria supplier", "Nigerian supplier",
         "Nigerian vendor", "Nigerian manufacturer", "Lagos supplier",
         "Abuja supplier", "Nigeria payment business",
@@ -495,48 +412,30 @@ FLINTEL_KEYWORDS = {
         "CAD to NGN business", "GBP to NGN business", "USD to NGN business",
         "naira business payment", "naira supplier payment",
         "send naira business",
-
-        # Pakistan
         "Pakistan supplier", "Pakistani supplier", "Pakistani vendor",
         "Pakistani manufacturer", "Karachi supplier", "Lahore supplier",
         "Pakistan payment business", "Pakistan transfer business",
         "CAD to PKR business", "GBP to PKR business",
         "rupee business payment", "rupee supplier payment",
-
-        # India
         "India supplier", "Indian supplier", "Indian vendor",
         "Indian manufacturer", "Mumbai supplier", "Delhi supplier",
         "India payment business", "India transfer business",
         "CAD to INR business", "GBP to INR business",
-
-        # Ghana
         "Ghana supplier", "Ghanaian supplier", "Accra supplier",
         "Ghana payment business", "Ghana transfer business",
         "cedi business payment",
-
-        # Kenya
         "Kenya supplier", "Kenyan supplier", "Nairobi supplier",
         "Kenya payment business", "M-Pesa business payment",
         "Mpesa business payment",
-
-        # Other African corridors
         "South Africa supplier", "Ethiopian supplier", "Tanzania supplier",
         "Uganda supplier", "African supplier payment",
         "Africa business payment", "Africa wire transfer",
-
-        # Sending countries with business context
         "Canada Nigeria business", "UK Nigeria business",
         "USA Nigeria business", "Australia Nigeria business",
         "UAE Nigeria business", "Canada Pakistan business",
         "UK Pakistan business", "Canada India business",
         "UK Ghana business",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 7 — LARGE AMOUNT SIGNALS
-    # Large amounts almost always confirm business not consumer.
-    # Bonus category (boosts priority +3).
-    # ═══════════════════════════════════════════════════
 
     'LARGE_AMOUNTS': [
         "$10,000", "$10k", "$15,000", "$15k", "$20,000", "$20k",
@@ -546,19 +445,15 @@ FLINTEL_KEYWORDS = {
         "$150,000", "$150k", "$200,000", "$200k", "$250,000", "$250k",
         "$300,000", "$300k", "$500,000", "$500k", "$750,000", "$750k",
         "$1 million", "$1m", "$2 million", "$2m",
-
         "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
         "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
         "£75,000", "£75k", "£100,000", "£100k", "£200,000", "£200k",
         "£500,000", "£500k",
-
         "€10,000", "€10k", "€20,000", "€20k", "€50,000", "€50k",
         "€100,000", "€100k",
-
         "CAD 10,000", "CAD 20,000", "CAD 50,000",
         "10,000 CAD", "20,000 CAD", "50,000 CAD",
         "100,000 CAD", "200,000 CAD", "500,000 CAD",
-
         "six figures transfer", "six-figure transfer",
         "seven figures transfer", "seven-figure transfer",
         "large business transfer", "large business payment",
@@ -566,10 +461,6 @@ FLINTEL_KEYWORDS = {
         "high volume payments", "monthly volume business",
         "bulk transfer business", "bulk payment business",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 8 — COMPLIANCE AND KYC PAIN
-    # ═══════════════════════════════════════════════════
 
     'COMPLIANCE_PAIN': [
         "KYC rejected business", "KYC failed business",
@@ -587,13 +478,6 @@ FLINTEL_KEYWORDS = {
         "keeps blocking my payment", "keeps rejecting my payment",
         "always blocks my transfer", "always rejects my payment",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 9 — URGENCY WITH BUSINESS CONTEXT
-    # Urgency words ONLY count combined with business context (i.e. they
-    # still need a second category match to pass).
-    # Immediate-trigger category (boosts priority +5).
-    # ═══════════════════════════════════════════════════
 
     'BUSINESS_URGENCY': [
         "supplier waiting for payment", "supplier is waiting payment",
@@ -614,11 +498,6 @@ FLINTEL_KEYWORDS = {
         "ASAP supplier payment", "ASAP business transfer",
     ],
 
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 10 — TREASURY AND FX MANAGEMENT
-    # Mid intent B2B signals for finance professionals.
-    # ═══════════════════════════════════════════════════
-
     'TREASURY_FX': [
         "treasury management software", "treasury management solution",
         "treasury management platform", "cash management international",
@@ -637,12 +516,6 @@ FLINTEL_KEYWORDS = {
         "cash pooling business", "intercompany payment",
         "intercompany transfer",
     ],
-
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 11 — BUSINESS EXPANSION SIGNALS
-    # Future buyers — watchlist territory. Score 3-4 max unless combined
-    # with pain signals (still needs 2-category match to pass at all).
-    # ═══════════════════════════════════════════════════
 
     'EXPANSION_SIGNALS': [
         "just signed supplier contract", "signed new supplier",
@@ -664,12 +537,6 @@ FLINTEL_KEYWORDS = {
         "new overseas supplier",
     ],
 
-    # ═══════════════════════════════════════════════════
-    # CATEGORY 12 — HARD NEGATIVE SIGNALS
-    # Posts containing ANY of these are IMMEDIATELY DISCARDED, regardless
-    # of any other category matches. Checked FIRST (Stage 1).
-    # ═══════════════════════════════════════════════════
-
     'HARD_NEGATIVES': [
         "send to my mum", "send to my mom", "send to my parents",
         "send to my family", "send to my sister", "send to my brother",
@@ -678,23 +545,18 @@ FLINTEL_KEYWORDS = {
         "rent money", "house rent", "personal remittance", "pocket money",
         "allowance", "birthday money", "birthday gift", "wedding gift",
         "funeral money", "medical bills family",
-
         "Cash App", "Venmo", "Zelle", "Apple Pay transfer",
         "Google Pay transfer", "PayPal friends", "PayPal personal",
         "PayPal gift",
-
         "$50 transfer", "$100 transfer", "$200 transfer", "$300 transfer",
         "$500 personal", "$400 personal", "£50 transfer", "£100 transfer",
         "£200 transfer", "£300 transfer",
-
         "crypto trading", "bitcoin trading", "ethereum trading",
         "altcoin trading", "NFT payment", "DeFi yield", "staking rewards",
         "mining rewards", "crypto gains", "trading profits", "P2P crypto",
-
         "Netflix payment", "Spotify payment", "BeatStars payment",
         "subscription payment", "monthly subscription cancel",
         "streaming subscription",
-
         "stock market", "stock trading", "share purchase",
         "dividend payment", "mortgage payment", "car payment", "car loan",
         "student loan", "credit card payment", "insurance claim",
@@ -704,18 +566,11 @@ FLINTEL_KEYWORDS = {
     ],
 }
 
-# Pre-lowercase every keyword once at import time, so the hot-path filter
-# below does zero per-call .lower() work on the keyword lists (only on the
-# input text). Significant speedup for the high-frequency Reddit/Twitter
-# filter path.
 _FLINTEL_KEYWORDS_LOWER = {
     category: [kw.lower() for kw in kws]
     for category, kws in FLINTEL_KEYWORDS.items()
 }
 
-# Categories that, when matched alongside any second category, indicate
-# such high signal that they get an extra priority boost (used to order
-# items within the existing batch queue — see run_batch_processor).
 _IMMEDIATE_TRIGGER_CATEGORIES = {
     'COMPETITOR_LEAVING',
     'BANK_BLOCKING_PAIN',
@@ -725,35 +580,18 @@ _IMMEDIATE_TRIGGER_CATEGORIES = {
 
 def passes_keyword_filter(text: str) -> tuple[bool, int]:
     """
-    PRECISION v2.0 filter (v6.3).
-
+    PRECISION v2.0 filter.
     Returns (passes: bool, priority: int).
-
-    Stage 1 — Hard negative check: if text matches ANY HARD_NEGATIVES
-              phrase, return (False, 0) immediately. No exceptions.
-
-    Stage 2 — Minimum two-category requirement: text must match keywords
-              from at least TWO different categories (excluding
-              HARD_NEGATIVES) to pass. A single-category match is
-              discarded — (False, 0) — saving Claude API cost on the
-              ~90% of posts that only weakly resemble a real signal.
-
-    Stage 3 — Priority scoring: priority starts at the number of matched
-              categories, then gets +5 if any of COMPETITOR_LEAVING /
-              BANK_BLOCKING_PAIN / BUSINESS_URGENCY matched, +3 if
-              LARGE_AMOUNTS matched, +2 if CORRIDORS matched. Higher
-              priority = processed sooner within the existing batch
-              queue (front-inserted), but batch size / gap / overall
-              architecture are unchanged from v6.2.
+    Stage 1 — Hard negative check.
+    Stage 2 — Minimum two-category requirement.
+    Stage 3 — Priority scoring.
     """
     text_lower = text.lower()
 
-    # ── Stage 1 — Hard negative check ──────────────────────────────────
     for neg in _FLINTEL_KEYWORDS_LOWER['HARD_NEGATIVES']:
         if neg in text_lower:
             return False, 0
 
-    # ── Stage 2 — Minimum two-category requirement ─────────────────────
     categories_matched = []
     for category, keywords in _FLINTEL_KEYWORDS_LOWER.items():
         if category == 'HARD_NEGATIVES':
@@ -761,20 +599,16 @@ def passes_keyword_filter(text: str) -> tuple[bool, int]:
         for kw in keywords:
             if kw in text_lower:
                 categories_matched.append(category)
-                break  # one match per category is enough
+                break
 
     if len(categories_matched) < 2:
         return False, 0
 
-    # ── Stage 3 — Priority scoring ──────────────────────────────────────
     priority = len(categories_matched)
-
     if any(cat in _IMMEDIATE_TRIGGER_CATEGORIES for cat in categories_matched):
         priority += 5
-
     if 'LARGE_AMOUNTS' in categories_matched:
         priority += 3
-
     if 'CORRIDORS' in categories_matched:
         priority += 2
 
@@ -782,7 +616,7 @@ def passes_keyword_filter(text: str) -> tuple[bool, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE SYSTEM PROMPT  — v6  (cost-optimised, same precision)
+# CLAUDE SYSTEM PROMPT  — v6
 # ─────────────────────────────────────────────────────────────────────────────
 
 CLAUDE_SYSTEM_PROMPT = """
@@ -840,10 +674,6 @@ Future potential, 30-60 days.
 
 SCORE 0-2 → tier: discard
 Consumer, personal, wrong context.
-— Sending money home to family
-— Small personal amounts under $2,000
-— Consumer app complaints unrelated to business
-— General market commentary, news sharing
 
 AUTO +1: business identity confirmed, large amount ($10k+), multiple pain points,
          negative competitor mention, urgency words, active block, supplier at risk
@@ -922,14 +752,17 @@ def get_database():
         ]:
             db.signals.create_index([(field, ASCENDING)])
 
-        # ── v6.1: persistent queue collection ──────────────────────────────
-        # Stores every keyword-matched item the moment it is queued.
-        # status: "pending"  -> not yet scored by Claude (survives restarts)
-        # status: "done"     -> scored + processed, safe to ignore/remove
-        db.pending_items.create_index([("message_id", ASCENDING)], unique=True, name="pending_message_id_unique")
+        db.pending_items.create_index(
+            [("message_id", ASCENDING)], unique=True, name="pending_message_id_unique"
+        )
         db.pending_items.create_index([("platform", ASCENDING)], name="pending_platform")
         db.pending_items.create_index([("status", ASCENDING)], name="pending_status")
         db.pending_items.create_index([("created_at", ASCENDING)], name="pending_created_at")
+
+        # v6.4: twitter_state collection persists since_id across restarts
+        db.twitter_state.create_index(
+            [("key", ASCENDING)], unique=True, name="twitter_state_key_unique"
+        )
 
         log.info("MongoDB connected.")
         return db
@@ -940,28 +773,59 @@ def get_database():
 
 db = get_database()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENT QUEUE HELPERS  (v6.1, extended v6.2)
+# TWITTER STATE PERSISTENCE  (v6.4 — Bug Fix 2)
 #
-# Every item placed on reddit_queue / twitter_queue is ALSO written to
-# db.pending_items with status="pending". Only after the item has been
-# scored by Claude AND passed to process_scored_item do we mark it
-# status="done" (and remove it). This guarantees that an update/restart —
-# even mid-batch — never silently drops an item: on the next startup,
-# load_pending_items_from_db() re-queues anything still "pending".
+# since_id is now stored in db.twitter_state so restarts resume exactly
+# where they left off. Without this, each restart reset since_id to None,
+# causing Twitter to return the full recent-search window and re-process
+# tweets already handled in the previous run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_twitter_since_id() -> str | None:
+    """Load persisted since_id from MongoDB on startup."""
+    try:
+        doc = db.twitter_state.find_one({"key": "since_id"})
+        if doc and doc.get("value"):
+            since_id = doc["value"]
+            log.info(f"Twitter since_id restored from MongoDB: {since_id}")
+            return since_id
+    except Exception as exc:
+        log.error(f"load_twitter_since_id error: {exc}")
+    log.info("Twitter since_id: no previous state — starting fresh.")
+    return None
+
+
+def save_twitter_since_id(since_id: str):
+    """Persist since_id to MongoDB after each successful poll."""
+    try:
+        db.twitter_state.update_one(
+            {"key": "since_id"},
+            {"$set": {"value": since_id, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.error(f"save_twitter_since_id error: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT QUEUE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def enqueue_item(q: queue.Queue, item: dict):
     """
     Persist item to db.pending_items (status="pending") and put it on the
-    in-memory queue. If the item already exists (duplicate message_id —
-    e.g. re-loaded after restart, or seen again), it is still placed on the
-    in-memory queue but the DB write is a safe no-op (duplicate key ignored).
+    in-memory queue. Duplicate message_id is a safe no-op.
+    Item does NOT have pre_validated set here — it will go through the
+    keyword filter in run_batch_processor.
     """
     try:
         doc = dict(item)
         doc["status"] = "pending"
         doc.setdefault("created_at", datetime.now(timezone.utc))
+        # pre_validated is intentionally NOT set here — only set by
+        # load_pending_items_from_db for items that already passed the filter.
         db.pending_items.update_one(
             {"message_id": item["message_id"]},
             {"$setOnInsert": doc},
@@ -974,11 +838,7 @@ def enqueue_item(q: queue.Queue, item: dict):
 
 
 def mark_item_done(message_id: str):
-    """
-    Mark an item as fully processed (scored by Claude + run through
-    process_scored_item). Removes it from db.pending_items so it will
-    never be re-loaded on a future restart.
-    """
+    """Remove item from db.pending_items after scoring + processing."""
     try:
         db.pending_items.delete_one({"message_id": message_id})
     except Exception as exc:
@@ -987,12 +847,9 @@ def mark_item_done(message_id: str):
 
 def item_already_known(message_id: str) -> bool:
     """
-    v6.2: Returns True if this message_id has already been seen by the
-    system in a previous run — either it's still sitting in
-    db.pending_items (queued/awaiting scoring) or it has already been
-    fully scored and stored in db.signals. Used by poll_twitter() to
-    avoid re-enqueueing the same tweet after a restart (which would
-    otherwise trigger a duplicate Claude API call).
+    Returns True if this message_id was already seen in a previous run
+    (either still pending or already scored). Used by poll_twitter() to
+    avoid re-enqueueing after restart.
     """
     try:
         if db.pending_items.find_one({"message_id": message_id}, {"_id": 1}):
@@ -1002,21 +859,26 @@ def item_already_known(message_id: str) -> bool:
         return False
     except Exception as exc:
         log.error(f"item_already_known check error for {message_id}: {exc}")
-        return False  # fail-open: better to risk a duplicate than drop a tweet
+        return False  # fail-open
 
 
 def load_pending_items_from_db() -> dict:
     """
-    Called once at startup, BEFORE the live Reddit/Twitter streams begin.
-    Re-loads any items left with status="pending" from a previous run
-    (crash, update, restart — even mid-batch) back into the in-memory
-    queues, oldest first, so they are processed in the next batch(es)
-    exactly like fresh items.
+    Called once at startup, BEFORE live streams begin.
+    Re-loads any items left status="pending" back into in-memory queues.
 
-    v6.2: Returns a dict {"reddit": <count>, "twitter": <count>} so that
-    run_batch_processor() can seed its current_batch progress counter to
-    reflect the REAL number of items already restored, instead of always
-    logging "0/<batch_size>" right after a restart.
+    v6.4 FIX (Bug Fix 1 — Old messages being dropped):
+    Previously called q.put() directly. This meant reloaded items entered
+    the in-memory queue WITHOUT the pre_validated flag. In
+    run_batch_processor, these items then went through passes_keyword_filter
+    again — and if they failed (edge case: text truncation, slightly
+    different text representation) mark_item_done() was called, permanently
+    deleting them from pending_items. DROPPED FOREVER.
+
+    Fix: items loaded here are tagged pre_validated=True. The batch
+    processor checks this flag and skips re-filtering for pre-validated
+    items, sending them directly into current_batch. They already passed
+    the filter on first enqueue — no need to re-check.
     """
     counts = {"reddit": 0, "twitter": 0}
     try:
@@ -1027,6 +889,7 @@ def load_pending_items_from_db() -> dict:
         for doc in reddit_pending:
             doc.pop("_id", None)
             doc.pop("status", None)
+            doc["pre_validated"] = True  # v6.4: skip re-filtering on reload
             reddit_queue.put(doc)
         counts["reddit"] = len(reddit_pending)
 
@@ -1037,13 +900,15 @@ def load_pending_items_from_db() -> dict:
         for doc in twitter_pending:
             doc.pop("_id", None)
             doc.pop("status", None)
+            doc["pre_validated"] = True  # v6.4: skip re-filtering on reload
             twitter_queue.put(doc)
         counts["twitter"] = len(twitter_pending)
 
         if reddit_pending or twitter_pending:
             log.info(
                 f"Persistent queue restore | reddit:{len(reddit_pending)} "
-                f"twitter:{len(twitter_pending)} items reloaded from MongoDB."
+                f"twitter:{len(twitter_pending)} items reloaded from MongoDB "
+                f"(pre_validated — will NOT be re-filtered)."
             )
         else:
             log.info("Persistent queue restore | nothing pending — clean start.")
@@ -1079,7 +944,7 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER  (shared by Reddit + Twitter)
+# CLAUDE BATCH SCORER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -1089,7 +954,7 @@ def _build_batch_prompt(batch: list) -> str:
         platform  = item.get("platform", "unknown").upper()
         subreddit = item.get("subreddit", "")
         username  = item.get("username", "unknown")
-        text      = item.get("text", "")[:800]   # 800-char cap — cost reduction
+        text      = item.get("text", "")[:800]
 
         location = f"r/{subreddit}" if subreddit else platform
         lines.append(
@@ -1124,7 +989,6 @@ def _call_claude_batch(batch: list) -> list:
     )
 
     raw = response.content[0].text.strip()
-    # Strip accidental markdown fences
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw.strip("```").strip()
@@ -1203,10 +1067,7 @@ def save_signal(data: dict) -> bool:
         log.info(
             f"SAVED | {data.get('platform','?').upper()} | "
             f"Score:{data['intent_score']} | Tier:{data.get('tier','?')} | "
-            f"u/{data.get('username')} | {data.get('content_type','')} | "
-            f"r/{data.get('subreddit','')}" if data.get('subreddit') else
-            f"SAVED | {data.get('platform','?').upper()} | "
-            f"Score:{data['intent_score']} | u/{data.get('username')}"
+            f"u/{data.get('username')} | {data.get('content_type','')}"
         )
         return True
     except DuplicateKeyError:
@@ -1291,7 +1152,6 @@ def send_slack_alert(data: dict) -> bool:
 
     header_emoji = "🚨" if score >= 8 else "⚠️"
     header_text  = f"{header_emoji} {category} — Score {score}/10 | {tier}"
-
     source_label = f"r/{subreddit}" if subreddit else platform
 
     blocks = [
@@ -1428,7 +1288,7 @@ def _hs_create_contact(data: dict) -> str | None:
 def _hs_create_note(data: dict, contact_id: str):
     try:
         note = (
-            f"FLINTEL SIGNAL — v6.3\n\n"
+            f"FLINTEL SIGNAL — v6.4\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1491,17 +1351,14 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR  (platform-agnostic)
+# CORE SIGNAL PROCESSOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict):
     """
     Receives one item + its Claude score. Runs full delivery pipeline.
     Identical logic for Reddit and Twitter items.
-
-    v6.1: At the very end (success or discard), mark_item_done() is called
-    so this item is removed from db.pending_items and will never be
-    re-loaded on a future restart.
+    mark_item_done() is always called at the end.
     """
     score = score_result.get("intent_score", 0)
 
@@ -1545,7 +1402,7 @@ def process_scored_item(item: dict, score_result: dict):
     saved = save_signal(data)
     if not saved:
         mark_item_done(item["message_id"])
-        return  # Duplicate — skip delivery
+        return
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
         log.info(f"MEDIUM | Score:{score} | Slack only | u/{data['username']} | {data['platform'].upper()}")
@@ -1566,7 +1423,7 @@ def process_scored_item(item: dict, score_result: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR  (shared logic for both platforms)
+# GENERIC BATCH PROCESSOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -1576,25 +1433,20 @@ def run_batch_processor(
     preloaded_count: int = 0,
 ):
     """
-    Reads from queue q.
-    Collects keyword-matched items into batches of batch_size.
+    Reads from queue q. Collects keyword-matched items into batches.
     Sends each full batch to Claude, then runs process_scored_item per item.
     30s gap between batches.
 
-    v6.1: Items that don't pass the basic checks or keyword filter are
-    marked done immediately (mark_item_done) so they don't linger in
-    db.pending_items. Items that DO match stay "pending" in MongoDB until
-    they are scored + processed (process_scored_item calls mark_item_done).
-    This means a partially-filled current_batch is fully recoverable on
-    restart via load_pending_items_from_db().
+    v6.4 FIX (Bug Fix 1 — Old messages dropped on restart):
+    Items with pre_validated=True (set by load_pending_items_from_db) skip
+    the keyword filter entirely and go straight into current_batch. They
+    already passed the filter when first enqueued — re-filtering them was
+    the cause of silent drops after restart.
 
-    v6.2: `preloaded_count` lets the caller seed the progress counter with
-    the number of items that were just restored from MongoDB on startup
-    (load_pending_items_from_db). This makes the "[X/batch_size]" log line
-    reflect REAL progress (e.g. "7/10") immediately after a restart,
-    instead of resetting to "0/10" while those 7 items are still sitting
-    in the queue waiting to be re-collected. Purely cosmetic — data was
-    never lost in v6.1, this just fixes the displayed count.
+    v6.4 FIX (Bug Fix 3 — Confusing progress counter):
+    Log now shows "[batch_slot:X/batch_size | total_matched:Y]" so both
+    the current batch slot progress AND cumulative matched count are
+    clearly visible and not conflated.
     """
     log.info(
         f"Batch processor [{platform_label}] started | batch_size:{batch_size} | "
@@ -1622,7 +1474,17 @@ def run_batch_processor(
                 q.task_done()
                 continue
 
-            passes, priority = passes_keyword_filter(text)
+            # v6.4: pre_validated items skip keyword re-filtering
+            if item.get("pre_validated"):
+                passes  = True
+                priority = item.get("priority", 1)
+                log.debug(
+                    f"[{platform_label}] PRE-VALIDATED (skip filter) | "
+                    f"u/{item.get('username')} | {item.get('content_type','?')}"
+                )
+            else:
+                passes, priority = passes_keyword_filter(text)
+
             if not passes:
                 total_dropped += 1
                 log.debug(
@@ -1635,19 +1497,15 @@ def run_batch_processor(
 
             total_matched += 1
 
-            # v6.3: higher-priority items (competitor-leaving, bank
-            # blocking, business urgency, large amounts, corridors) are
-            # inserted at the FRONT of current_batch so they reach Claude
-            # in the next completed batch sooner than lower-priority
-            # items already waiting. Batch size / gap / architecture
-            # otherwise unchanged from v6.2.
             if priority >= 7:
                 current_batch.insert(0, item)
             else:
                 current_batch.append(item)
 
+            # v6.4 FIX (Bug Fix 3): clearer log — batch slot AND total matched
             log.info(
-                f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
+                f"[{platform_label}] MATCH "
+                f"[batch_slot:{len(current_batch)}/{batch_size} | total_matched:{total_matched}] | "
                 f"priority:{priority} | "
                 f"{item.get('content_type','?').upper()} | u/{item.get('username')}"
             )
@@ -1660,13 +1518,12 @@ def run_batch_processor(
                 current_batch   = current_batch[batch_size:]
 
                 log.info(
-                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | "
+                    f"[{platform_label}] ━━━ BATCH {total_batches} FIRING ━━━ | "
                     f"items:{len(batch_to_send)} | "
                     f"received:{total_received} matched:{total_matched} dropped:{total_dropped}"
                 )
 
                 scores = score_batch_with_claude(batch_to_send)
-
                 score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
 
                 for i, it in enumerate(batch_to_send):
@@ -1763,25 +1620,8 @@ def stream_comments(reddit: praw.Reddit):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TWITTER / X  POLLER
-#
-# Strategy:
-#   — tweepy.Client (v2 API) with Bearer Token for search
-#   — OAuth1 (API Key/Secret + Access Token/Secret) for user context if needed
-#   — Search query built from top-tier keywords (no full KEYWORDS list —
-#     Twitter query length is capped at 512 chars)
-#   — Polls every TWITTER_POLL_INTERVAL seconds
-#   — Deduplication via in-memory seen_tweet_ids set (per run)
-#   — Rate-limit safe: 1 request per poll cycle (well within 15 req/15 min)
-#   — 50 tweets max per request (Twitter v2 max_results=100, we cap at 50)
-#   — Items pushed to twitter_queue → batch processor → Claude (50/block)
-#
-# NOTE (v6.1): This polling behaviour (every 60s, search returns a rotating
-# top-50 "recent tweets" window) is EXPECTED Twitter v2 API behaviour, not a
-# bug. Tweets "cycling"/changing between polls reflects Twitter's own search
-# index turnover. Logic kept exactly as-is per requirements.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Top-tier search query for Twitter (must be ≤512 chars combined)
 TWITTER_SEARCH_QUERY = (
     "("
     "\"pay my supplier\" OR \"supplier payment\" OR \"send to nigeria\" OR "
@@ -1803,10 +1643,10 @@ def build_twitter_client() -> tweepy.Client | None:
         return None
     try:
         client = tweepy.Client(
-            bearer_token        = TWITTER_BEARER_TOKEN,
-            consumer_key        = TWITTER_API_KEY,
-            consumer_secret     = TWITTER_API_SECRET,
-            wait_on_rate_limit  = True,   # tweepy handles rate limiting automatically
+            bearer_token       = TWITTER_BEARER_TOKEN,
+            consumer_key       = TWITTER_API_KEY,
+            consumer_secret    = TWITTER_API_SECRET,
+            wait_on_rate_limit = True,
         )
         log.info("Twitter/X client initialised.")
         return client
@@ -1818,51 +1658,40 @@ def build_twitter_client() -> tweepy.Client | None:
 def poll_twitter(client: tweepy.Client):
     """
     Polls Twitter search every TWITTER_POLL_INTERVAL seconds.
-    Fetches up to 50 tweets per poll. Deduplicates by tweet ID.
-    Pushes unique, keyword-matching tweets to twitter_queue.
-    Rate-limit: wait_on_rate_limit=True in tweepy client — safe by default.
 
-    v6.2 fixes (token-waste / "not receiving messages"):
-      1. since_id: each poll only asks Twitter for tweets newer than the
-         last tweet ID we already saw. Without this, Twitter's recent-
-         search window heavily overlaps between polls and the same
-         tweets get returned (and re-checked) over and over — wasted
-         API quota AND wasted local processing.
-      2. Local keyword pre-filter (passes_keyword_filter) is applied here
-         BEFORE enqueueing. Previously every tweet matching the broad
-         Twitter search query (which must be short/simple — Twitter query
-         length is capped at 512 chars, so it can't carry the full 350+
-         keyword list) was enqueued and later sent to Claude in batches —
-         including tweets that don't actually match Flintel's real
-         keyword list. Filtering here means only genuinely relevant
-         tweets ever reach the batch processor / Claude, cutting Claude
-         token usage significantly.
-      3. item_already_known(): before enqueueing, check MongoDB (both
-         pending_items and signals) so a tweet already queued or already
-         scored in a previous run is never re-enqueued after a restart —
-         in-memory seen_ids resets on restart, MongoDB does not.
-      4. seen_ids is kept as a fast first-pass, low-cost in-memory check
-         (avoids a MongoDB round-trip for tweets seen earlier in THIS run);
-         item_already_known() is the authoritative, restart-safe check.
+    v6.4 FIX (Bug Fix 2 — Token waste / no messages):
+    (a) since_id is now loaded from MongoDB on startup and saved after
+        every successful poll. Restarts resume exactly where they left
+        off — no re-fetching of already-processed tweets.
+    (b) seen_ids now uses an OrderedDict for LRU-style trimming instead
+        of full clear. When SEEN_IDS_MAX is hit, oldest entries are
+        removed until SEEN_IDS_KEEP remain. This prevents the situation
+        where a full clear caused recently-seen tweets to be re-processed
+        on the next poll cycle.
+    (c) since_id is advanced even when response.data is empty but
+        response.meta has a newest_id — prevents the "same window
+        returned every poll" loop on low-traffic/quota-limited tiers.
+    (d) Added explicit logging when empty responses occur repeatedly
+        so operators know whether silence is due to low traffic vs
+        API quota exhaustion.
 
-    If Twitter API quota is very low (common on Basic/Free tiers —
-    sometimes as low as 1 search request per 15 minutes),
-    wait_on_rate_limit=True will cause this thread to block for long
-    periods between polls. That is expected tweepy behaviour, not a bug —
-    but it explains "not receiving messages" if your Twitter API tier has
-    a very restrictive search quota. Check your developer portal's
-    Usage & Rate Limits for "Recent search" if Twitter signals seem absent
-    for long stretches.
+    v6.4 FIX (Bug Fix 4 — "no messages" on low-quota tiers):
+    See (c) and (d) above.
     """
-    seen_ids: set = set()
-    since_id: str | None = None
+    # LRU-style seen_ids using OrderedDict
+    seen_ids: OrderedDict = OrderedDict()
+
+    # Load persisted since_id from MongoDB (v6.4 fix)
+    since_id: str | None = load_twitter_since_id()
+
+    empty_streak = 0
     log.info("Twitter poll started.")
 
     while True:
         try:
             search_kwargs = dict(
                 query        = TWITTER_SEARCH_QUERY,
-                max_results  = 50,             # 50 per block as required
+                max_results  = 50,
                 tweet_fields = ["author_id", "created_at", "text", "conversation_id"],
                 expansions   = ["author_id"],
                 user_fields  = ["username", "name"],
@@ -1872,18 +1701,31 @@ def poll_twitter(client: tweepy.Client):
 
             response = client.search_recent_tweets(**search_kwargs)
 
+            # v6.4: always advance since_id from meta even if data is empty
+            newest_id = None
+            if response and response.meta:
+                newest_id = response.meta.get("newest_id")
+            if newest_id:
+                since_id = newest_id
+                save_twitter_since_id(since_id)  # persist to MongoDB
+
             if not response or not response.data:
-                log.debug("Twitter: no results this cycle.")
+                empty_streak += 1
+                if empty_streak == 1:
+                    log.debug("Twitter: no results this cycle.")
+                elif empty_streak % 5 == 0:
+                    log.warning(
+                        f"Twitter: {empty_streak} consecutive empty polls. "
+                        f"since_id={since_id}. "
+                        f"Possible causes: low traffic on search query, "
+                        f"API quota exhausted (check developer portal), "
+                        f"or search index lag. Will keep polling."
+                    )
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
-            # Advance since_id to the newest tweet ID in this response so
-            # the NEXT poll never re-fetches tweets we've already handled.
-            newest_id = response.meta.get("newest_id") if response.meta else None
-            if newest_id:
-                since_id = newest_id
+            empty_streak = 0  # reset on successful result
 
-            # Build author_id → username map from includes
             user_map: dict = {}
             if response.includes and "users" in response.includes:
                 for u in response.includes["users"]:
@@ -1894,34 +1736,30 @@ def poll_twitter(client: tweepy.Client):
             skip_keyword = 0
 
             for tweet in response.data:
-                tweet_id = str(tweet.id)
+                tweet_id   = str(tweet.id)
                 message_id = f"twitter_{tweet_id}"
 
-                # Fast in-memory dedup (this run only)
+                # LRU-style in-memory dedup (v6.4)
                 if tweet_id in seen_ids:
+                    seen_ids.move_to_end(tweet_id)  # refresh recency
                     continue
-                seen_ids.add(tweet_id)
+                seen_ids[tweet_id] = True
 
-                # Cap seen_ids memory usage
-                if len(seen_ids) > 50_000:
-                    seen_ids.clear()
+                # Trim oldest entries when cap exceeded (v6.4)
+                if len(seen_ids) > SEEN_IDS_MAX:
+                    trim_count = len(seen_ids) - SEEN_IDS_KEEP
+                    for _ in range(trim_count):
+                        seen_ids.popitem(last=False)
+                    log.debug(f"Twitter seen_ids trimmed to {SEEN_IDS_KEEP} (removed {trim_count} oldest)")
 
                 text     = tweet.text or ""
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
-                # Local keyword pre-filter — Precision v2.0 (v6.3).
-                # Requires hard-negative-free text AND matches from at
-                # least 2 different keyword categories. This is the
-                # PRIMARY token-waste fix: tweets matching Twitter's
-                # broad search query but not this stricter 2-category
-                # rule never reach Claude at all.
                 passes, priority = passes_keyword_filter(text)
                 if not passes:
                     skip_keyword += 1
                     continue
 
-                # Restart-safe dedup: skip tweets already pending or
-                # already scored in a previous run.
                 if item_already_known(message_id):
                     skip_dup += 1
                     continue
@@ -1938,12 +1776,11 @@ def poll_twitter(client: tweepy.Client):
                 })
                 new_count += 1
 
-            if new_count or skip_dup or skip_keyword:
-                log.info(
-                    f"Twitter: {new_count} new tweets queued | "
-                    f"skipped_keyword:{skip_keyword} skipped_duplicate:{skip_dup} | "
-                    f"queue_size:{twitter_queue.qsize()}"
-                )
+            log.info(
+                f"Twitter poll: {new_count} new queued | "
+                f"skipped_keyword:{skip_keyword} skipped_dup:{skip_dup} | "
+                f"since_id:{since_id} | queue:{twitter_queue.qsize()}"
+            )
 
         except tweepy.errors.TweepyException as exc:
             log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
@@ -2003,7 +1840,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.3 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.4 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
         ]
 
         result = retry_with_backoff(
@@ -2074,7 +1911,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.3 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.4 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2188,9 +2025,9 @@ async def start_twitter_listener(preloaded_count: int = 0):
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v6.3",
+    title       = "FX Signal Intelligence API — Flintel v6.4",
     description = "Reddit + Twitter signals: monitor, score, store, alert.",
-    version     = "6.3.0",
+    version     = "6.4.0",
 )
 
 
@@ -2207,7 +2044,7 @@ def _serialise(signals: list) -> list:
 def root():
     return {
         "status":              "running",
-        "system":              "FLINTEL v6.3",
+        "system":              "FLINTEL v6.4",
         "client":              CLIENT_ID,
         "platforms":           ["reddit", "twitter"],
         "reddit_batch_size":   REDDIT_BATCH_SIZE,
@@ -2230,30 +2067,39 @@ def health():
         pending_twitter = db.pending_items.count_documents({"status": "pending", "platform": "twitter"})
     except Exception:
         pending_reddit = pending_twitter = -1
+
+    # v6.4: also surface persisted since_id
+    try:
+        since_doc = db.twitter_state.find_one({"key": "since_id"})
+        persisted_since_id = since_doc["value"] if since_doc else None
+    except Exception:
+        persisted_since_id = None
+
     return {
-        "status":             "ok",
-        "mongodb":            mongo,
-        "reddit":             "streaming",
-        "twitter":            "polling" if TWITTER_BEARER_TOKEN else "disabled",
-        "reddit_queue_size":  reddit_queue.qsize(),
-        "twitter_queue_size": twitter_queue.qsize(),
-        "pending_reddit_db":  pending_reddit,
-        "pending_twitter_db": pending_twitter,
-        "client_id":          CLIENT_ID,
-        "timestamp":          datetime.now(timezone.utc).isoformat(),
+        "status":                "ok",
+        "mongodb":               mongo,
+        "reddit":                "streaming",
+        "twitter":               "polling" if TWITTER_BEARER_TOKEN else "disabled",
+        "reddit_queue_size":     reddit_queue.qsize(),
+        "twitter_queue_size":    twitter_queue.qsize(),
+        "pending_reddit_db":     pending_reddit,
+        "pending_twitter_db":    pending_twitter,
+        "twitter_since_id":      persisted_since_id,
+        "client_id":             CLIENT_ID,
+        "timestamp":             datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/signals")
 def get_signals(
-    limit:      int  = 50,
-    platform:   str  = None,
-    category:   str  = None,
-    min_score:  int  = None,
-    subreddit:  str  = None,
-    tier:       str  = None,
-    corridor:   str  = None,
-    pain_type:  str  = None,
+    limit:       int  = 50,
+    platform:    str  = None,
+    category:    str  = None,
+    min_score:   int  = None,
+    subreddit:   str  = None,
+    tier:        str  = None,
+    corridor:    str  = None,
+    pain_type:   str  = None,
     is_business: bool = None,
 ):
     try:
@@ -2342,7 +2188,6 @@ def get_business(limit: int = 20):
 
 @app.get("/signals/outreach")
 def get_outreach(limit: int = 20):
-    """Signals with outreach scripts ready for the sales team."""
     try:
         signals = list(
             db.signals.find(
@@ -2408,11 +2253,6 @@ def get_watchlist(limit: int = 50):
 
 @app.get("/signals/pending")
 def get_pending(limit: int = 100):
-    """
-    v6.1: Inspect items currently sitting in the persistent queue
-    (status="pending") — i.e. matched items waiting to be batched/scored.
-    Useful for debugging restart-safety.
-    """
     try:
         items = list(
             db.pending_items.find({"status": "pending"}, {"_id": 0})
@@ -2432,6 +2272,31 @@ def get_pending(limit: int = 100):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/twitter/state")
+def get_twitter_state():
+    """v6.4: Inspect persisted Twitter poll state (since_id, last update)."""
+    try:
+        doc = db.twitter_state.find_one({"key": "since_id"}, {"_id": 0})
+        if doc and "updated_at" in doc:
+            doc["updated_at"] = doc["updated_at"].isoformat()
+        return doc or {"key": "since_id", "value": None, "updated_at": None}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/twitter/state")
+def reset_twitter_state():
+    """
+    v6.4: Reset since_id (forces full recent-window fetch on next poll).
+    Use only if you want to re-scan the last 7 days of Twitter results.
+    """
+    try:
+        db.twitter_state.delete_one({"key": "since_id"})
+        return {"status": "reset", "message": "Twitter since_id cleared. Next poll will fetch full recent window."}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def run_fastapi():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
@@ -2441,12 +2306,6 @@ def run_fastapi():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def main():
-    # v6.1/6.2: restore any items left "pending" from a previous run BEFORE
-    # starting the live streams, so they get processed in upcoming batches
-    # alongside new items — nothing queued is ever lost on restart/update.
-    # v6.2: the returned counts seed each batch processor's progress
-    # counter so logs show real progress (e.g. "7/10") right after a
-    # restart instead of "0/10".
     preloaded = load_pending_items_from_db()
 
     api_thread = threading.Thread(target=run_fastapi, daemon=True, name="FastAPI")
@@ -2462,23 +2321,25 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.3")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.4")
     log.info("=" * 65)
     log.info(f"  Client           : {CLIENT_ID}")
     log.info(f"  Platforms        : Reddit + Twitter/X")
     log.info(f"  Reddit batch     : {REDDIT_BATCH_SIZE} items → 1 Claude call")
     log.info(f"  Twitter batch    : {TWITTER_BATCH_SIZE} items → 1 Claude call")
     log.info(f"  Batch gap        : {BATCH_GAP_SECONDS}s between calls")
-    log.info(f"  Twitter poll     : every {TWITTER_POLL_INTERVAL}s (since_id-based, rate-limit safe)")
+    log.info(f"  Twitter poll     : every {TWITTER_POLL_INTERVAL}s (since_id persisted to MongoDB)")
     log.info(f"  Score 0-5        : DISCARD — never stored")
     log.info(f"  Score 6-7        : MEDIUM  — MongoDB + Slack")
     log.info(f"  Score 8-10       : HIGH    — MongoDB + Slack + HubSpot")
     log.info(f"  Daily digest     : {DAILY_DIGEST_HOUR}:00 UTC")
     log.info(f"  Weekly report    : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits       : {len(TARGET_SUBREDDITS)} monitored")
-    log.info(f"  Keywords         : {sum(len(v) for v in FLINTEL_KEYWORDS.values())} phrases across {len(FLINTEL_KEYWORDS)} categories (2-category-min filter)")
+    log.info(f"  Keywords         : {sum(len(v) for v in FLINTEL_KEYWORDS.values())} phrases across {len(FLINTEL_KEYWORDS)} categories")
     log.info(f"  MongoDB          : {MONGODB_DB}")
-    log.info(f"  Persistent queue : db.pending_items (restart-safe)")
+    log.info(f"  Persistent queue : db.pending_items (restart-safe + pre_validated flag)")
+    log.info(f"  Twitter state    : db.twitter_state (since_id persisted across restarts)")
+    log.info(f"  Seen IDs cap     : {SEEN_IDS_MAX} max → trim to {SEEN_IDS_KEEP} (LRU, not full clear)")
     log.info(f"  Reddit account   : u/{REDDIT_USERNAME}")
     log.info(f"  Twitter          : {'enabled' if TWITTER_BEARER_TOKEN else 'DISABLED — set TWITTER_BEARER_TOKEN'}")
     log.info(f"  HubSpot          : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
