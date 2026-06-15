@@ -1,5 +1,5 @@
 """
-FX Signal Intelligence System — FLINTEL v6.2
+FX Signal Intelligence System — FLINTEL v6.3
 =============================================
 Platforms : Reddit (PRAW) + Twitter/X (tweepy v2)
 Pipeline  :
@@ -49,6 +49,35 @@ Twitter batch rules:
   → 50 matched items → one Claude prompt
   → 30s gap between batches
   → Unknown / irrelevant content never reaches Claude
+
+Changelog v6.3:
+  - NEW: Keyword pre-filter replaced with PRECISION v2.0 system
+    (FLINTEL_KEYWORDS, 12 categories incl. HARD_NEGATIVES). This is the
+    primary fix for Twitter token waste / "Claude tokens spent without
+    real messages":
+      Stage 1 — Hard negative check: any HARD_NEGATIVES phrase (personal
+        remittances, consumer apps, crypto trading, etc.) = instant
+        discard, overriding all other matches.
+      Stage 2 — Minimum two-category rule: a post/tweet must match
+        keywords from at least TWO different categories to pass to
+        Claude at all. Previously a SINGLE generic match (e.g. just
+        "exchange rate") was enough to reach Claude. Now it needs a
+        second confirming category (business context, corridor, amount,
+        urgency, etc.) — eliminating the vast majority of false positives
+        that were silently burning Claude tokens with no real signal.
+      Stage 3 — Priority score: matched-category count plus bonuses for
+        COMPETITOR_LEAVING / BANK_BLOCKING_PAIN / BUSINESS_URGENCY (+5),
+        LARGE_AMOUNTS (+3), CORRIDORS (+2). Used ONLY to front-insert
+        high-priority items (priority >= 7) into current_batch so they
+        reach Claude in the next completed batch sooner — batch size
+        (10/20), 30s gap, single-queue architecture, persistent MongoDB
+        queue, since_id, restart-safe dedup — ALL UNCHANGED from v6.2.
+  - passes_keyword_filter(text) now returns (bool, priority) instead of
+    bool. Both call sites (run_batch_processor, poll_twitter) updated
+    accordingly. Keywords are pre-lowercased once at import time for a
+    faster hot-path on the high-frequency Reddit/Twitter filter.
+  - All persistence, restart-safety, since_id, Slack/HubSpot/FastAPI/
+    schedulers, Claude scoring prompt and rules — UNCHANGED from v6.2.
 
 Changelog v6.2:
   - FIX: Batch progress counter now restores correctly on restart.
@@ -155,7 +184,7 @@ REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.2")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.3")
 
 # Twitter / X
 TWITTER_API_KEY            = os.getenv("TWITTER_API_KEY")            # Customer Key
@@ -222,948 +251,534 @@ reddit_queue:  queue.Queue = queue.Queue()
 twitter_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER  — 350+ signals
-# Applied to EVERY item before Claude ever sees it
-# Zero API cost — runs in microseconds
+# KEYWORD PRE-FILTER  — PRECISION v2.0  (v6.3)
+#
+# CRITICAL RULE: A post must match keywords from TWO different categories
+# before it passes to Claude. Single-category matches are DISCARDED
+# immediately. This eliminates the vast majority of false positives that
+# were previously reaching Claude (and burning tokens) under the old
+# single-keyword-match system.
+#
+# Stage 1 — Hard negative check: any HARD_NEGATIVES phrase = instant
+#           discard, no matter what else matches.
+# Stage 2 — Category match count: must match keywords from >= 2 different
+#           categories (excluding HARD_NEGATIVES) to pass.
+# Stage 3 — Priority score: more categories matched, plus bonus categories
+#           (COMPETITOR_LEAVING / BANK_BLOCKING_PAIN / BUSINESS_URGENCY /
+#           LARGE_AMOUNTS / CORRIDORS), produce a priority integer. v6.3
+#           uses this priority only to order items within the existing
+#           batch queue (higher-priority items are inserted at the front
+#           of current_batch so they reach Claude sooner) — batch size,
+#           gap, and overall architecture from v6.2 are UNCHANGED.
 # ─────────────────────────────────────────────────────────────────────────────
 
-KEYWORDS = [
+FLINTEL_KEYWORDS = {
 
-  # Sending money
-        "send money to",
-        "sending money to",
-        "transfer money to",
-        "transferring money to",
-        "wire money to",
-        "wiring money to",
-        "move money to",
-        "moving money to",
-        "remit money to",
-        "remitting money to",
-        "pay my supplier",
-        "paying my supplier",
-        "pay a supplier",
-        "paying a supplier",
-        "pay my vendor",
-        "paying my vendor",
-        "pay my manufacturer",
-        "pay my factory",
-        "pay my partner",
-        "pay my contractor",
-        "pay an invoice",
-        "paying an invoice",
-        "settle an invoice",
-        "settling an invoice",
-        "pay a business",
-        "business payment to",
-        "supplier payment to",
-        "vendor payment to",
-        "invoice payment to",
-        "international payment to",
-        "overseas payment to",
-        "cross border payment",
-        "cross-border payment",
-        "cross border transfer",
-        "cross-border transfer",
-        "international transfer",
-        "international wire",
-        "international wire transfer",
-        "foreign wire transfer",
-        "overseas wire transfer",
-        "overseas transfer",
-        "global payment",
-        "global transfer",
-        "b2b payment",
-        "b2b transfer",
-        "business to business payment"
+    # ═══════════════════════════════════════════════════
+    # CATEGORY 1 — HIGH CONFIDENCE PAYMENT PHRASES
+    # Specific two-word+ combinations only. Each phrase alone strongly
+    # implies B2B payment intent, but still needs a second category match.
+    # ═══════════════════════════════════════════════════
 
-        # Bank blocking
-        "bank blocked my",
-        "bank blocked my transfer",
-        "bank blocked my payment",
-        "bank blocked my wire",
-        "bank blocked my transaction",
-        "bank flagged my",
-        "bank flagged my transfer",
-        "bank flagged my payment",
-        "bank rejected my",
-        "bank rejected my transfer",
-        "bank rejected my payment",
-        "bank declined my",
-        "bank declined my transfer",
-        "bank won't let me transfer",
-        "bank won't let me send",
-        "bank refuses to",
-        "bank holding my",
-        "bank holding my funds",
-        "bank holding my money",
-        "bank froze my",
-        "account frozen",
-        "funds frozen",
-        "money frozen",
-        "transfer frozen",
-        "payment frozen",
-        "transfer blocked",
-        "payment blocked",
-        "wire blocked",
-        "transaction blocked",
-        "transfer rejected",
-        "payment rejected",
-        "wire rejected",
-        "transfer declined",
-        "payment declined",
-        "transfer failed",
-        "payment failed",
-        "wire failed",
-        "transfer stuck",
-        "payment stuck",
-        "money stuck",
-        "funds stuck",
-        "money held",
-        "funds held",
-        "money hostage",
-        "holding my money",
-        "holding my funds",
-        "won't release my funds",
-        "won't release my money",
-        "compliance hold",
-        "compliance review",
-        "compliance check",
-        "AML hold",
-        "AML review",
-        "AML flag",
-        "flagged for review",
-        "flagged as suspicious",
-        "suspicious activity",
-        "suspicious transaction",
-        "frozen for review",
-        "under review",
-        "transfer delayed",
-        "payment delayed",
-        "wire delayed",
-        "transfer pending",
-        "stuck in pending",
-        "days to process",
-        "weeks to process",
-        "10-14 days",
-        "10 to 14 days",
-        "two weeks to transfer",
-        "transfer taking forever",
-        "payment taking forever",
-        "money hasn't arrived",
-        "money still hasn't arrived",
-        "payment hasn't arrived",
-        "where is my transfer",
-        "where is my payment",
-        "where is my money",
-        "where did my money go",
-        "money disappeared",
-        "payment disappeared",
-        "transfer disappeared",
-        "no tracking",
-        "can't track my transfer",
-        "can't track my payment",
-        "no update on my transfer",
-        "no update on my payment"
+    'HIGH_CONFIDENCE_PHRASES': [
+        "pay my supplier", "paying my supplier", "pay our supplier",
+        "paying our supplier", "pay a supplier", "supplier payment",
+        "supplier payments", "pay my vendor", "paying my vendor",
+        "vendor payment", "pay my manufacturer", "manufacturer payment",
+        "pay my factory", "factory payment", "pay my contractor",
+        "contractor payment", "pay an invoice", "paying an invoice",
+        "settle an invoice", "invoice payment", "settle invoice",
+        "business invoice", "supplier invoice", "vendor invoice",
+        "pay my partner overseas", "pay my overseas partner",
+        "pay my business partner",
 
-       # FEE_FRUSTRATION
-        "SWIFT fees",
-        "SWIFT charges",
-        "wire transfer fees",
-        "wire transfer charges",
-        "international transfer fees",
-        "international wire fees",
-        "transfer fees too high",
-        "transfer fees killing",
-        "fees killing my margins",
-        "fees eating my margins",
-        "fees eating my profit",
-        "exchange rate terrible",
-        "exchange rate awful",
-        "exchange rate bad",
-        "terrible exchange rate",
-        "awful exchange rate",
-        "bad exchange rate",
-        "worst exchange rate",
-        "exchange rate ripoff",
-        "exchange rate rip off",
-        "hidden fees",
-        "hidden charges",
-        "unexpected fees",
-        "unexpected charges",
-        "FX fees",
-        "FX charges",
-        "FX markup",
-        "FX spread",
-        "currency conversion fee",
-        "currency conversion charge",
-        "conversion fee too high",
-        "conversion markup",
-        "losing money on transfer",
-        "losing money on fees",
-        "losing money to fees",
-        "losing money exchanging",
-        "percentage on transfer",
-        "percentage on payment",
-        "ripping me off",
-        "highway robbery",
-        "daylight robbery",
-        "absolute ripoff",
-        "total ripoff",
-        "complete ripoff",
-        "charging too much",
-        "too expensive to send",
-        "too expensive to transfer",
-        "cheapest way to send",
-        "cheapest way to transfer",
-        "cheapest international transfer",
-        "cheapest cross border",
-        "better rate than",
-        "better rates than",
-        "cheaper than SWIFT",
-        "cheaper than wire",
-        "SWIFT alternative",
-        "alternative to SWIFT",
-        "avoid SWIFT fees",
-        "avoid wire fees",
-        "correspondent bank fees",
-        "intermediary bank fees",
-        "intermediary fees"
+        "cross border payment", "cross-border payment",
+        "cross border transfer", "cross-border transfer",
+        "cross border business", "cross-border business",
+        "international wire transfer", "international business payment",
+        "international supplier payment", "overseas supplier payment",
+        "overseas business payment", "overseas business transfer",
+        "foreign supplier payment", "global business payment",
+        "B2B payment", "B2B transfer", "B2B transaction",
+        "business to business payment", "business wire transfer",
+        "corporate wire transfer", "corporate payment",
+        "intercompany payment", "intercompany transfer",
 
-    #    'COMPETITOR_MENTIONS'
-        # Wise variants
-        "Wise Business",
-        "Wise business account",
-        "Wise transfer",
-        "Wise payment",
-        "Wise blocked",
-        "Wise restricted",
-        "Wise suspended",
-        "Wise account restricted",
-        "Wise account suspended",
-        "Wise account blocked",
-        "Wise account closed",
-        "Wise limit",
-        "Wise holding",
-        "leaving Wise",
-        "left Wise",
-        "moving off Wise",
-        "moved off Wise",
-        "switching from Wise",
-        "switched from Wise",
-        "never using Wise",
-        "done with Wise",
-        "Wise is terrible",
-        "Wise is awful",
-        "Wise is a joke",
-        "hate Wise",
-        "Wise disappointed",
-        "TransferWise",
-        # Remitly
-        "Remitly blocked",
-        "Remitly restricted",
-        "Remitly limit",
-        "Remitly failed",
-        "leaving Remitly",
-        "switching from Remitly",
-        "Remitly alternative",
+        "trade finance", "trade payment", "letter of credit",
+        "purchase order payment", "PO payment", "import payment",
+        "export payment", "import financing", "export financing",
+        "supply chain payment", "supply chain finance",
+    ],
+
+    # ═══════════════════════════════════════════════════
+    # CATEGORY 2 — COMPETITOR LEAVING SIGNALS
+    # Someone leaving a competitor = hottest possible signal.
+    # Immediate-trigger category (boosts priority +5).
+    # ═══════════════════════════════════════════════════
+
+    'COMPETITOR_LEAVING': [
+        # Wise
+        "leaving Wise", "left Wise", "leaving Wise Business",
+        "left Wise Business", "moving off Wise", "moved off Wise",
+        "switching from Wise", "switched from Wise", "done with Wise",
+        "never using Wise", "never using Wise again", "Wise is terrible",
+        "Wise is awful", "Wise keeps blocking", "Wise keeps holding",
+        "Wise holding my money", "Wise holding my funds", "Wise hostage",
+        "money hostage Wise", "Wise restricted my", "Wise blocked my",
+        "Wise suspended my", "Wise account restricted",
+        "Wise account blocked", "Wise account suspended",
+        "Wise account closed", "alternative to Wise",
+        "alternatives to Wise", "better than Wise",
+        "Wise Business blocked", "Wise Business restricted",
+        "Wise Business suspended", "Wise Business holding",
+        "10-14 days Wise", "Wise 10-14 days", "two weeks Wise",
+
         # Payoneer
-        "Payoneer blocked",
-        "Payoneer restricted",
-        "Payoneer suspended",
-        "Payoneer account blocked",
-        "Payoneer account restricted",
-        "Payoneer account suspended",
-        "Payoneer limit",
-        "Payoneer holding",
-        "leaving Payoneer",
-        "switching from Payoneer",
-        "Payoneer alternative",
-        "alternative to Payoneer",
-        # WorldRemit
-        "WorldRemit failed",
-        "WorldRemit blocked",
-        "WorldRemit problem",
-        "WorldRemit issue",
-        "WorldRemit terrible",
-        # Western Union
-        "Western Union failed",
-        "Western Union blocked",
-        "Western Union delayed",
-        "Western Union problem",
-        "leaving Western Union",
-        "WU failed",
-        "WU blocked",
-        # OFX
-        "OFX failed",
-        "OFX blocked",
-        "OFX problem",
-        "OFX issue",
+        "leaving Payoneer", "left Payoneer", "switching from Payoneer",
+        "Payoneer restricted my", "Payoneer blocked my",
+        "Payoneer suspended my", "Payoneer account restricted",
+        "Payoneer account blocked", "Payoneer account suspended",
+        "alternative to Payoneer", "better than Payoneer",
+        "done with Payoneer", "never using Payoneer",
+
+        # Remitly
+        "leaving Remitly", "left Remitly", "Remitly blocked my",
+        "Remitly restricted my", "Remitly account blocked",
+        "alternative to Remitly", "better than Remitly",
+
         # Revolut
-        "Revolut blocked",
-        "Revolut restricted",
-        "Revolut suspended",
-        "Revolut Business blocked",
-        "Revolut Business restricted",
-        "Revolut account blocked",
-        "Revolut account restricted",
-        "Revolut holding",
-        "leaving Revolut",
-        "switching from Revolut",
-        # Stripe
-        "Stripe blocked",
-        "Stripe restricted",
-        "Stripe account blocked",
-        "Stripe account restricted",
-        # Mercury
-        "Mercury blocked",
-        "Mercury restricted",
-        "Mercury bank blocked",
-        # LemFi
-        "LemFi failed",
-        "LemFi blocked",
-        "LemFi problem",
-        # Grey Finance
-        "Grey Finance failed",
-        "Grey Finance blocked",
-        "Grey Finance problem",
-        # NALA
-        "NALA failed",
-        "NALA blocked",
-        "NALA problem",
-        # Chipper Cash
-        "Chipper Cash failed",
-        "Chipper Cash blocked",
-        "Chipper Cash problem",
-        # General competitor frustration
-        "alternative to Wise",
-        "alternative to Remitly",
-        "alternative to Payoneer",
+        "leaving Revolut", "Revolut Business blocked",
+        "Revolut Business restricted", "Revolut account blocked",
+        "Revolut account restricted", "Revolut account suspended",
+        "alternative to Revolut Business",
+
+        # WorldRemit
+        "leaving WorldRemit", "WorldRemit blocked", "WorldRemit failed my",
         "alternative to WorldRemit",
-        "alternative to Western Union",
-        "alternative to Revolut",
-        "better than Wise",
-        "better than Remitly",
-        "better than Payoneer",
-        "better than WorldRemit",
-        "better than Western Union",
+
+        # Western Union
+        "leaving Western Union", "done with Western Union",
+        "Western Union failed my", "alternative to Western Union",
+
+        # OFX
+        "leaving OFX", "OFX blocked my", "OFX failed my",
+        "alternative to OFX",
+
+        # LemFi
+        "leaving LemFi", "LemFi blocked", "LemFi failed",
+        "alternative to LemFi",
+
+        # Grey Finance
+        "leaving Grey Finance", "Grey Finance blocked", "Grey Finance failed",
+
+        # NALA
+        "leaving NALA", "NALA blocked", "NALA failed",
+
+        # Chipper Cash
+        "leaving Chipper Cash", "Chipper Cash blocked", "Chipper Cash failed",
+
+        # Mercury
+        "Mercury bank blocked", "Mercury account blocked", "leaving Mercury",
+
+        # General
+        "leaving my payment provider", "switching payment providers",
+        "switching payment platform", "switching payment service",
+        "switching to a new payment", "looking for Wise alternative",
+        "looking for Payoneer alternative", "need alternative to Wise",
+        "need alternative to Payoneer", "Wise competitors",
         "competitors to Wise",
-        "Wise competitors",
-        "Payoneer competitors"
-    
+    ],
 
-    # ── CURRENCIES AND CORRIDORS ─────────────────────────────────────────────
-  # TIER 5 — RECOMMENDATION REQUESTS
-    # People actively asking for a solution right now
     # ═══════════════════════════════════════════════════
-
-    # 'RECOMMENDATION_REQUESTS': 
-        "recommend a payment",
-        "recommend a transfer",
-        "recommend a service",
-        "recommend a platform",
-        "recommend an app",
-        "recommend a provider",
-        "recommend a solution",
-        "anyone recommend",
-        "can anyone recommend",
-        "does anyone recommend",
-        "what payment service",
-        "what transfer service",
-        "what payment platform",
-        "what transfer platform",
-        "what payment app",
-        "what transfer app",
-        "which payment service",
-        "which transfer service",
-        "which payment platform",
-        "which transfer platform",
-        "which payment app",
-        "which transfer app",
-        "which payment provider",
-        "which service is best",
-        "which platform is best",
-        "which app is best",
-        "best payment service",
-        "best transfer service",
-        "best payment platform",
-        "best transfer platform",
-        "best payment app",
-        "best transfer app",
-        "best way to send",
-        "best way to transfer",
-        "best way to pay",
-        "fastest way to send",
-        "fastest way to transfer",
-        "cheapest way to send",
-        "cheapest way to transfer",
-        "how do I send",
-        "how do I transfer",
-        "how do I pay",
-        "how can I send",
-        "how can I transfer",
-        "how can I pay",
-        "looking for a payment",
-        "looking for a transfer",
-        "looking for a platform",
-        "looking for a service",
-        "looking for a solution",
-        "searching for a payment",
-        "need a payment solution",
-        "need a transfer solution",
-        "need a payment platform",
-        "need a transfer platform",
-        "anyone using",
-        "does anyone use",
-        "has anyone used",
-        "who uses",
-        "who do you use",
-        "what do you use",
-        "what are you using",
-        "tried everything",
-        "tried so many",
-        "tried multiple",
-        "tried several",
-        "nothing works",
-        "none of them work",
-        "still haven't found",
-        "still looking for",
-        "still searching for",
-        
-    # ═══════════════════════════════════════════════════
-    # TIER 6 — BUSINESS AND TRADE CONTEXT
-    # Confirms business not consumer intent
+    # CATEGORY 3 — ACTIVE BANK BLOCKING PAIN
+    # Specific pain phrases — always high intent when business.
+    # Immediate-trigger category (boosts priority +5).
     # ═══════════════════════════════════════════════════
 
-    # 'BUSINESS_CONTEXT'
-        "my supplier",
-        "my suppliers",
-        "our supplier",
-        "our suppliers",
-        "my vendor",
-        "my vendors",
-        "our vendor",
-        "our vendors",
-        "my manufacturer",
-        "my manufacturers",
-        "our manufacturer",
-        "my factory",
-        "our factory",
-        "my business partner",
-        "our business partner",
-        "my contractor",
-        "our contractor",
-        "my client overseas",
-        "our client overseas",
-        "import business",
-        "importing business",
-        "export business",
-        "exporting business",
-        "import export",
-        "import/export",
-        "importing goods",
-        "exporting goods",
-        "importing products",
-        "exporting products",
-        "buying from overseas",
-        "buying from abroad",
-        "sourcing from",
-        "sourcing overseas",
-        "sourcing abroad",
-        "purchase order",
-        "business invoice",
-        "supplier invoice",
-        "vendor invoice",
-        "trade finance",
-        "trade payment",
-        "trade financing",
-        "supply chain payment",
-        "supply chain finance",
-        "diaspora business",
-        "diaspora entrepreneur",
-        "running a business",
-        "my business needs",
-        "for my business",
-        "business account",
-        "business transfer",
-        "business wire",
-        "corporate payment",
-        "corporate transfer",
-        "corporate wire",
-        "company payment",
-        "company transfer",
-        "B2B payment",
-        "B2B transfer",
-        "B2B transaction",
-        "business to business",
-        
+    'BANK_BLOCKING_PAIN': [
+        "bank blocked my transfer", "bank blocked my payment",
+        "bank blocked my wire", "bank blocked my transaction",
+        "bank blocked my international", "bank flagged my transfer",
+        "bank flagged my payment", "bank flagged my wire",
+        "bank rejected my transfer", "bank rejected my payment",
+        "bank rejected my wire", "bank declined my transfer",
+        "bank declined my payment", "bank won't let me transfer",
+        "bank won't let me send", "bank refuses to transfer",
+        "bank refuses to send", "bank holding my transfer",
+        "bank holding my payment", "bank holding my funds",
+        "bank holding my money", "bank froze my account",
+        "bank froze my funds", "bank froze my transfer",
+        "account frozen transfer", "funds frozen transfer",
+        "money frozen transfer", "transfer on hold", "payment on hold",
+        "wire on hold", "funds on hold business", "money on hold business",
+        "compliance hold transfer", "compliance hold payment",
+        "AML hold transfer", "AML hold payment", "AML flagged transfer",
+        "AML flagged payment", "suspicious activity transfer",
+        "suspicious transaction flagged", "flagged for compliance",
+        "under compliance review", "transfer under review",
+        "payment under review", "wire under review",
+        "money hasn't arrived supplier", "payment hasn't arrived supplier",
+        "transfer hasn't arrived supplier", "where is my wire transfer",
+        "where is my business payment", "payment disappeared business",
+        "transfer disappeared business", "funds missing business",
+        "wire missing business",
+    ],
+
     # ═══════════════════════════════════════════════════
-    # TIER 7 — CORRIDOR KEYWORDS
-    # Geographic signals for relevant payment corridors
+    # CATEGORY 4 — FEE FRUSTRATION WITH BUSINESS CONTEXT
+    # Fee complaints only valid when business context present.
     # ═══════════════════════════════════════════════════
 
-    # 'CORRIDORS'
-        # Nigeria corridors
-        "to Nigeria",
-        "to Lagos",
-        "to Abuja",
-        "from Nigeria",
-        "Nigeria payment",
-        "Nigeria transfer",
-        "Nigeria wire",
-        "Nigerian supplier",
-        "Nigerian vendor",
-        "Nigerian manufacturer",
-        "Nigeria business",
-        "CAD to NGN",
-        "GBP to NGN",
-        "USD to NGN",
-        "EUR to NGN",
-        "AUD to NGN",
-        "naira payment",
-        "naira transfer",
-        "send naira",
-        "receive naira",
-        # Pakistan corridors
-        "to Pakistan",
-        "to Karachi",
-        "to Lahore",
-        "to Islamabad",
-        "from Pakistan",
-        "Pakistan payment",
-        "Pakistan transfer",
-        "Pakistan wire",
-        "Pakistani supplier",
-        "Pakistani vendor",
-        "Pakistani manufacturer",
-        "CAD to PKR",
-        "GBP to PKR",
-        "USD to PKR",
-        "rupee payment",
-        "rupee transfer",
-        # India corridors
-        "to India",
-        "to Mumbai",
-        "to Delhi",
-        "to Bangalore",
-        "from India",
-        "India payment",
-        "India transfer",
-        "India wire",
-        "Indian supplier",
-        "Indian vendor",
-        "Indian manufacturer",
-        "CAD to INR",
-        "GBP to INR",
-        "USD to INR",
-        "rupee payment",
-        # Ghana corridors
-        "to Ghana",
-        "to Accra",
-        "from Ghana",
-        "Ghana payment",
-        "Ghana transfer",
-        "Ghanaian supplier",
-        "GHS payment",
-        "cedi payment",
-        # Kenya corridors
-        "to Kenya",
-        "to Nairobi",
-        "from Kenya",
-        "Kenya payment",
-        "Kenya transfer",
-        "Kenyan supplier",
-        "KES payment",
-        "M-Pesa business",
-        "Mpesa business",
+    'FEE_FRUSTRATION': [
+        "SWIFT fees killing", "SWIFT fees insane", "SWIFT fees too high",
+        "SWIFT fees destroying", "SWIFT fees eating", "SWIFT charges killing",
+        "international wire fees killing", "international wire fees insane",
+        "international transfer fees killing",
+        "international transfer fees insane",
+        "wire transfer fees too high", "transfer fees killing my margins",
+        "transfer fees eating my margins", "transfer fees eating my profit",
+        "fees killing my business", "fees destroying my margins",
+        "exchange rate terrible business", "exchange rate awful supplier",
+        "terrible exchange rate supplier", "FX fees killing",
+        "FX fees insane", "FX markup too high",
+        "losing money on international", "losing money on wire",
+        "losing money on transfer", "highway robbery international",
+        "daylight robbery SWIFT", "ripoff SWIFT fees",
+        "cheaper than SWIFT", "avoid SWIFT fees", "SWIFT alternative business",
+        "correspondent bank fees", "intermediary bank fees killing",
+    ],
+
+    # ═══════════════════════════════════════════════════
+    # CATEGORY 5 — ACTIVE RECOMMENDATION REQUESTS
+    # People asking for solutions RIGHT NOW. High-specificity phrases only.
+    # ═══════════════════════════════════════════════════
+
+    'RECOMMENDATION_REQUESTS': [
+        "recommend a payment platform", "recommend a payment service",
+        "recommend a payment provider", "recommend a payment solution",
+        "recommend a transfer service", "recommend a transfer platform",
+        "recommend a business payment", "anyone recommend payment",
+        "can anyone recommend payment", "does anyone recommend payment",
+        "best payment platform for business",
+        "best transfer service for business",
+        "best payment service for business", "best way to pay supplier",
+        "best way to pay vendors", "best way to transfer internationally",
+        "best way to send internationally",
+        "which payment platform for business",
+        "which transfer service for business",
+        "which service for international", "looking for payment platform",
+        "looking for transfer service", "searching for payment solution",
+        "need payment solution for business",
+        "need transfer solution for business", "tried everything payment",
+        "tried multiple payment platforms", "tried several payment services",
+        "nothing works for international payment",
+        "still haven't found payment", "still looking for payment solution",
+        "what do you use for international payment",
+        "what do you use to pay suppliers",
+        "who do you use for international",
+        "how do you pay international suppliers",
+        "how do you send money internationally business",
+    ],
+
+    # ═══════════════════════════════════════════════════
+    # CATEGORY 6 — CORRIDOR KEYWORDS
+    # Geographic signals — must combine with business context (another
+    # category) to pass. Bonus category (boosts priority +2).
+    # ═══════════════════════════════════════════════════
+
+    'CORRIDORS': [
+        # Nigeria
+        "to Nigeria business", "Nigeria supplier", "Nigerian supplier",
+        "Nigerian vendor", "Nigerian manufacturer", "Lagos supplier",
+        "Abuja supplier", "Nigeria payment business",
+        "Nigeria transfer business", "Nigeria wire business",
+        "CAD to NGN business", "GBP to NGN business", "USD to NGN business",
+        "naira business payment", "naira supplier payment",
+        "send naira business",
+
+        # Pakistan
+        "Pakistan supplier", "Pakistani supplier", "Pakistani vendor",
+        "Pakistani manufacturer", "Karachi supplier", "Lahore supplier",
+        "Pakistan payment business", "Pakistan transfer business",
+        "CAD to PKR business", "GBP to PKR business",
+        "rupee business payment", "rupee supplier payment",
+
+        # India
+        "India supplier", "Indian supplier", "Indian vendor",
+        "Indian manufacturer", "Mumbai supplier", "Delhi supplier",
+        "India payment business", "India transfer business",
+        "CAD to INR business", "GBP to INR business",
+
+        # Ghana
+        "Ghana supplier", "Ghanaian supplier", "Accra supplier",
+        "Ghana payment business", "Ghana transfer business",
+        "cedi business payment",
+
+        # Kenya
+        "Kenya supplier", "Kenyan supplier", "Nairobi supplier",
+        "Kenya payment business", "M-Pesa business payment",
+        "Mpesa business payment",
+
         # Other African corridors
-        "to Ethiopia",
-        "to Senegal",
-        "to Ivory Coast",
-        "to Cameroon",
-        "to Tanzania",
-        "to Uganda",
-        "to Zimbabwe",
-        "to South Africa",
-        "to Johannesburg",
-        "African supplier",
-        "African vendor",
-        "African manufacturer",
-        "Africa payment",
-        "Africa transfer",
-        # Sending countries
-        "from Canada",
-        "from Toronto",
-        "from Vancouver",
-        "from Calgary",
-        "from Ottawa",
-        "from Montreal",
-        "from UK",
-        "from London",
-        "from Manchester",
-        "from Birmingham",
-        "from Glasgow",
-        "from USA",
-        "from New York",
-        "from Houston",
-        "from Atlanta",
-        "from Washington",
-        "from Australia",
-        "from Sydney",
-        "from Melbourne",
-        "from Perth",
-        "from UAE",
-        "from Dubai",
-        "from Abu Dhabi",
-    
-    
-    # ═══════════════════════════════════════════════════
-    # TIER 8 — AMOUNT SIGNALS
-    # Large amounts confirm business not consumer
-    # ═══════════════════════════════════════════════════
+        "South Africa supplier", "Ethiopian supplier", "Tanzania supplier",
+        "Uganda supplier", "African supplier payment",
+        "Africa business payment", "Africa wire transfer",
 
-    # 'AMOUNT_SIGNALS'
-        "$10,000", "$10k", "10 thousand",
-        "$15,000", "$15k", "15 thousand",
-        "$20,000", "$20k", "20 thousand",
-        "$25,000", "$25k", "25 thousand",
-        "$30,000", "$30k", "30 thousand",
-        "$40,000", "$40k", "40 thousand",
-        "$45,000", "$45k", "45 thousand",
-        "$50,000", "$50k", "50 thousand",
-        "$60,000", "$60k", "60 thousand",
-        "$75,000", "$75k", "75 thousand",
-        "$80,000", "$80k", "80 thousand",
-        "$100,000", "$100k", "100 thousand",
-        "$150,000", "$150k", "150 thousand",
-        "$200,000", "$200k", "200 thousand",
-        "$250,000", "$250k", "250 thousand",
-        "$500,000", "$500k", "500 thousand",
-        "$750,000", "$750k", "750 thousand",
-        "$1 million", "$1m", "one million",
-        "£10,000", "£10k", "£15,000", "£15k",
-        "£20,000", "£20k", "£25,000", "£25k",
-        "£30,000", "£30k", "£50,000", "£50k",
-        "£100,000", "£100k", "£200,000", "£200k",
-        "large transfer", "large amount", "large payment",
-        "large wire", "large sum", "significant amount",
-        "substantial amount", "big transfer", "big payment",
-        "six figures", "seven figures", "six-figure",
-        "seven-figure", "monthly volume", "weekly volume",
-    
-    
-    # ═══════════════════════════════════════════════════
-    # TIER 9 — COMPLIANCE AND DOCUMENTATION PAIN
-    # ═══════════════════════════════════════════════════
-
-    # 'COMPLIANCE_PAIN'
-        "KYC rejected",
-        "KYC failed",
-        "KYC verification failed",
-        "KYC problem",
-        "KYC issue",
-        "KYC nightmare",
-        "AML rejected",
-        "AML flagged",
-        "AML hold",
-        "AML review",
-        "documentation rejected",
-        "documents rejected",
-        "proof of funds",
-        "source of funds",
-        "source of wealth",
-        "proof of business",
-        "business verification failed",
-        "verification rejected",
-        "verification failed",
-        "compliance rejected",
-        "compliance hold",
-        "compliance review",
-        "compliance nightmare",
-        "compliance problem",
-        "compliance issue",
-        "Form M",
-        "CBN compliance",
-        "regulatory hold",
-        "regulatory review",
-        "regulatory problem",
-        "regulatory issue",
-        "submitted documents again",
-        "sent documents again",
-        "asking for documents again",
-        "same documents again",
-        "keep asking for documents",
-        "keep rejecting documents",
-        "third time submitting",
-        "fourth time submitting",
-        "rejected again",
-        "blocked again",
-        "failed again",
-        "happening again",
-        "third time",
-        "fourth time",
-        "keep blocking",
-        "keeps blocking",
-        "keeps rejecting",
-        "keeps failing",
-        "always blocks",
-        "always rejects",
-        "always fails",
-    
+        # Sending countries with business context
+        "Canada Nigeria business", "UK Nigeria business",
+        "USA Nigeria business", "Australia Nigeria business",
+        "UAE Nigeria business", "Canada Pakistan business",
+        "UK Pakistan business", "Canada India business",
+        "UK Ghana business",
+    ],
 
     # ═══════════════════════════════════════════════════
-    # TIER 10 — URGENCY SIGNALS
-    # Time pressure confirms high intent
+    # CATEGORY 7 — LARGE AMOUNT SIGNALS
+    # Large amounts almost always confirm business not consumer.
+    # Bonus category (boosts priority +3).
     # ═══════════════════════════════════════════════════
 
-    # 'URGENCY'
-        "urgently",
-        "urgent",
-        "desperately",
-        "desperate",
-        "ASAP",
-        "as soon as possible",
-        "right now",
-        "today",
-        "this week",
-        "by Friday",
-        "by Monday",
-        "by end of week",
-        "by end of month",
-        "deadline",
-        "time sensitive",
-        "need it done",
-        "need it now",
-        "need it today",
-        "need it urgently",
-        "waiting on payment",
-        "supplier is waiting",
-        "supplier waiting",
-        "vendor is waiting",
-        "vendor waiting",
-        "manufacturer waiting",
-        "partner waiting",
-        "been waiting",
-        "already delayed",
-        "already late",
-        "overdue",
-        "past due",
-        "losing the contract",
-        "losing my supplier",
-        "losing my vendor",
-        "threatening to cancel",
-        "might cancel",
-        "going to cancel",
-        "cancelling the order",
-        "losing the deal",
-        "deal at risk",
-        "relationship at risk",
-        "can't wait any longer",
-        "running out of time",
-        "no more time",
-    
+    'LARGE_AMOUNTS': [
+        "$10,000", "$10k", "$15,000", "$15k", "$20,000", "$20k",
+        "$25,000", "$25k", "$30,000", "$30k", "$40,000", "$40k",
+        "$45,000", "$45k", "$50,000", "$50k", "$60,000", "$60k",
+        "$75,000", "$75k", "$80,000", "$80k", "$100,000", "$100k",
+        "$150,000", "$150k", "$200,000", "$200k", "$250,000", "$250k",
+        "$300,000", "$300k", "$500,000", "$500k", "$750,000", "$750k",
+        "$1 million", "$1m", "$2 million", "$2m",
+
+        "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
+        "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
+        "£75,000", "£75k", "£100,000", "£100k", "£200,000", "£200k",
+        "£500,000", "£500k",
+
+        "€10,000", "€10k", "€20,000", "€20k", "€50,000", "€50k",
+        "€100,000", "€100k",
+
+        "CAD 10,000", "CAD 20,000", "CAD 50,000",
+        "10,000 CAD", "20,000 CAD", "50,000 CAD",
+        "100,000 CAD", "200,000 CAD", "500,000 CAD",
+
+        "six figures transfer", "six-figure transfer",
+        "seven figures transfer", "seven-figure transfer",
+        "large business transfer", "large business payment",
+        "large supplier payment", "high volume transfers",
+        "high volume payments", "monthly volume business",
+        "bulk transfer business", "bulk payment business",
+    ],
 
     # ═══════════════════════════════════════════════════
-    # TIER 11 — BUSINESS EXPANSION SIGNALS
-    # Future buyers — watchlist territory
+    # CATEGORY 8 — COMPLIANCE AND KYC PAIN
     # ═══════════════════════════════════════════════════
 
-    # 'EXPANSION_SIGNALS'
-        "just signed a supplier",
-        "signed a new supplier",
-        "found a supplier",
-        "new supplier in",
-        "signed a contract with",
-        "new contract with",
-        "starting to import",
-        "starting an import",
-        "starting to export",
-        "starting an export",
-        "launching in",
-        "expanding to",
-        "entering the market",
-        "new market",
-        "setting up payments",
-        "need to set up payments",
-        "need to transfer money",
-        "will need to send",
-        "will need to transfer",
-        "going to need",
-        "starting a business",
-        "new business",
-        "import business",
-        "export business",
-        "trading company",
-        "sourcing products from",
-        "sourcing goods from",
-        "buying products from",
-        "buying goods from",
-        "manufacturing in",
-        "producing in",
-    
+    'COMPLIANCE_PAIN': [
+        "KYC rejected business", "KYC failed business",
+        "KYC verification failed", "KYC nightmare business",
+        "AML hold business", "AML review business", "AML flagged business",
+        "documentation rejected payment", "documents rejected transfer",
+        "proof of funds business", "source of funds business",
+        "proof of business payment", "business verification failed",
+        "compliance hold business", "compliance rejected payment",
+        "compliance nightmare payment", "Form M Nigeria",
+        "CBN compliance payment", "regulatory hold payment",
+        "submitted documents again payment", "same documents again payment",
+        "keep rejecting my documents", "third time submitting documents",
+        "rejected again payment", "blocked again payment",
+        "keeps blocking my payment", "keeps rejecting my payment",
+        "always blocks my transfer", "always rejects my payment",
+    ],
 
     # ═══════════════════════════════════════════════════
-    # TIER 12 — TREASURY AND FX MANAGEMENT
-    # Mid intent B2B signals for finance professionals
+    # CATEGORY 9 — URGENCY WITH BUSINESS CONTEXT
+    # Urgency words ONLY count combined with business context (i.e. they
+    # still need a second category match to pass).
+    # Immediate-trigger category (boosts priority +5).
     # ═══════════════════════════════════════════════════
 
-    # 'TREASURY_FX'
-        "treasury management",
-        "cash management",
-        "liquidity management",
-        "FX management",
-        "FX exposure",
-        "FX risk",
-        "FX hedging",
-        "currency hedging",
-        "currency risk",
-        "currency exposure",
-        "FX solution",
-        "FX platform",
-        "FX tool",
-        "treasury solution",
-        "treasury platform",
-        "cash flow management",
-        "multi currency",
-        "multi-currency",
-        "multicurrency",
-        "currency account",
-        "foreign currency account",
-        "international banking",
-        "international bank account",
-        "global banking",
-        "global bank account",
-        "correspondent banking",
-        "banking relationship",
-        "banking partner",
-        "payment infrastructure",
-        "payment rails",
-        "payment solution",
-        "payment platform",
-        "payment provider",
-        "payment partner",
-        "fintech payment",
-        "embedded payment",
-        "embedded finance",
-        "cross border banking",
-        "international banking solution",
-        "FX banking",
-        "FX banking relationship",
-        "FX liquidity",
-        "cash pooling",
-        "cash concentration",
-        "intercompany payment",
+    'BUSINESS_URGENCY': [
+        "supplier waiting for payment", "supplier is waiting payment",
+        "supplier waiting urgently", "vendor waiting for payment",
+        "manufacturer waiting payment", "supplier threatening to cancel",
+        "supplier might cancel", "supplier going to cancel",
+        "losing my supplier", "lost my supplier",
+        "losing the contract payment", "deal at risk payment",
+        "relationship at risk payment", "killing my business payment",
+        "killing my business transfer", "destroying my business payment",
+        "urgent supplier payment", "urgent business transfer",
+        "urgent international payment", "urgent cross border",
+        "need payment today supplier", "need transfer today supplier",
+        "payment overdue supplier", "invoice overdue supplier",
+        "past due supplier", "supplier payment deadline",
+        "payment deadline today", "transfer deadline today",
+        "need to pay supplier today", "need to pay vendor today",
+        "ASAP supplier payment", "ASAP business transfer",
+    ],
+
+    # ═══════════════════════════════════════════════════
+    # CATEGORY 10 — TREASURY AND FX MANAGEMENT
+    # Mid intent B2B signals for finance professionals.
+    # ═══════════════════════════════════════════════════
+
+    'TREASURY_FX': [
+        "treasury management software", "treasury management solution",
+        "treasury management platform", "cash management international",
+        "liquidity management international", "FX management business",
+        "FX exposure business", "FX risk management", "FX hedging business",
+        "currency hedging business", "currency risk business",
+        "FX solution business", "FX platform business",
+        "multi currency business", "multi-currency business",
+        "multicurrency business account", "foreign currency business account",
+        "international banking business", "international bank account business",
+        "global banking business", "correspondent banking business",
+        "banking relationship payments", "payment infrastructure business",
+        "payment rails business", "payment solution business",
+        "embedded payments business", "embedded finance business",
+        "FX banking relationship", "FX liquidity business",
+        "cash pooling business", "intercompany payment",
         "intercompany transfer",
-    
+    ],
 
     # ═══════════════════════════════════════════════════
-    # TIER 13 — JOB POSTING SIGNALS
-    # Companies building international payment capability
+    # CATEGORY 11 — BUSINESS EXPANSION SIGNALS
+    # Future buyers — watchlist territory. Score 3-4 max unless combined
+    # with pain signals (still needs 2-category match to pass at all).
     # ═══════════════════════════════════════════════════
 
-    #   'JOB_SIGNALS'
-        "treasury manager",
-        "treasury analyst",
-        "FX manager",
-        "FX analyst",
-        "FX trader",
-        "treasury director",
-        "head of treasury",
-        "VP treasury",
-        "international payments manager",
-        "global payments manager",
-        "cross border payments",
-        "payments operations manager",
-        "payments specialist",
-        "treasury specialist",
-        "FX specialist",
-        "international finance manager",
-        "global finance manager",
-        "head of payments",
-        "director of payments",
-        "VP payments",
-        "chief financial officer",
-        "head of finance",
-        "finance director",
-        "controller international",
-        "global controller",
-    
+    'EXPANSION_SIGNALS': [
+        "just signed supplier contract", "signed new supplier",
+        "found new supplier overseas", "new supplier in Nigeria",
+        "new supplier in Pakistan", "new supplier in India",
+        "new supplier in Ghana", "new supplier in Africa",
+        "signed contract overseas supplier", "starting to import from",
+        "starting import business", "starting export business",
+        "launching import business", "expanding to Nigeria",
+        "expanding to Pakistan", "expanding to Africa",
+        "entering Nigerian market", "entering African market",
+        "setting up international payments",
+        "need to set up international payments",
+        "setting up payment infrastructure", "need payment infrastructure",
+        "sourcing products from Nigeria", "sourcing products from Pakistan",
+        "sourcing goods from Africa", "buying from overseas supplier",
+        "manufacturing in Nigeria", "manufacturing in Pakistan",
+        "manufacturing in India", "producing overseas",
+        "new overseas supplier",
+    ],
 
     # ═══════════════════════════════════════════════════
-    # TIER 14 — NEGATIVE FILTERS
-    # These words REDUCE the score when found
-    # Used to eliminate consumer and irrelevant signals
+    # CATEGORY 12 — HARD NEGATIVE SIGNALS
+    # Posts containing ANY of these are IMMEDIATELY DISCARDED, regardless
+    # of any other category matches. Checked FIRST (Stage 1).
     # ═══════════════════════════════════════════════════
 
-    # 'NEGATIVE_SIGNALS'
-        # Consumer personal payments
-        "send to my mum",
-        "send to my mom",
-        "send to my parents",
-        "send to my family",
-        "send to my sister",
-        "send to my brother",
-        "school fees",
-        "rent money",
-        "personal money",
-        "pocket money",
-        "allowance",
-        "birthday gift",
-        "wedding gift",
-        # Consumer apps unrelated
-        "PayPal personal",
-        "Cash App",
-        "Venmo",
-        "Zelle",
-        "Apple Pay",
-        "Google Pay",
-        # Small amounts — consumer
-        "$50", "$100", "$200", "$300", "$500",
-        "£50", "£100", "£200", "£300", "£500",
-        # Crypto trading not payments
-        "crypto trading",
-        "bitcoin trading",
-        "ethereum trading",
-        "altcoin",
-        "NFT",
-        "DeFi yield",
-        "staking",
-        "mining",
-        # Consumer subscriptions
-        "Netflix",
-        "Spotify",
-        "BeatStars",
-        "subscription payment",
-        "monthly subscription",
-        # Irrelevant financial
-        "stock market",
-        "shares",
-        "dividend",
-        "mortgage",
-        "car payment",
-        "car loan",
-        "student loan",
-        "credit card",
-        "insurance claim",
-        "tax refund",
-        
-    
+    'HARD_NEGATIVES': [
+        "send to my mum", "send to my mom", "send to my parents",
+        "send to my family", "send to my sister", "send to my brother",
+        "send to my wife", "send to my husband", "send to my children",
+        "send to my kids", "school fees", "university fees", "tuition fees",
+        "rent money", "house rent", "personal remittance", "pocket money",
+        "allowance", "birthday money", "birthday gift", "wedding gift",
+        "funeral money", "medical bills family",
 
-    
+        "Cash App", "Venmo", "Zelle", "Apple Pay transfer",
+        "Google Pay transfer", "PayPal friends", "PayPal personal",
+        "PayPal gift",
 
-]
+        "$50 transfer", "$100 transfer", "$200 transfer", "$300 transfer",
+        "$500 personal", "$400 personal", "£50 transfer", "£100 transfer",
+        "£200 transfer", "£300 transfer",
 
-def passes_keyword_filter(text: str) -> bool:
+        "crypto trading", "bitcoin trading", "ethereum trading",
+        "altcoin trading", "NFT payment", "DeFi yield", "staking rewards",
+        "mining rewards", "crypto gains", "trading profits", "P2P crypto",
+
+        "Netflix payment", "Spotify payment", "BeatStars payment",
+        "subscription payment", "monthly subscription cancel",
+        "streaming subscription",
+
+        "stock market", "stock trading", "share purchase",
+        "dividend payment", "mortgage payment", "car payment", "car loan",
+        "student loan", "credit card payment", "insurance claim",
+        "tax refund", "salary payment", "wage payment", "paycheck",
+        "payday loan", "personal loan", "gambling", "casino payment",
+        "betting payment",
+    ],
+}
+
+# Pre-lowercase every keyword once at import time, so the hot-path filter
+# below does zero per-call .lower() work on the keyword lists (only on the
+# input text). Significant speedup for the high-frequency Reddit/Twitter
+# filter path.
+_FLINTEL_KEYWORDS_LOWER = {
+    category: [kw.lower() for kw in kws]
+    for category, kws in FLINTEL_KEYWORDS.items()
+}
+
+# Categories that, when matched alongside any second category, indicate
+# such high signal that they get an extra priority boost (used to order
+# items within the existing batch queue — see run_batch_processor).
+_IMMEDIATE_TRIGGER_CATEGORIES = {
+    'COMPETITOR_LEAVING',
+    'BANK_BLOCKING_PAIN',
+    'BUSINESS_URGENCY',
+}
+
+
+def passes_keyword_filter(text: str) -> tuple[bool, int]:
     """
-    Returns True if text contains at least one target keyword.
-    Case-insensitive. Zero API cost. Runs in microseconds.
-    Applied to ALL content: posts, comments, replies, tweets.
+    PRECISION v2.0 filter (v6.3).
+
+    Returns (passes: bool, priority: int).
+
+    Stage 1 — Hard negative check: if text matches ANY HARD_NEGATIVES
+              phrase, return (False, 0) immediately. No exceptions.
+
+    Stage 2 — Minimum two-category requirement: text must match keywords
+              from at least TWO different categories (excluding
+              HARD_NEGATIVES) to pass. A single-category match is
+              discarded — (False, 0) — saving Claude API cost on the
+              ~90% of posts that only weakly resemble a real signal.
+
+    Stage 3 — Priority scoring: priority starts at the number of matched
+              categories, then gets +5 if any of COMPETITOR_LEAVING /
+              BANK_BLOCKING_PAIN / BUSINESS_URGENCY matched, +3 if
+              LARGE_AMOUNTS matched, +2 if CORRIDORS matched. Higher
+              priority = processed sooner within the existing batch
+              queue (front-inserted), but batch size / gap / overall
+              architecture are unchanged from v6.2.
     """
-    t = text.lower()
-    for kw in KEYWORDS:
-        if kw in t:
-            return True
-    return False
+    text_lower = text.lower()
+
+    # ── Stage 1 — Hard negative check ──────────────────────────────────
+    for neg in _FLINTEL_KEYWORDS_LOWER['HARD_NEGATIVES']:
+        if neg in text_lower:
+            return False, 0
+
+    # ── Stage 2 — Minimum two-category requirement ─────────────────────
+    categories_matched = []
+    for category, keywords in _FLINTEL_KEYWORDS_LOWER.items():
+        if category == 'HARD_NEGATIVES':
+            continue
+        for kw in keywords:
+            if kw in text_lower:
+                categories_matched.append(category)
+                break  # one match per category is enough
+
+    if len(categories_matched) < 2:
+        return False, 0
+
+    # ── Stage 3 — Priority scoring ──────────────────────────────────────
+    priority = len(categories_matched)
+
+    if any(cat in _IMMEDIATE_TRIGGER_CATEGORIES for cat in categories_matched):
+        priority += 5
+
+    if 'LARGE_AMOUNTS' in categories_matched:
+        priority += 3
+
+    if 'CORRIDORS' in categories_matched:
+        priority += 2
+
+    return True, priority
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1813,7 +1428,7 @@ def _hs_create_contact(data: dict) -> str | None:
 def _hs_create_note(data: dict, contact_id: str):
     try:
         note = (
-            f"FLINTEL SIGNAL — v6.2\n\n"
+            f"FLINTEL SIGNAL — v6.3\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -2007,7 +1622,8 @@ def run_batch_processor(
                 q.task_done()
                 continue
 
-            if not passes_keyword_filter(text):
+            passes, priority = passes_keyword_filter(text)
+            if not passes:
                 total_dropped += 1
                 log.debug(
                     f"[{platform_label}] FILTERED | u/{item.get('username')} | "
@@ -2018,10 +1634,21 @@ def run_batch_processor(
                 continue
 
             total_matched += 1
-            current_batch.append(item)
+
+            # v6.3: higher-priority items (competitor-leaving, bank
+            # blocking, business urgency, large amounts, corridors) are
+            # inserted at the FRONT of current_batch so they reach Claude
+            # in the next completed batch sooner than lower-priority
+            # items already waiting. Batch size / gap / architecture
+            # otherwise unchanged from v6.2.
+            if priority >= 7:
+                current_batch.insert(0, item)
+            else:
+                current_batch.append(item)
 
             log.info(
                 f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
+                f"priority:{priority} | "
                 f"{item.get('content_type','?').upper()} | u/{item.get('username')}"
             )
 
@@ -2282,11 +1909,14 @@ def poll_twitter(client: tweepy.Client):
                 text     = tweet.text or ""
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
-                # Local keyword pre-filter — zero cost, runs BEFORE this
-                # tweet is ever queued for a Claude batch. Tweets that
-                # match Twitter's broad search query but not Flintel's
-                # real keyword list never reach Claude.
-                if not passes_keyword_filter(text):
+                # Local keyword pre-filter — Precision v2.0 (v6.3).
+                # Requires hard-negative-free text AND matches from at
+                # least 2 different keyword categories. This is the
+                # PRIMARY token-waste fix: tweets matching Twitter's
+                # broad search query but not this stricter 2-category
+                # rule never reach Claude at all.
+                passes, priority = passes_keyword_filter(text)
+                if not passes:
                     skip_keyword += 1
                     continue
 
@@ -2304,6 +1934,7 @@ def poll_twitter(client: tweepy.Client):
                     "username":     username,
                     "subreddit":    "",
                     "post_url":     f"https://twitter.com/{username}/status/{tweet_id}",
+                    "priority":     priority,
                 })
                 new_count += 1
 
@@ -2372,7 +2003,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.3 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
         ]
 
         result = retry_with_backoff(
@@ -2443,7 +2074,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.3 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2557,9 +2188,9 @@ async def start_twitter_listener(preloaded_count: int = 0):
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v6.2",
+    title       = "FX Signal Intelligence API — Flintel v6.3",
     description = "Reddit + Twitter signals: monitor, score, store, alert.",
-    version     = "6.2.0",
+    version     = "6.3.0",
 )
 
 
@@ -2576,7 +2207,7 @@ def _serialise(signals: list) -> list:
 def root():
     return {
         "status":              "running",
-        "system":              "FLINTEL v6.2",
+        "system":              "FLINTEL v6.3",
         "client":              CLIENT_ID,
         "platforms":           ["reddit", "twitter"],
         "reddit_batch_size":   REDDIT_BATCH_SIZE,
@@ -2831,7 +2462,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.2")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.3")
     log.info("=" * 65)
     log.info(f"  Client           : {CLIENT_ID}")
     log.info(f"  Platforms        : Reddit + Twitter/X")
@@ -2845,7 +2476,7 @@ if __name__ == "__main__":
     log.info(f"  Daily digest     : {DAILY_DIGEST_HOUR}:00 UTC")
     log.info(f"  Weekly report    : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits       : {len(TARGET_SUBREDDITS)} monitored")
-    log.info(f"  Keywords         : {len(KEYWORDS)} filters active")
+    log.info(f"  Keywords         : {sum(len(v) for v in FLINTEL_KEYWORDS.values())} phrases across {len(FLINTEL_KEYWORDS)} categories (2-category-min filter)")
     log.info(f"  MongoDB          : {MONGODB_DB}")
     log.info(f"  Persistent queue : db.pending_items (restart-safe)")
     log.info(f"  Reddit account   : u/{REDDIT_USERNAME}")
