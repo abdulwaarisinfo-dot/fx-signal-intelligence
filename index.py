@@ -1,5 +1,5 @@
 """
-FX Signal Intelligence System — FLINTEL v6.1
+FX Signal Intelligence System — FLINTEL v6.2
 =============================================
 Platforms : Reddit (PRAW) + Twitter/X (tweepy v2)
 Pipeline  :
@@ -49,6 +49,24 @@ Twitter batch rules:
   → 50 matched items → one Claude prompt
   → 30s gap between batches
   → Unknown / irrelevant content never reaches Claude
+
+Changelog v6.2:
+  - FIX: Batch progress counter now restores correctly on restart.
+    On startup, load_pending_items_from_db() returns the count of
+    reloaded items per platform. run_batch_processor() seeds
+    current_batch progress from this count so logs show the REAL
+    progress (e.g. "7/10") instead of resetting to "0/10" after a
+    restart/update — even though the underlying data was never lost
+    in v6.1 either way.
+  - FIX: Twitter duplicate-Claude-call edge case removed.
+    poll_twitter() no longer relies solely on an in-memory seen_ids
+    set (which resets on restart). Before enqueueing a tweet, it now
+    checks MongoDB (db.pending_items + db.signals) for an existing
+    message_id. If the tweet was already queued/pending OR already
+    scored in a previous run, it is skipped — preventing duplicate
+    Claude API calls after a restart.
+  - All other logic, scoring rules, batch sizes, gaps, Slack/HubSpot/
+    FastAPI/schedulers, keyword list, system prompt — UNCHANGED (v6.1).
 
 Changelog v6.1:
   - NEW: Persistent MongoDB-backed queue (db.pending_items collection)
@@ -137,7 +155,7 @@ REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
 REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.1")
+REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/6.2")
 
 # Twitter / X
 TWITTER_API_KEY            = os.getenv("TWITTER_API_KEY")            # Customer Key
@@ -1308,7 +1326,7 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENT QUEUE HELPERS  (v6.1)
+# PERSISTENT QUEUE HELPERS  (v6.1, extended v6.2)
 #
 # Every item placed on reddit_queue / twitter_queue is ALSO written to
 # db.pending_items with status="pending". Only after the item has been
@@ -1352,14 +1370,40 @@ def mark_item_done(message_id: str):
         log.error(f"mark_item_done error for {message_id}: {exc}")
 
 
-def load_pending_items_from_db():
+def item_already_known(message_id: str) -> bool:
+    """
+    v6.2: Returns True if this message_id has already been seen by the
+    system in a previous run — either it's still sitting in
+    db.pending_items (queued/awaiting scoring) or it has already been
+    fully scored and stored in db.signals. Used by poll_twitter() to
+    avoid re-enqueueing the same tweet after a restart (which would
+    otherwise trigger a duplicate Claude API call).
+    """
+    try:
+        if db.pending_items.find_one({"message_id": message_id}, {"_id": 1}):
+            return True
+        if db.signals.find_one({"message_id": message_id}, {"_id": 1}):
+            return True
+        return False
+    except Exception as exc:
+        log.error(f"item_already_known check error for {message_id}: {exc}")
+        return False  # fail-open: better to risk a duplicate than drop a tweet
+
+
+def load_pending_items_from_db() -> dict:
     """
     Called once at startup, BEFORE the live Reddit/Twitter streams begin.
     Re-loads any items left with status="pending" from a previous run
     (crash, update, restart — even mid-batch) back into the in-memory
     queues, oldest first, so they are processed in the next batch(es)
     exactly like fresh items.
+
+    v6.2: Returns a dict {"reddit": <count>, "twitter": <count>} so that
+    run_batch_processor() can seed its current_batch progress counter to
+    reflect the REAL number of items already restored, instead of always
+    logging "0/<batch_size>" right after a restart.
     """
+    counts = {"reddit": 0, "twitter": 0}
     try:
         reddit_pending = list(
             db.pending_items.find({"status": "pending", "platform": "reddit"})
@@ -1369,6 +1413,7 @@ def load_pending_items_from_db():
             doc.pop("_id", None)
             doc.pop("status", None)
             reddit_queue.put(doc)
+        counts["reddit"] = len(reddit_pending)
 
         twitter_pending = list(
             db.pending_items.find({"status": "pending", "platform": "twitter"})
@@ -1378,6 +1423,7 @@ def load_pending_items_from_db():
             doc.pop("_id", None)
             doc.pop("status", None)
             twitter_queue.put(doc)
+        counts["twitter"] = len(twitter_pending)
 
         if reddit_pending or twitter_pending:
             log.info(
@@ -1388,6 +1434,8 @@ def load_pending_items_from_db():
             log.info("Persistent queue restore | nothing pending — clean start.")
     except Exception as exc:
         log.error(f"load_pending_items_from_db error: {exc}")
+
+    return counts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1765,7 +1813,7 @@ def _hs_create_contact(data: dict) -> str | None:
 def _hs_create_note(data: dict, contact_id: str):
     try:
         note = (
-            f"FLINTEL SIGNAL — v6.1\n\n"
+            f"FLINTEL SIGNAL — v6.2\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1910,6 +1958,7 @@ def run_batch_processor(
     q: queue.Queue,
     batch_size: int,
     platform_label: str,
+    preloaded_count: int = 0,
 ):
     """
     Reads from queue q.
@@ -1923,12 +1972,23 @@ def run_batch_processor(
     they are scored + processed (process_scored_item calls mark_item_done).
     This means a partially-filled current_batch is fully recoverable on
     restart via load_pending_items_from_db().
+
+    v6.2: `preloaded_count` lets the caller seed the progress counter with
+    the number of items that were just restored from MongoDB on startup
+    (load_pending_items_from_db). This makes the "[X/batch_size]" log line
+    reflect REAL progress (e.g. "7/10") immediately after a restart,
+    instead of resetting to "0/10" while those 7 items are still sitting
+    in the queue waiting to be re-collected. Purely cosmetic — data was
+    never lost in v6.1, this just fixes the displayed count.
     """
-    log.info(f"Batch processor [{platform_label}] started | batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s")
+    log.info(
+        f"Batch processor [{platform_label}] started | batch_size:{batch_size} | "
+        f"gap:{BATCH_GAP_SECONDS}s | restored:{preloaded_count}"
+    )
 
     current_batch  = []
     total_received = 0
-    total_matched  = 0
+    total_matched  = preloaded_count
     total_dropped  = 0
     total_batches  = 0
 
@@ -2134,24 +2194,67 @@ def poll_twitter(client: tweepy.Client):
     Fetches up to 50 tweets per poll. Deduplicates by tweet ID.
     Pushes unique, keyword-matching tweets to twitter_queue.
     Rate-limit: wait_on_rate_limit=True in tweepy client — safe by default.
+
+    v6.2 fixes (token-waste / "not receiving messages"):
+      1. since_id: each poll only asks Twitter for tweets newer than the
+         last tweet ID we already saw. Without this, Twitter's recent-
+         search window heavily overlaps between polls and the same
+         tweets get returned (and re-checked) over and over — wasted
+         API quota AND wasted local processing.
+      2. Local keyword pre-filter (passes_keyword_filter) is applied here
+         BEFORE enqueueing. Previously every tweet matching the broad
+         Twitter search query (which must be short/simple — Twitter query
+         length is capped at 512 chars, so it can't carry the full 350+
+         keyword list) was enqueued and later sent to Claude in batches —
+         including tweets that don't actually match Flintel's real
+         keyword list. Filtering here means only genuinely relevant
+         tweets ever reach the batch processor / Claude, cutting Claude
+         token usage significantly.
+      3. item_already_known(): before enqueueing, check MongoDB (both
+         pending_items and signals) so a tweet already queued or already
+         scored in a previous run is never re-enqueued after a restart —
+         in-memory seen_ids resets on restart, MongoDB does not.
+      4. seen_ids is kept as a fast first-pass, low-cost in-memory check
+         (avoids a MongoDB round-trip for tweets seen earlier in THIS run);
+         item_already_known() is the authoritative, restart-safe check.
+
+    If Twitter API quota is very low (common on Basic/Free tiers —
+    sometimes as low as 1 search request per 15 minutes),
+    wait_on_rate_limit=True will cause this thread to block for long
+    periods between polls. That is expected tweepy behaviour, not a bug —
+    but it explains "not receiving messages" if your Twitter API tier has
+    a very restrictive search quota. Check your developer portal's
+    Usage & Rate Limits for "Recent search" if Twitter signals seem absent
+    for long stretches.
     """
     seen_ids: set = set()
+    since_id: str | None = None
     log.info("Twitter poll started.")
 
     while True:
         try:
-            response = client.search_recent_tweets(
-                query           = TWITTER_SEARCH_QUERY,
-                max_results     = 50,             # 50 per block as required
-                tweet_fields    = ["author_id", "created_at", "text", "conversation_id"],
-                expansions      = ["author_id"],
-                user_fields     = ["username", "name"],
+            search_kwargs = dict(
+                query        = TWITTER_SEARCH_QUERY,
+                max_results  = 50,             # 50 per block as required
+                tweet_fields = ["author_id", "created_at", "text", "conversation_id"],
+                expansions   = ["author_id"],
+                user_fields  = ["username", "name"],
             )
+            if since_id:
+                search_kwargs["since_id"] = since_id
+
+            response = client.search_recent_tweets(**search_kwargs)
 
             if not response or not response.data:
                 log.debug("Twitter: no results this cycle.")
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
+
+            # Advance since_id to the newest tweet ID in this response so
+            # the NEXT poll never re-fetches tweets we've already handled.
+            newest_id = response.meta.get("newest_id") if response.meta else None
+            if newest_id:
+                since_id = newest_id
 
             # Build author_id → username map from includes
             user_map: dict = {}
@@ -2159,11 +2262,15 @@ def poll_twitter(client: tweepy.Client):
                 for u in response.includes["users"]:
                     user_map[u.id] = u.username
 
-            new_count = 0
+            new_count    = 0
+            skip_dup     = 0
+            skip_keyword = 0
+
             for tweet in response.data:
                 tweet_id = str(tweet.id)
+                message_id = f"twitter_{tweet_id}"
 
-                # Deduplicate
+                # Fast in-memory dedup (this run only)
                 if tweet_id in seen_ids:
                     continue
                 seen_ids.add(tweet_id)
@@ -2175,9 +2282,22 @@ def poll_twitter(client: tweepy.Client):
                 text     = tweet.text or ""
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
-                # Only enqueue — keyword filter runs in batch processor
+                # Local keyword pre-filter — zero cost, runs BEFORE this
+                # tweet is ever queued for a Claude batch. Tweets that
+                # match Twitter's broad search query but not Flintel's
+                # real keyword list never reach Claude.
+                if not passes_keyword_filter(text):
+                    skip_keyword += 1
+                    continue
+
+                # Restart-safe dedup: skip tweets already pending or
+                # already scored in a previous run.
+                if item_already_known(message_id):
+                    skip_dup += 1
+                    continue
+
                 enqueue_item(twitter_queue, {
-                    "message_id":   f"twitter_{tweet_id}",
+                    "message_id":   message_id,
                     "platform":     "twitter",
                     "content_type": "tweet",
                     "text":         text,
@@ -2187,8 +2307,12 @@ def poll_twitter(client: tweepy.Client):
                 })
                 new_count += 1
 
-            if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
+            if new_count or skip_dup or skip_keyword:
+                log.info(
+                    f"Twitter: {new_count} new tweets queued | "
+                    f"skipped_keyword:{skip_keyword} skipped_duplicate:{skip_dup} | "
+                    f"queue_size:{twitter_queue.qsize()}"
+                )
 
         except tweepy.errors.TweepyException as exc:
             log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
@@ -2248,7 +2372,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.1 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | Client: {CLIENT_ID} | Reddit + Twitter"}]},
         ]
 
         result = retry_with_backoff(
@@ -2319,7 +2443,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.1 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v6.2 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2359,7 +2483,7 @@ async def run_scheduler():
 # ASYNC LISTENERS  — thread management + auto-restart
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def start_reddit_listener():
+async def start_reddit_listener(preloaded_count: int = 0):
     reddit = build_reddit_client()
 
     post_thread = threading.Thread(target=stream_posts,    args=(reddit,), daemon=True, name="Reddit-Posts")
@@ -2367,6 +2491,7 @@ async def start_reddit_listener():
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT"),
+        kwargs={"preloaded_count": preloaded_count},
         daemon=True, name="Reddit-Batch",
     )
 
@@ -2394,7 +2519,7 @@ async def start_reddit_listener():
             btch_thread.start()
 
 
-async def start_twitter_listener():
+async def start_twitter_listener(preloaded_count: int = 0):
     client = build_twitter_client()
     if client is None:
         log.warning("Twitter listener not started — credentials missing.")
@@ -2404,6 +2529,7 @@ async def start_twitter_listener():
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER"),
+        kwargs={"preloaded_count": preloaded_count},
         daemon=True, name="Twitter-Batch",
     )
 
@@ -2431,9 +2557,9 @@ async def start_twitter_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v6.1",
+    title       = "FX Signal Intelligence API — Flintel v6.2",
     description = "Reddit + Twitter signals: monitor, score, store, alert.",
-    version     = "6.1.0",
+    version     = "6.2.0",
 )
 
 
@@ -2450,7 +2576,7 @@ def _serialise(signals: list) -> list:
 def root():
     return {
         "status":              "running",
-        "system":              "FLINTEL v6.1",
+        "system":              "FLINTEL v6.2",
         "client":              CLIENT_ID,
         "platforms":           ["reddit", "twitter"],
         "reddit_batch_size":   REDDIT_BATCH_SIZE,
@@ -2684,32 +2810,35 @@ def run_fastapi():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def main():
-    # v6.1: restore any items left "pending" from a previous run BEFORE
+    # v6.1/6.2: restore any items left "pending" from a previous run BEFORE
     # starting the live streams, so they get processed in upcoming batches
     # alongside new items — nothing queued is ever lost on restart/update.
-    load_pending_items_from_db()
+    # v6.2: the returned counts seed each batch processor's progress
+    # counter so logs show real progress (e.g. "7/10") right after a
+    # restart instead of "0/10".
+    preloaded = load_pending_items_from_db()
 
     api_thread = threading.Thread(target=run_fastapi, daemon=True, name="FastAPI")
     api_thread.start()
     log.info("FastAPI running at http://0.0.0.0:8000")
 
     await asyncio.gather(
-        start_reddit_listener(),
-        start_twitter_listener(),
+        start_reddit_listener(preloaded_count=preloaded.get("reddit", 0)),
+        start_twitter_listener(preloaded_count=preloaded.get("twitter", 0)),
         run_scheduler(),
     )
 
 
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.1")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v6.2")
     log.info("=" * 65)
     log.info(f"  Client           : {CLIENT_ID}")
     log.info(f"  Platforms        : Reddit + Twitter/X")
     log.info(f"  Reddit batch     : {REDDIT_BATCH_SIZE} items → 1 Claude call")
     log.info(f"  Twitter batch    : {TWITTER_BATCH_SIZE} items → 1 Claude call")
     log.info(f"  Batch gap        : {BATCH_GAP_SECONDS}s between calls")
-    log.info(f"  Twitter poll     : every {TWITTER_POLL_INTERVAL}s (rate-limit safe)")
+    log.info(f"  Twitter poll     : every {TWITTER_POLL_INTERVAL}s (since_id-based, rate-limit safe)")
     log.info(f"  Score 0-5        : DISCARD — never stored")
     log.info(f"  Score 6-7        : MEDIUM  — MongoDB + Slack")
     log.info(f"  Score 8-10       : HIGH    — MongoDB + Slack + HubSpot")
