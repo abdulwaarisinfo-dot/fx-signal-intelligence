@@ -2,7 +2,7 @@
 FX Signal Intelligence System — FLINTEL v7.2
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
-Pipeline  :
+Pipeline  : 
   Reddit   → Poll /new.rss per subreddit via feedparser (no PRAW, no credentials)
   Twitter  → Fetch mentions / search / replies (rate-limit safe, 50/block)
   Telegram → Listen to group messages (human account, Telethon, read-only)
