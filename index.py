@@ -1319,7 +1319,7 @@ def _call_claude_batch(batch: list) -> list:
     prompt = _build_batch_prompt(batch)
     response = anthropic_client.messages.create(
         model      = "claude-sonnet-4-6",
-        max_tokens = 8192,          # raised from 1000 — prevents Twitter 50-item truncation crash
+        max_tokens = 90000,          # raised from 1000 — prevents Twitter 50-item truncation crash
         system     = system_prompt,
         messages   = [{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
     )
