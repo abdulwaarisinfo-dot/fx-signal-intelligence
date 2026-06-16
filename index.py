@@ -1,9 +1,9 @@
 """
 FX Signal Intelligence System — FLINTEL v7.1
 =============================================
-Platforms : Reddit (PRAW) + Twitter/X (tweepy v2) + Telegram (Telethon)
+Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
 Pipeline  :
-  Reddit   → Stream posts / comments / replies
+  Reddit   → Poll /new.rss per subreddit via feedparser (no PRAW, no credentials)
   Twitter  → Fetch mentions / search / replies (rate-limit safe, 50/block)
   Telegram → Listen to group messages (human account, Telethon, read-only)
       ↓
@@ -36,7 +36,9 @@ Score rules:
   8-10 → HIGH    — MongoDB + Slack + HubSpot
 
 Reddit batch rules:
-  → Continuous stream (posts + comments + replies)
+  → feedparser RSS polling per subreddit (no PRAW credentials required)
+  → Polls /r/<subreddit>/new.rss on a configurable interval
+  → In-memory deduplication by entry ID before keyword filter
   → Keyword filter applied to every item
   → 10 matched items OR 120s timeout → one Claude prompt
   → 30s gap between batches
@@ -79,6 +81,10 @@ Changelog v7.1 (bug fixes only — all logic 100% unchanged):
            TELEGRAM_ENABLED=true → set false to disable Telegram entirely
            Disabled platforms are skipped at startup with a clear log warning.
 
+  RSS   — Reddit now uses feedparser RSS instead of PRAW.
+           No Reddit credentials required (REDDIT_CLIENT_ID etc. removed).
+           REDDIT_POLL_INTERVAL controls how often each subreddit is polled (default 300s).
+
 Changelog v7.0:
   - Added Telegram platform (Telethon, human account, read-only listener)
   - TARGET_TELEGRAM_GROUPS list (mirrors TARGET_SUBREDDITS pattern)
@@ -103,8 +109,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-import praw
-import praw.exceptions
+import feedparser
 import anthropic
 import tweepy
 from telethon import TelegramClient, events
@@ -144,12 +149,8 @@ log = logging.getLogger("flintel")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Reddit
-REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME")
-REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD")
-REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "FlintelSignalBot/7.1")
+# Reddit — RSS polling (no credentials required)
+REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))  # seconds per subreddit cycle
 
 # Twitter / X
 TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
@@ -214,33 +215,24 @@ async def verify_api_key(
     key_header: str = Security(api_key_header),
     key_query:  str = Security(api_key_query),
 ):
-    """
-    Dependency injected into all data endpoints.
-    If API_KEY env var is not set → auth disabled (open, dev mode).
-    If set → key must match via header or query param.
-    """
     if not API_KEY:
-        return  # Auth disabled — no key configured
+        return
     if key_header == API_KEY or key_query == API_KEY:
         return
     raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Invalid or missing API key.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — PLATFORM ENABLE / DISABLE FLAGS
-# REDDIT_ENABLED=true/false   → enable or disable Reddit platform
-# TWITTER_ENABLED=true/false  → enable or disable Twitter platform
-# TELEGRAM_ENABLED=true/false → enable or disable Telegram platform
-# All default to True. Set to false in .env to disable a platform entirely.
+# PLATFORM ENABLE / DISABLE FLAGS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
-TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", True)
+TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TARGET SUBREDDITS
@@ -296,15 +288,6 @@ TARGET_TELEGRAM_GROUPS = [
 reddit_queue:   queue.Queue = queue.Queue()
 twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LIVE COUNTERS — per platform batch progress display
-# ─────────────────────────────────────────────────────────────────────────────
-
-_reddit_batch_counter   = 0
-_twitter_batch_counter  = 0
-_telegram_batch_counter = 0
-_counter_lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KEYWORD PRE-FILTER — 350+ signals
@@ -619,7 +602,7 @@ def passes_keyword_filter(text: str) -> bool:
     """
     Returns True if text contains at least one target keyword.
     Case-insensitive. Zero API cost. Runs in microseconds.
-    Applied to ALL content: posts, comments, replies, tweets, telegram messages.
+    Applied to ALL content: posts, comments, tweets, telegram messages.
     SAME keyword list for all 3 platforms — no mixing of items.
     """
     t = text.lower()
@@ -631,23 +614,9 @@ def passes_keyword_filter(text: str) -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX 1 — TWITTER SEARCH QUERY BUILT DYNAMICALLY FROM KEYWORDS
-# Previously hardcoded. Now auto-built from KEYWORDS list.
-# Updating KEYWORDS automatically updates the Twitter search query.
-# Twitter search queries are limited to 512 chars — we take the top-priority
-# short keywords that fit, excluding multi-word phrases (too long for OR query).
-# Short single-phrase keywords ≤ 30 chars are used; remainder handled by
-# the keyword pre-filter after tweets are fetched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
-    """
-    Builds Twitter search query dynamically from KEYWORDS.
-    Selects short keywords (≤ 30 chars) suitable for a Twitter OR query.
-    Twitter API v2 recent search query limit is 512 chars.
-    Remaining keyword filtering is handled by passes_keyword_filter() after fetch.
-    Returns a valid Twitter search query string.
-    """
-    # Short keywords most suitable as Twitter search terms
     short_kws = [
         kw for kw in KEYWORDS
         if len(kw) <= 30 and " " not in kw or (
@@ -655,7 +624,6 @@ def _build_twitter_search_query() -> str:
         )
     ]
 
-    # Deduplicate preserving order
     seen = set()
     unique_kws = []
     for kw in short_kws:
@@ -664,16 +632,12 @@ def _build_twitter_search_query() -> str:
             seen.add(kl)
             unique_kws.append(kw)
 
-    # Build OR clauses, staying within 512 char limit
-    # Reserve 30 chars for " -is:retweet lang:en" suffix
     max_query_len = 480
     parts = []
     current_len = 0
 
     for kw in unique_kws:
-        # Quote multi-word keywords
         term = f'"{kw}"' if " " in kw else kw
-        # +4 for " OR "
         addition = len(term) + (4 if parts else 0)
         if current_len + addition > max_query_len:
             break
@@ -681,7 +645,6 @@ def _build_twitter_search_query() -> str:
         current_len += addition
 
     if not parts:
-        # Absolute fallback — should never happen
         return (
             "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
             " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
@@ -692,12 +655,11 @@ def _build_twitter_search_query() -> str:
     return query
 
 
-# Built once at startup; reflects current KEYWORDS list automatically
 TWITTER_SEARCH_QUERY = _build_twitter_search_query()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE SYSTEM PROMPT — v7 (Telegram added, all 3 platforms)
+# CLAUDE SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
 
 CLAUDE_SYSTEM_PROMPT = """
@@ -847,7 +809,6 @@ def get_database():
         ]:
             db.signals.create_index([(field, ASCENDING)])
 
-        # FIX 5 — state collection for persisting scheduler state across restarts
         db.flintel_state.create_index(
             [("key", ASCENDING)], unique=True, name="state_key_unique"
         )
@@ -888,17 +849,9 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX 3 — OPERATOR SLACK ALERT
-# Fires to SLACK_WEBHOOK_URL with [OPERATOR ALERT] prefix.
-# Used for Claude API down, MongoDB drop, and other critical system errors.
-# Separate from signal alerts — always goes to same webhook.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
-    """
-    Sends an operator-level system alert to Slack.
-    level: ERROR (default) or CRITICAL
-    Never raises — swallows its own exceptions to avoid alert loops.
-    """
     if not SLACK_WEBHOOK_URL:
         log.warning(f"[OPERATOR ALERT] {title} — {detail} (Slack not configured)")
         return
@@ -1019,16 +972,11 @@ def _call_claude_batch(batch: list) -> list:
 
 
 def score_batch_with_claude(batch: list) -> list:
-    """
-    Scores a batch with Claude. On total failure after all retries,
-    sends an operator Slack alert (FIX 3) and returns fallback scores.
-    """
     result = retry_with_backoff(
         _call_claude_batch, batch,
         retries=3, delay=5, label="Claude-Batch",
     )
     if result is None:
-        # FIX 3 — alert operator that Claude API is down
         send_operator_alert(
             title="Claude API Unavailable",
             detail=(
@@ -1047,14 +995,6 @@ def score_batch_with_claude(batch: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
-    """
-    Saves ALL signals 1-10 to MongoDB.
-    Score 1-5 are saved but never alerted.
-    Score 6-7 → Slack only.
-    Score 8-10 → Slack + HubSpot.
-    Platform field is always set — no cross-platform mixing.
-    On MongoDB failure, sends operator Slack alert (FIX 3).
-    """
     try:
         doc = {
             "message_id":                   data["message_id"],
@@ -1109,7 +1049,6 @@ def save_signal(data: dict) -> bool:
         return False
     except Exception as exc:
         log.error(f"MongoDB save error: {exc}")
-        # FIX 3 — alert operator on MongoDB write failure
         send_operator_alert(
             title="MongoDB Write Failed",
             detail=(
@@ -1150,12 +1089,9 @@ def mark_hubspot_alerted(message_id: str, contact_id: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX 5 — WEEKLY REPORT STATE PERSISTENCE
-# Persists last_report_week in MongoDB flintel_state collection.
-# Server restarts no longer re-fire the weekly report on Monday morning.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_state(key: str):
-    """Retrieve a value from flintel_state collection. Returns None if not found."""
     try:
         doc = db.flintel_state.find_one({"key": key})
         return doc["value"] if doc else None
@@ -1165,7 +1101,6 @@ def _get_state(key: str):
 
 
 def _set_state(key: str, value):
-    """Upsert a value in flintel_state collection."""
     try:
         db.flintel_state.update_one(
             {"key": key},
@@ -1438,14 +1373,6 @@ def send_to_hubspot(data: dict) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict):
-    """
-    Receives one item + its Claude score. Runs full delivery pipeline.
-    ALL scores 1-10 are saved to MongoDB.
-    Score 1-5  → MongoDB only (silent save)
-    Score 6-7  → MongoDB + Slack
-    Score 8-10 → MongoDB + Slack + HubSpot
-    Platform is always preserved — Reddit/Twitter/Telegram never mixed.
-    """
     score    = score_result.get("intent_score", 1)
     platform = item.get("platform", "unknown")
 
@@ -1491,19 +1418,13 @@ def process_scored_item(item: dict, score_result: dict):
         return
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
-        log.info(
-            f"MEDIUM | [{platform.upper()}] Score:{score} | Slack only | "
-            f"u/{data['username']}"
-        )
+        log.info(f"MEDIUM | [{platform.upper()}] Score:{score} | Slack only | u/{data['username']}")
         ok = send_slack_alert(data)
         if ok:
             mark_slack_alerted(data["message_id"])
 
     elif score >= MIN_SCORE_HIGH:
-        log.info(
-            f"HIGH | [{platform.upper()}] Score:{score} | Slack + HubSpot | "
-            f"u/{data['username']}"
-        )
+        log.info(f"HIGH | [{platform.upper()}] Score:{score} | Slack + HubSpot | u/{data['username']}")
         ok = send_slack_alert(data)
         if ok:
             mark_slack_alerted(data["message_id"])
@@ -1605,7 +1526,6 @@ def run_batch_processor(
                 )
 
                 scores = score_batch_with_claude(batch_to_send)
-
                 score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
 
                 for i, it in enumerate(batch_to_send):
@@ -1627,111 +1547,128 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT STREAMS
-# FIX 2 — in-memory dedup set (mirrors Twitter's seen_ids pattern)
+# REDDIT — feedparser RSS poller (replaces PRAW entirely)
+# No Reddit credentials required.
+# Polls /r/<subreddit>/new.rss for each subreddit in TARGET_SUBREDDITS.
+# In-memory dedup by entry ID. Keyword filter applied before queuing.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_reddit_client() -> praw.Reddit:
-    r = praw.Reddit(
-        client_id     = REDDIT_CLIENT_ID,
-        client_secret = REDDIT_CLIENT_SECRET,
-        username      = REDDIT_USERNAME,
-        password      = REDDIT_PASSWORD,
-        user_agent    = REDDIT_USER_AGENT,
-    )
-    log.info(f"Reddit authenticated as u/{REDDIT_USERNAME}")
-    return r
-
-
-# FIX 2 — shared in-memory dedup set for all Reddit streams
-# Capped at 100,000 entries then cleared (same pattern as Twitter)
+# In-memory dedup set for Reddit RSS entries
 _reddit_seen_ids: set = set()
 _reddit_seen_lock = threading.Lock()
 
-def _reddit_is_seen(item_id: str) -> bool:
-    """Returns True if already seen. Registers if new. Thread-safe."""
+
+def _reddit_rss_is_seen(entry_id: str) -> bool:
+    """Returns True if already seen. Registers if new. Thread-safe. Caps at 200k."""
     global _reddit_seen_ids
     with _reddit_seen_lock:
-        if item_id in _reddit_seen_ids:
+        if entry_id in _reddit_seen_ids:
             return True
-        _reddit_seen_ids.add(item_id)
-        if len(_reddit_seen_ids) > 100_000:
+        _reddit_seen_ids.add(entry_id)
+        if len(_reddit_seen_ids) > 200_000:
             _reddit_seen_ids.clear()
         return False
 
 
-def stream_posts(reddit: praw.Reddit):
-    combined  = "+".join(TARGET_SUBREDDITS)
-    subreddit = reddit.subreddit(combined)
-    log.info(f"Reddit post stream started | {len(TARGET_SUBREDDITS)} subreddits")
+def _get_reddit_rss(subreddit: str) -> list:
+    """
+    Fetches /r/<subreddit>/new.rss via feedparser.
+    Returns a list of raw item dicts ready for the reddit_queue.
+    Applies in-memory deduplication. Does NOT apply keyword filter (batch processor does that).
+    """
+    url = f"https://www.reddit.com/r/{subreddit}/new.rss"
+    items = []
+    try:
+        feed = feedparser.parse(url)
+        if feed.bozo and not feed.entries:
+            log.warning(f"[REDDIT-RSS] Feed parse issue for r/{subreddit}: {feed.bozo_exception}")
+            return items
+
+        for entry in feed.entries:
+            entry_id = entry.get("id", "") or entry.get("link", "")
+            if not entry_id:
+                continue
+            if _reddit_rss_is_seen(entry_id):
+                continue
+
+            # Combine title + summary (selftext) for maximum signal coverage
+            title   = entry.get("title", "").strip()
+            summary = entry.get("summary", "").strip()
+
+            # feedparser wraps HTML in summary — strip tags for plain text
+            import html
+            import re as _re
+            summary_plain = _re.sub(r"<[^>]+>", " ", html.unescape(summary)).strip()
+
+            text = title
+            if summary_plain and summary_plain.lower() != title.lower():
+                text = f"{title}\n\n{summary_plain}"
+
+            author = entry.get("author", "unknown").lstrip("u/").strip() or "unknown"
+            link   = entry.get("link", "")
+
+            # Derive content_type: RSS entries are always posts (no comment stream via RSS /new)
+            items.append({
+                "message_id":     f"reddit_rss_{entry_id.split('/')[-1] or entry_id}",
+                "platform":       "reddit",
+                "content_type":   "post",
+                "text":           text,
+                "username":       author,
+                "subreddit":      subreddit,
+                "telegram_group": "",
+                "post_url":       link,
+            })
+
+    except Exception as exc:
+        log.error(f"[REDDIT-RSS] Error fetching r/{subreddit}: {exc}")
+
+    return items
+
+
+def poll_reddit_rss():
+    """
+    Continuously cycles through TARGET_SUBREDDITS, fetching each subreddit's
+    /new.rss feed. New (unseen) items are pushed to reddit_queue.
+    One full cycle then sleeps REDDIT_POLL_INTERVAL seconds before repeating.
+    Runs as a single thread — no per-subreddit threads needed.
+    """
+    log.info(
+        f"[REDDIT-RSS] Poller started | {len(TARGET_SUBREDDITS)} subreddits | "
+        f"poll interval: {REDDIT_POLL_INTERVAL}s per cycle"
+    )
 
     while True:
-        try:
-            for post in subreddit.stream.submissions(skip_existing=True, pause_after=0):
-                if post is None:
-                    continue
-                # FIX 2 — skip already-seen posts
-                if _reddit_is_seen(f"post_{post.id}"):
-                    continue
-                text   = post.title
-                if post.selftext and post.selftext.strip():
-                    text = f"{post.title}\n\n{post.selftext}"
-                author = str(post.author) if post.author else "[deleted]"
-                reddit_queue.put({
-                    "message_id":     f"reddit_post_{post.id}",
-                    "platform":       "reddit",
-                    "content_type":   "post",
-                    "text":           text,
-                    "username":       author,
-                    "subreddit":      str(post.subreddit),
-                    "telegram_group": "",
-                    "post_url":       f"https://reddit.com{post.permalink}",
-                })
-        except praw.exceptions.PRAWException as exc:
-            log.error(f"PRAW post stream error: {exc} — reconnecting in 30s...")
-            time.sleep(30)
-        except Exception as exc:
-            log.error(f"Post stream error: {exc} — reconnecting in 30s...")
-            time.sleep(30)
+        cycle_start  = time.time()
+        total_new    = 0
+        total_errors = 0
 
+        for subreddit in TARGET_SUBREDDITS:
+            try:
+                items = _get_reddit_rss(subreddit)
+                for item in items:
+                    reddit_queue.put(item)
+                    total_new += 1
+                if items:
+                    log.info(
+                        f"[REDDIT-RSS] r/{subreddit} → {len(items)} new items queued "
+                        f"(queue size: {reddit_queue.qsize()})"
+                    )
+                # Small courtesy delay between subreddit requests to avoid rate limits
+                time.sleep(2)
+            except Exception as exc:
+                log.error(f"[REDDIT-RSS] Unhandled error for r/{subreddit}: {exc}")
+                total_errors += 1
 
-def stream_comments(reddit: praw.Reddit):
-    combined  = "+".join(TARGET_SUBREDDITS)
-    subreddit = reddit.subreddit(combined)
-    log.info(f"Reddit comment stream started | {len(TARGET_SUBREDDITS)} subreddits")
-
-    while True:
-        try:
-            for comment in subreddit.stream.comments(skip_existing=True, pause_after=0):
-                if comment is None:
-                    continue
-                # FIX 2 — skip already-seen comments
-                if _reddit_is_seen(f"comment_{comment.id}"):
-                    continue
-                ctype  = "reply" if comment.parent_id.startswith("t1_") else "comment"
-                author = str(comment.author) if comment.author else "[deleted]"
-                reddit_queue.put({
-                    "message_id":     f"reddit_comment_{comment.id}",
-                    "platform":       "reddit",
-                    "content_type":   ctype,
-                    "text":           comment.body,
-                    "username":       author,
-                    "subreddit":      str(comment.subreddit),
-                    "telegram_group": "",
-                    "post_url":       f"https://reddit.com{comment.permalink}",
-                })
-        except praw.exceptions.PRAWException as exc:
-            log.error(f"PRAW comment stream error: {exc} — reconnecting in 30s...")
-            time.sleep(30)
-        except Exception as exc:
-            log.error(f"Comment stream error: {exc} — reconnecting in 30s...")
-            time.sleep(30)
+        cycle_elapsed = time.time() - cycle_start
+        log.info(
+            f"[REDDIT-RSS] Cycle complete | new:{total_new} errors:{total_errors} | "
+            f"elapsed:{cycle_elapsed:.1f}s | sleeping {REDDIT_POLL_INTERVAL}s..."
+        )
+        time.sleep(REDDIT_POLL_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TWITTER / X POLLER
-# FIX 1 — uses dynamically built TWITTER_SEARCH_QUERY (from KEYWORDS)
-# FIX 2 — seen_ids already existed for Twitter; unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -1753,12 +1690,6 @@ def build_twitter_client() -> tweepy.Client | None:
 
 
 def poll_twitter(client: tweepy.Client):
-    """
-    Polls Twitter search every TWITTER_POLL_INTERVAL seconds.
-    Uses TWITTER_SEARCH_QUERY built dynamically from KEYWORDS (FIX 1).
-    Deduplicates by tweet ID (seen_ids set — unchanged from v7.0).
-    Pushes unique tweets to twitter_queue ONLY.
-    """
     seen_ids: set = set()
     log.info(f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)}")
 
@@ -1823,15 +1754,13 @@ def poll_twitter(client: tweepy.Client):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM LISTENER (Telethon — human account, read-only)
-# FIX 2 — in-memory dedup set by (chat_id, msg_id)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX 2 — Telegram in-memory dedup set
 _telegram_seen_ids: set = set()
 _telegram_seen_lock = threading.Lock()
 
+
 def _telegram_is_seen(chat_id: int, msg_id: int) -> bool:
-    """Returns True if already seen. Registers if new. Thread-safe."""
     global _telegram_seen_ids
     key = f"{chat_id}_{msg_id}"
     with _telegram_seen_lock:
@@ -1913,7 +1842,6 @@ async def _run_telegram_listener(client: TelegramClient):
             if not text or len(text) < 5:
                 return
 
-            # FIX 2 — skip already-seen Telegram messages
             if _telegram_is_seen(chat_id, msg_id):
                 return
 
@@ -1970,7 +1898,6 @@ def run_telegram_listener_thread():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHEDULERS — Daily Digest + Weekly Report
-# FIX 5 — last_report_week persisted in MongoDB; survives restarts
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_daily_digest():
@@ -1980,9 +1907,9 @@ def send_daily_digest():
         since = datetime.now(timezone.utc) - timedelta(hours=24)
         signals = list(
             db.signals.find({
-                "client_id":    CLIENT_ID,
-                "intent_score": {"$gte": 6, "$lte": 7},
-                "created_at":   {"$gte": since},
+                "client_id":       CLIENT_ID,
+                "intent_score":    {"$gte": 6, "$lte": 7},
+                "created_at":      {"$gte": since},
                 "digest_included": False,
             }).sort("intent_score", -1)
         )
@@ -2114,18 +2041,12 @@ def send_weekly_report():
 
 
 async def run_scheduler():
-    """
-    FIX 5 — last_report_week loaded from MongoDB on startup.
-    Survives server restarts — no double-fire on Monday morning.
-    last_digest_date still in-memory (digest is idempotent via digest_included flag).
-    """
     log.info(
         f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | "
         f"report Mon {WEEKLY_REPORT_HOUR}:00 UTC"
     )
     last_digest_date = None
 
-    # FIX 5 — load persisted weekly report state from MongoDB
     persisted_week = _get_state("last_report_week")
     last_report_week: int | None = persisted_week
 
@@ -2147,13 +2068,11 @@ async def run_scheduler():
             log.info("Scheduler: triggering weekly report...")
             await asyncio.to_thread(send_weekly_report)
             last_report_week = current_week
-            # FIX 5 — persist to MongoDB so restart doesn't re-fire
             _set_state("last_report_week", current_week)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASYNC LISTENERS — thread management + auto-restart
-# NEW — REDDIT_ENABLED / TWITTER_ENABLED / TELEGRAM_ENABLED flags
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -2161,13 +2080,8 @@ async def start_reddit_listener():
         log.warning("Reddit platform DISABLED (REDDIT_ENABLED=false) — skipping.")
         return
 
-    reddit = build_reddit_client()
-
-    post_thread = threading.Thread(
-        target=stream_posts, args=(reddit,), daemon=True, name="Reddit-Posts"
-    )
-    cmnt_thread = threading.Thread(
-        target=stream_comments, args=(reddit,), daemon=True, name="Reddit-Comments"
+    rss_thread = threading.Thread(
+        target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
     )
     btch_thread = threading.Thread(
         target=run_batch_processor,
@@ -2175,25 +2089,18 @@ async def start_reddit_listener():
         daemon=True, name="Reddit-Batch",
     )
 
-    post_thread.start()
-    cmnt_thread.start()
+    rss_thread.start()
     btch_thread.start()
-    log.info("Reddit threads running: Posts ✅ | Comments ✅ | Batch ✅")
+    log.info("Reddit threads running: RSS-Poller ✅ | Batch ✅")
 
     while True:
         await asyncio.sleep(60)
-        if not post_thread.is_alive():
-            log.error("Reddit post thread died — restarting...")
-            post_thread = threading.Thread(
-                target=stream_posts, args=(reddit,), daemon=True, name="Reddit-Posts"
+        if not rss_thread.is_alive():
+            log.error("Reddit RSS thread died — restarting...")
+            rss_thread = threading.Thread(
+                target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
             )
-            post_thread.start()
-        if not cmnt_thread.is_alive():
-            log.error("Reddit comment thread died — restarting...")
-            cmnt_thread = threading.Thread(
-                target=stream_comments, args=(reddit,), daemon=True, name="Reddit-Comments"
-            )
-            cmnt_thread.start()
+            rss_thread.start()
         if not btch_thread.is_alive():
             log.error("Reddit batch thread died — restarting...")
             btch_thread = threading.Thread(
@@ -2290,12 +2197,11 @@ async def start_telegram_listener():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI — REST API
-# FIX 4 — all data endpoints protected with API key auth
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title       = "FX Signal Intelligence API — Flintel v7.1",
-    description = "Reddit + Twitter + Telegram signals: monitor, score, store, alert.",
+    description = "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert.",
     version     = "7.1.0",
 )
 
@@ -2309,8 +2215,6 @@ def _serialise(signals: list) -> list:
     return signals
 
 
-# ── Public endpoints (no auth) ───────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {
@@ -2321,6 +2225,8 @@ def root():
         "reddit_enabled":       REDDIT_ENABLED,
         "twitter_enabled":      TWITTER_ENABLED,
         "telegram_enabled":     TELEGRAM_ENABLED,
+        "reddit_mode":          "feedparser RSS (no credentials required)",
+        "reddit_poll_interval": REDDIT_POLL_INTERVAL,
         "reddit_batch_size":    REDDIT_BATCH_SIZE,
         "twitter_batch_size":   TWITTER_BATCH_SIZE,
         "telegram_batch_size":  TELEGRAM_BATCH_SIZE,
@@ -2344,7 +2250,7 @@ def health():
     return {
         "status":               "ok",
         "mongodb":              mongo,
-        "reddit":               ("streaming" if REDDIT_ENABLED else "disabled"),
+        "reddit":               ("polling-rss" if REDDIT_ENABLED else "disabled"),
         "twitter":              ("polling" if TWITTER_ENABLED and TWITTER_BEARER_TOKEN else "disabled"),
         "telegram":             ("listening" if TELEGRAM_ENABLED and TELEGRAM_API_ID else "disabled"),
         "reddit_queue_size":    reddit_queue.qsize(),
@@ -2354,8 +2260,6 @@ def health():
         "timestamp":            datetime.now(timezone.utc).isoformat(),
     }
 
-
-# ── Protected endpoints (FIX 4 — require API key if API_KEY is set) ──────────
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
 def get_signals(
@@ -2463,7 +2367,6 @@ def get_business(limit: int = 20):
 
 @app.get("/signals/outreach", dependencies=[Depends(verify_api_key)])
 def get_outreach(limit: int = 20):
-    """Signals with outreach scripts ready for the sales team."""
     try:
         signals = list(
             db.signals.find(
@@ -2510,7 +2413,6 @@ def get_reddit_signals(limit: int = 50, min_score: int = None):
 
 @app.get("/signals/telegram", dependencies=[Depends(verify_api_key)])
 def get_telegram_signals(limit: int = 50, min_score: int = None, group: str = None):
-    """Telegram-only signals. Optional filter by group name."""
     try:
         q: dict = {"client_id": CLIENT_ID, "platform": "telegram"}
         if min_score is not None:
@@ -2552,7 +2454,6 @@ def get_watchlist(limit: int = 50):
 
 @app.get("/signals/silent", dependencies=[Depends(verify_api_key)])
 def get_silent_signals(limit: int = 50):
-    """Score 1-5 signals — saved to MongoDB but never alerted."""
     try:
         signals = list(
             db.signals.find(
@@ -2590,8 +2491,10 @@ if __name__ == "__main__":
     log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.1")
     log.info("=" * 70)
     log.info(f"  Client            : {CLIENT_ID}")
-    log.info(f"  Platforms         : Reddit + Twitter/X + Telegram")
+    log.info(f"  Platforms         : Reddit (RSS) + Twitter/X + Telegram")
     log.info(f"  Reddit            : {'✅ ENABLED' if REDDIT_ENABLED else '❌ DISABLED (REDDIT_ENABLED=false)'}")
+    log.info(f"  Reddit mode       : feedparser RSS — no credentials required")
+    log.info(f"  Reddit poll gap   : {REDDIT_POLL_INTERVAL}s between full subreddit cycles")
     log.info(f"  Twitter           : {'✅ ENABLED' if TWITTER_ENABLED else '❌ DISABLED (TWITTER_ENABLED=false)'}")
     log.info(f"  Telegram          : {'✅ ENABLED' if TELEGRAM_ENABLED else '❌ DISABLED (TELEGRAM_ENABLED=false)'}")
     log.info(f"  Reddit batch      : {REDDIT_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
@@ -2607,7 +2510,7 @@ if __name__ == "__main__":
     log.info(f"  Score 8-10        : HIGH   — MongoDB + Slack + HubSpot")
     log.info(f"  MongoDB           : ALL scores 1-10 saved, nothing discarded")
     log.info(f"  Platform isolation: Reddit / Twitter / Telegram NEVER mixed")
-    log.info(f"  Deduplication     : In-memory sets for all 3 platforms (Reddit + Telegram added)")
+    log.info(f"  Deduplication     : In-memory sets for all 3 platforms")
     log.info(f"  Operator alerts   : Claude API down + MongoDB failure → Slack")
     log.info(f"  API auth          : {'✅ ENABLED (API_KEY set)' if API_KEY else '⚠️  DISABLED (API_KEY not set — open access)'}")
     log.info(f"  Weekly state      : Persisted in MongoDB (survives restarts)")
@@ -2617,7 +2520,6 @@ if __name__ == "__main__":
     log.info(f"  Telegram groups   : {len(TARGET_TELEGRAM_GROUPS)} configured")
     log.info(f"  Keywords          : {len(KEYWORDS)} filters (same for all 3 platforms)")
     log.info(f"  MongoDB DB        : {MONGODB_DB}")
-    log.info(f"  Reddit account    : u/{REDDIT_USERNAME}")
     log.info(f"  HubSpot           : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack             : {'enabled' if SLACK_WEBHOOK_URL else 'DISABLED — set SLACK_WEBHOOK_URL'}")
     log.info("=" * 70)
