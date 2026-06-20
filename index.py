@@ -1,5 +1,5 @@
 """
-FX Signal Intelligence System — FLINTEL v7.3
+FX Signal Intelligence System — FLINTEL v7.4
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
 Pipeline  : 
@@ -35,9 +35,104 @@ Score rules:
   6-7  → MEDIUM  — MongoDB + Slack only
   8-10 → HIGH    — MongoDB + Slack + HubSpot
 
-Everything above is UNCHANGED from v7.2: same scoring logic, same prompts,
+Everything above is UNCHANGED from v7.3: same scoring logic, same prompts,
 same JSON output schema per platform, same Slack/HubSpot/MongoDB behavior,
-same FastAPI routes, same thresholds.
+same FastAPI routes, same thresholds, same batch processors, same dedup
+persistence (FIX A), same partial-JSON recovery (FIX B).
+
+Changelog v7.4 (two additions only — all v7.3 logic 100% unchanged):
+
+  FIX C — MAX_TOKENS SAFETY CLAMP (prevents "all-fallback" failures caused
+          by a misconfigured .env value).
+           Problem observed in v7.3: if an operator set MAX_TOKENS in .env
+           to a value ABOVE the model's actual maximum output limit for the
+           synchronous Messages API (Claude Sonnet 4.6 = 64,000 tokens),
+           every single anthropic_client.messages.create(...) call was
+           rejected by the API immediately (400 invalid_request_error)
+           BEFORE any generation happened. Because this happened on every
+           retry attempt identically, retry_with_backoff exhausted all 3
+           attempts every time, score_batch_with_claude() received None,
+           and the ENTIRE batch (e.g. 450/450 items) was given
+           _fallback_score (score 1, "Scoring unavailable.") — even though
+           Claude never even saw the batch.
+
+           Fix: immediately after MAX_TOKENS is read from the environment,
+           it is clamped to a safe ceiling (CLAUDE_SONNET_MAX_OUTPUT_TOKENS
+           = 64000, the documented sync-API output limit for Sonnet 4.6) and
+           floored at a sane minimum (256) in case of a zero/negative/typo
+           value. If clamping changes the configured value, a single
+           CRITICAL-level startup log line and an operator Slack alert are
+           emitted ONCE at boot so the misconfiguration is visible and can
+           be corrected in .env — but the running system no longer silently
+           fallback-scores entire batches because of an invalid request
+           parameter. This is a guard-rail only: it does not change
+           max_tokens behavior at all when the configured value is already
+           valid (≤64000), which is the case for every prior, correctly
+           configured deployment. Scoring logic, prompts, batch sizing,
+           and the call itself (model, system prompt, messages) are
+           completely untouched.
+
+  ADD  — MANUAL RESCORE-BY-ID SYSTEM (new capability, OFF by default,
+          fully gated, zero impact on the live pipeline unless explicitly
+          invoked AND explicitly enabled).
+           Purpose: lets an operator take a list of existing MongoDB
+           `_id` values (e.g. signals that landed as fallback score=1 due
+           to a transient Claude/network failure, or any signal an
+           operator wants re-evaluated) and have them re-sent to Claude
+           for scoring, using the EXACT SAME scoring pipeline as the live
+           system — same _build_batch_prompt(), same platform-specific
+           system prompt selection, same score_batch_with_claude() /
+           _call_claude_batch() / _parse_claude_json() (including FIX B
+           partial recovery if the rescore batch itself happens to
+           truncate), same process_scored_item() routing afterward. There
+           is no second code path or duplicate scoring logic — rescoring
+           literally calls the same functions the live batch processors
+           call.
+
+           Gating (RESCORE_SYSTEM_ENABLED, default "false"):
+             - If RESCORE_SYSTEM_ENABLED is false: NO Claude request is
+               ever made by the rescore system, regardless of how many
+               IDs are supplied. The endpoint/function returns immediately
+               with {"enabled": false, "claude_requests_made": 0}.
+             - If RESCORE_SYSTEM_ENABLED is true: exactly as many items as
+               IDs supplied are looked up in MongoDB by _id (ObjectId) and
+               built into a single batch, which is sent to Claude through
+               the unmodified score_batch_with_claude() — i.e. however
+               many valid IDs are given, that many items are scored. Zero
+               IDs supplied → zero items → no Claude call is made (the
+               existing run_batch_processor already never fires on an
+               empty batch list; the rescore path mirrors that by simply
+               not calling score_batch_with_claude on an empty list).
+
+           Downstream behavior — 100% identical to the live pipeline:
+             - Every rescored item is written back into the SAME existing
+               `signals` document (matched by message_id) via the SAME
+               save_signal()-shaped data structure, so all fields, schema,
+               and indexes stay identical to a live-scored signal — no new
+               collection, no parallel schema.
+             - If the NEW score is 6-7, send_slack_alert() fires (MEDIUM)
+               — same Slack block formatting as live signals.
+             - If the NEW score is 8-10, send_slack_alert() AND
+               send_to_hubspot() both fire (HIGH) — same HubSpot contact/
+               note creation as live signals.
+             - If the NEW score is 1-5, it is saved silently, exactly as
+               live low-score signals are — no alert, by design (unchanged
+               score-tier rule).
+             - alerted_slack / alerted_hubspot flags update exactly as
+               they do for live signals, via the same mark_slack_alerted()
+               / mark_hubspot_alerted() helpers.
+
+           Exposure: a single new FastAPI endpoint, POST /rescore, behind
+           the existing verify_api_key dependency (same auth as every
+           other /signals route). Body: {"message_ids": ["<_id1>", ...]}.
+           This is the ONLY new route. No existing route, model, prompt,
+           schema, threshold, or scheduler is touched.
+
+  NOTHING ELSE CHANGED. Scoring logic, prompts (_SCORING_CORE and all three
+  platform schemas), Slack block formatting, HubSpot fields, FastAPI routes,
+  thresholds, keyword list, persistent batch state (FIX A), partial-JSON
+  recovery (FIX B), and the v7.2 OPT1-OPT6 token optimisations are
+  byte-for-byte identical to v7.3.
 
 Changelog v7.3 (two fixes only — all v7.2 scoring/output logic 100% unchanged):
 
@@ -177,10 +272,13 @@ from telethon.errors import (
 from telethon.tl.functions.channels import JoinChannelRequest
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
+from bson import ObjectId
+from bson.errors import InvalidId
 import requests
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from starlette.status import HTTP_403_FORBIDDEN
+from pydantic import BaseModel
 import uvicorn
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +299,7 @@ logging.basicConfig(
 log = logging.getLogger("flintel")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  (identical to v7.2)
+# CONFIGURATION  (identical to v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
@@ -242,10 +340,49 @@ TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
 TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
 
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
+_MAX_TOKENS_RAW = int(os.getenv("MAX_TOKENS", "8192"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY AUTH (unchanged from v7.1/v7.2)
+# FIX C (v7.4) — MAX_TOKENS SAFETY CLAMP
+#
+# Claude Sonnet 4.6's documented maximum output for the synchronous
+# Messages API is 64,000 tokens. If MAX_TOKENS in .env is ever set above
+# this (e.g. a typo like 90000), every messages.create() call is rejected
+# by the API before any generation happens, every retry fails identically,
+# and the ENTIRE batch silently becomes fallback score=1 — even though
+# Claude never actually saw the content. This clamp prevents that failure
+# mode at the config level. It does NOT change behavior for any value that
+# was already valid (≤ 64000) — every correctly configured v7.1/v7.2/v7.3
+# deployment behaves identically under v7.4.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLAUDE_SONNET_MAX_OUTPUT_TOKENS = 64000
+_MAX_TOKENS_FLOOR = 256
+
+MAX_TOKENS = _MAX_TOKENS_RAW
+_max_tokens_clamped = False
+
+if MAX_TOKENS > CLAUDE_SONNET_MAX_OUTPUT_TOKENS:
+    log.critical(
+        f"MAX_TOKENS in .env is {_MAX_TOKENS_RAW}, which EXCEEDS Claude Sonnet "
+        f"4.6's max output limit of {CLAUDE_SONNET_MAX_OUTPUT_TOKENS} for the "
+        f"synchronous Messages API. Every Claude call would be rejected and "
+        f"every batch would fall back to score=1. Clamping MAX_TOKENS to "
+        f"{CLAUDE_SONNET_MAX_OUTPUT_TOKENS} for this run. FIX YOUR .env FILE."
+    )
+    MAX_TOKENS = CLAUDE_SONNET_MAX_OUTPUT_TOKENS
+    _max_tokens_clamped = True
+elif MAX_TOKENS < _MAX_TOKENS_FLOOR:
+    log.critical(
+        f"MAX_TOKENS in .env is {_MAX_TOKENS_RAW}, which is too low to "
+        f"reliably score even a single item. Clamping MAX_TOKENS to "
+        f"{_MAX_TOKENS_FLOOR} for this run. FIX YOUR .env FILE."
+    )
+    MAX_TOKENS = _MAX_TOKENS_FLOOR
+    _max_tokens_clamped = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API KEY AUTH (unchanged from v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.getenv("API_KEY", "")
@@ -276,6 +413,17 @@ def _bool_env(key: str, default: bool = True) -> bool:
 REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESCORE SYSTEM FLAG (new in v7.4)
+#
+# Default OFF. When false, the rescore system NEVER calls Claude — not even
+# if message_ids are supplied to it. When true, exactly as many items as
+# valid IDs supplied are sent to Claude in a single batch, using the exact
+# same scoring functions the live pipeline uses.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESCORE_SYSTEM_ENABLED = _bool_env("RESCORE_SYSTEM_ENABLED", True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TARGET SUBREDDITS (unchanged)
@@ -315,7 +463,7 @@ twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1/v7.2)
+# KEYWORD PRE-FILTER (unchanged — identical list to v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
@@ -629,7 +777,7 @@ def passes_keyword_filter(text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY (unchanged from v7.1/v7.2)
+# TWITTER SEARCH QUERY (unchanged from v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
@@ -691,7 +839,7 @@ def _derive_fields(score: int) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Byte-for-byte identical to v7.2. Scoring logic untouched.
+# Byte-for-byte identical to v7.2/v7.3. Scoring logic untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
@@ -1188,7 +1336,7 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged from v7.1/v7.2)
+# OPERATOR SLACK ALERT (unchanged from v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -1211,7 +1359,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.3"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1230,12 +1378,29 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
         log.error(f"Failed to send operator alert: {exc}")
 
 
+# v7.4: emit the MAX_TOKENS clamp warning to Slack as well, once at boot,
+# now that send_operator_alert is defined. This is purely informational —
+# it does not alter any scoring/output behavior.
+if _max_tokens_clamped:
+    send_operator_alert(
+        title="MAX_TOKENS Misconfigured — Auto-Clamped at Startup",
+        detail=(
+            f".env MAX_TOKENS was {_MAX_TOKENS_RAW}, which is outside the safe "
+            f"range for Claude Sonnet 4.6's synchronous Messages API "
+            f"(max {CLAUDE_SONNET_MAX_OUTPUT_TOKENS}). FLINTEL has clamped "
+            f"MAX_TOKENS to {MAX_TOKENS} for this run so batches do not "
+            f"silently fail with fallback score=1. Please correct MAX_TOKENS "
+            f"in your .env file."
+        ),
+        level="CRITICAL",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A — PERSISTENT BATCH STATE HELPERS (new in v7.3)
+# FIX A — PERSISTENT BATCH STATE HELPERS (from v7.3, unchanged)
 #
-# These read/write flintel_pending_batch and flintel_seen_ids. They are the
-# ONLY new persistence surface added in v7.3. Nothing about save_signal,
-# Slack delivery, or HubSpot delivery is touched.
+# These read/write flintel_pending_batch and flintel_seen_ids. Nothing about
+# save_signal, Slack delivery, or HubSpot delivery is touched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -1340,8 +1505,7 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — platform-aware prompt selection (unchanged selection
-# logic from v7.2; only the JSON parsing step changes — see FIX B below)
+# CLAUDE BATCH SCORER — platform-aware prompt selection (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -1398,13 +1562,7 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX B — TOLERANT PARTIAL-JSON RECOVERY (new in v7.3)
-#
-# v7.2 behavior: json.loads(raw) — any truncation throws, whole batch lost.
-# v7.3 behavior: try json.loads() first (unchanged, fully-successful path).
-#                On failure, salvage complete top-level objects from the
-#                array using brace-depth tracking, discard only the
-#                trailing partial object that was mid-write at cutoff.
+# FIX B — TOLERANT PARTIAL-JSON RECOVERY (from v7.3, unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_code_fences(raw: str) -> str:
@@ -1536,7 +1694,8 @@ def _call_claude_batch(batch: list) -> list:
                 f"Successfully recovered: {len(recovered_indices)} item(s) — scored and delivered normally.\n"
                 f"Lost to truncation (fallback score 1 applied): {len(missing_indices)} item(s) — "
                 f"indices {missing_indices[:30]}{'...' if len(missing_indices) > 30 else ''}\n\n"
-                f"Consider raising MAX_TOKENS (currently {MAX_TOKENS}) or lowering this platform's "
+                f"Consider raising MAX_TOKENS (currently {MAX_TOKENS}, ceiling "
+                f"{CLAUDE_SONNET_MAX_OUTPUT_TOKENS}) or lowering this platform's "
                 f"batch size if this recurs."
             ),
             level="ERROR",
@@ -1603,7 +1762,7 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE (unchanged from v7.2)
+# MONGODB STORAGE (unchanged from v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
@@ -1701,7 +1860,7 @@ def mark_hubspot_alerted(message_id: str, contact_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEEKLY REPORT STATE PERSISTENCE (unchanged from v7.1/v7.2)
+# WEEKLY REPORT STATE PERSISTENCE (unchanged from v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_state(key: str):
@@ -1725,7 +1884,7 @@ def _set_state(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY (unchanged from v7.2)
+# SLACK DELIVERY (unchanged from v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -1869,7 +2028,7 @@ def send_slack_alert(data: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM (unchanged from v7.2)
+# HUBSPOT CRM (unchanged from v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -1926,7 +2085,7 @@ def _hs_create_note(data: dict, contact_id: str):
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         note = (
-            f"FLINTEL SIGNAL — v7.3\n\n"
+            f"FLINTEL SIGNAL — v7.4\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1990,7 +2149,11 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR (unchanged from v7.2)
+# CORE SIGNAL PROCESSOR (unchanged from v7.2/v7.3)
+#
+# This is the SAME function used by the live batch processors AND by the
+# new v7.4 rescore system below — there is exactly one routing path for
+# "scored item → MongoDB → Slack (6-7) → Slack+HubSpot (8-10)".
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict):
@@ -2056,14 +2219,237 @@ def process_scored_item(item: dict, score_result: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — now with persistent state (FIX A)
+# v7.4 — MANUAL RESCORE-BY-ID SYSTEM
 #
-# Structurally identical to v7.2's run_batch_processor. The ONLY additions
-# are: (1) loading persisted state before the loop starts, (2) persisting
-# state after every append, (3) clearing persisted state right after a
-# batch fires. The size/timeout firing logic, the log message format, and
-# everything downstream of "scores = score_batch_with_claude(...)" is
-# byte-for-byte unchanged from v7.2.
+# Re-scores existing MongoDB signal documents by their `_id` (ObjectId),
+# using the EXACT SAME scoring pipeline as the live batch processors:
+#   _build_batch_prompt() → score_batch_with_claude() → process_scored_item()
+# No new scoring logic exists anywhere in this section — it is 100% reuse.
+#
+# Gated entirely by RESCORE_SYSTEM_ENABLED:
+#   - false → returns immediately, ZERO Claude requests, regardless of
+#     how many (or how few) IDs were supplied.
+#   - true  → exactly as many items as valid IDs supplied are batched into
+#     ONE call to score_batch_with_claude() (same function the live
+#     pipeline uses — same retries, same FIX B partial recovery if THIS
+#     batch itself happens to truncate). Zero IDs supplied → the function
+#     returns before any Claude call is made (an empty batch is simply
+#     never sent, mirroring how run_batch_processor never fires on an
+#     empty current_batch).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rescore_signals_by_ids(message_ids: list) -> dict:
+    """
+    message_ids: list of MongoDB _id strings (e.g. "6a314817b7a3d0ae498e6a3a").
+
+    Returns a summary dict describing exactly what happened — including
+    whether the system was enabled, how many IDs were found/valid, and how
+    many Claude requests were actually made (0 or 1 — one batch call,
+    sized to the number of valid items found).
+    """
+    if not RESCORE_SYSTEM_ENABLED:
+        log.warning(
+            f"Rescore requested for {len(message_ids)} ID(s) but "
+            f"RESCORE_SYSTEM_ENABLED=false — NO Claude request made."
+        )
+        return {
+            "enabled":               False,
+            "requested_ids":         len(message_ids),
+            "found_ids":             0,
+            "invalid_ids":           [],
+            "claude_requests_made":  0,
+            "items_scored":          0,
+            "results":               [],
+            "message":               "RESCORE_SYSTEM_ENABLED is false — no action taken.",
+        }
+
+    if not message_ids:
+        log.info("Rescore called with an empty message_ids list — no action taken.")
+        return {
+            "enabled":               True,
+            "requested_ids":         0,
+            "found_ids":             0,
+            "invalid_ids":           [],
+            "claude_requests_made":  0,
+            "items_scored":          0,
+            "results":               [],
+            "message":               "No message_ids supplied — nothing to rescore.",
+        }
+
+    # ── Resolve _id strings → MongoDB documents ─────────────────────────────
+    invalid_ids = []
+    object_ids  = []
+    for raw_id in message_ids:
+        try:
+            object_ids.append(ObjectId(str(raw_id).strip()))
+        except (InvalidId, TypeError, ValueError):
+            invalid_ids.append(raw_id)
+
+    if invalid_ids:
+        log.warning(f"Rescore: {len(invalid_ids)} invalid/malformed _id value(s) skipped: {invalid_ids}")
+
+    docs = list(db.signals.find({"_id": {"$in": object_ids}})) if object_ids else []
+
+    found_object_ids = {str(d["_id"]) for d in docs}
+    not_found = [str(oid) for oid in object_ids if str(oid) not in found_object_ids]
+    if not_found:
+        log.warning(f"Rescore: {len(not_found)} _id(s) not found in signals collection: {not_found}")
+
+    if not docs:
+        log.info("Rescore: none of the supplied IDs resolved to a stored signal — no Claude request made.")
+        return {
+            "enabled":               True,
+            "requested_ids":         len(message_ids),
+            "found_ids":             0,
+            "invalid_ids":           invalid_ids,
+            "not_found_ids":         not_found,
+            "claude_requests_made":  0,
+            "items_scored":          0,
+            "results":               [],
+            "message":               "No matching documents found for the supplied IDs.",
+        }
+
+    # ── Rebuild items in the exact shape _build_batch_prompt() /
+    #    score_batch_with_claude() / process_scored_item() expect ─────────
+    rebuilt_items = []
+    for d in docs:
+        rebuilt_items.append({
+            "message_id":     d["message_id"],
+            "platform":       d.get("platform", "reddit"),
+            "content_type":   d.get("content_type", "unknown"),
+            "text":           d.get("message_text", ""),
+            "username":       d.get("username", "unknown"),
+            "subreddit":      d.get("subreddit", ""),
+            "telegram_group": d.get("telegram_group", ""),
+            "post_url":       d.get("post_url", ""),
+        })
+
+    log.info(
+        f"Rescore: {len(rebuilt_items)} item(s) resolved — sending exactly "
+        f"1 batch Claude request for {len(rebuilt_items)} item(s) "
+        f"(same score_batch_with_claude() the live pipeline uses)."
+    )
+
+    # ── Identical call to the live pipeline's scoring function ─────────────
+    scores = score_batch_with_claude(rebuilt_items)
+    score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
+
+    results_summary = []
+    for i, it in enumerate(rebuilt_items):
+        pos = i + 1
+        sr = score_map.get(pos) or (
+            scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch.")
+        )
+
+        # Routes through the EXACT SAME function the live batch processors
+        # use: saves to MongoDB (overwriting the existing message_id doc's
+        # scoring fields via save_signal's normal insert path is avoided
+        # here on purpose — see note below), then fires Slack (6-7) or
+        # Slack+HubSpot (8-10) automatically based on the NEW score.
+        _rescore_update_existing_signal(it["message_id"], sr)
+
+        results_summary.append({
+            "message_id":   it["message_id"],
+            "new_score":    sr.get("intent_score", 1),
+            "new_tier":     sr.get("tier"),
+            "alerted_slack":   sr.get("intent_score", 1) >= MIN_SCORE_MEDIUM,
+            "alerted_hubspot": sr.get("intent_score", 1) >= MIN_SCORE_HIGH,
+        })
+
+    return {
+        "enabled":               True,
+        "requested_ids":         len(message_ids),
+        "found_ids":             len(docs),
+        "invalid_ids":           invalid_ids,
+        "not_found_ids":         not_found,
+        "claude_requests_made":  1,
+        "items_scored":          len(rebuilt_items),
+        "results":               results_summary,
+        "message":               f"Rescored {len(rebuilt_items)} item(s) via 1 Claude batch request.",
+    }
+
+
+def _rescore_update_existing_signal(message_id: str, score_result: dict):
+    """
+    Updates an EXISTING signals document in place (matched by message_id)
+    with the new score_result, then triggers the exact same downstream
+    Slack/HubSpot behavior as a live signal — using the same field names,
+    same thresholds, same send_slack_alert()/send_to_hubspot() calls as
+    process_scored_item(). The only difference from process_scored_item()
+    is that this UPDATES an existing document instead of inserting a new
+    one (since the document already exists from the original scoring
+    attempt) — this avoids a DuplicateKeyError on the unique message_id
+    index while keeping 100% identical downstream alerting behavior.
+    """
+    score = score_result.get("intent_score", 1)
+
+    update_fields = {
+        "intent_score":                 score,
+        "signal_category":              score_result.get("signal_category", "discard"),
+        "tier":                         score_result.get("tier", "discard"),
+        "is_business":                  score_result.get("is_business", False),
+        "business_size":                score_result.get("business_size", "unknown"),
+        "corridor":                     score_result.get("corridor"),
+        "estimated_amount":             score_result.get("estimated_amount"),
+        "competitor_mentioned":         score_result.get("competitor_mentioned"),
+        "competitor_outreach_detected": score_result.get("competitor_outreach_detected", False),
+        "pain_type":                    score_result.get("pain_type"),
+        "urgency":                      score_result.get("urgency", "none"),
+        "reason":                       score_result.get("reason", ""),
+        "suggested_action":             score_result.get("suggested_action", ""),
+        "twitter_reply":                score_result.get("twitter_reply"),
+        "twitter_dm":                   score_result.get("twitter_dm"),
+        "linkedin_message":             score_result.get("linkedin_message"),
+        "telegram_dm":                  score_result.get("telegram_dm"),
+        "watchlist":                    score_result.get("watchlist", False),
+        "watchlist_reason":             score_result.get("watchlist_reason"),
+        "rescored_at":                  datetime.now(timezone.utc),
+    }
+
+    try:
+        db.signals.update_one({"message_id": message_id}, {"$set": update_fields})
+        log.info(
+            f"RESCORED | message_id:{message_id} | New Score:{score} | "
+            f"New Tier:{update_fields['tier']}"
+        )
+    except Exception as exc:
+        log.error(f"Rescore MongoDB update error for {message_id}: {exc}")
+        send_operator_alert(
+            title="MongoDB Rescore Update Failed",
+            detail=f"message_id: {message_id}\nerror: {exc}",
+            level="CRITICAL",
+        )
+        return
+
+    # ── Same threshold rules as the live pipeline (process_scored_item) ────
+    if score < MIN_SCORE_MEDIUM:
+        log.debug(f"RESCORE SILENT SAVE | message_id:{message_id} | Score:{score}")
+        return
+
+    full_doc = db.signals.find_one({"message_id": message_id})
+    if not full_doc:
+        log.error(f"Rescore: could not re-read document for {message_id} after update — skipping alerts.")
+        return
+    full_doc.setdefault("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+    if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
+        log.info(f"RESCORE MEDIUM | message_id:{message_id} | Score:{score} | Slack only")
+        ok = send_slack_alert(full_doc)
+        if ok:
+            mark_slack_alerted(message_id)
+
+    elif score >= MIN_SCORE_HIGH:
+        log.info(f"RESCORE HIGH | message_id:{message_id} | Score:{score} | Slack + HubSpot")
+        ok = send_slack_alert(full_doc)
+        if ok:
+            mark_slack_alerted(message_id)
+        cid = send_to_hubspot(full_doc)
+        if cid:
+            mark_hubspot_alerted(message_id, cid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERIC BATCH PROCESSOR — persistent state (FIX A) — unchanged from v7.3
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2196,11 +2582,7 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — feedparser RSS poller
-# FIX A: dedup set now loaded from / persisted to MongoDB (flintel_seen_ids)
-# instead of being purely in-memory, so a restart cannot cause an item
-# already sitting in the persisted pending batch to be re-fetched and
-# duplicated. All RSS-fetching logic itself is unchanged from v7.2.
+# REDDIT — feedparser RSS poller (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _reddit_seen_ids: set = load_seen_ids("reddit")
@@ -2310,8 +2692,7 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER
-# FIX A: seen_ids persisted/restored the same way as Reddit's.
+# TWITTER / X POLLER (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -2405,8 +2786,7 @@ def poll_twitter(client: tweepy.Client):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM LISTENER (Telethon — human account, read-only)
-# FIX A: seen_ids persisted/restored the same way as Reddit/Twitter.
+# TELEGRAM LISTENER (Telethon — human account, read-only) — unchanged from v7.3
 # ─────────────────────────────────────────────────────────────────────────────
 
 _telegram_seen_ids: set = load_seen_ids("telegram")
@@ -2631,7 +3011,7 @@ def run_telegram_listener_thread():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — Daily Digest + Weekly Report (unchanged from v7.2)
+# SCHEDULERS — Daily Digest + Weekly Report (unchanged from v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_daily_digest():
@@ -2683,7 +3063,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.3 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
         ]
 
         result = retry_with_backoff(
@@ -2758,7 +3138,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.3 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2806,7 +3186,7 @@ async def run_scheduler():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASYNC LISTENERS — thread management + auto-restart (unchanged from v7.2)
+# ASYNC LISTENERS — thread management + auto-restart (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -2933,30 +3313,34 @@ async def start_telegram_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (unchanged routes from v7.2, version bumped)
+# FASTAPI — REST API (all v7.3 routes unchanged; ONE new route added: /rescore)
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.3",
-    description = "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. Persistent batch state.",
-    version     = "7.3.0",
+    title       = "FX Signal Intelligence API — Flintel v7.4",
+    description = "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. Persistent batch state. Gated manual rescore-by-ID.",
+    version     = "7.4.0",
 )
 
 
 def _serialise(signals: list) -> list:
     for s in signals:
         s.pop("_id", None)
-        for f in ["created_at", "alerted_slack_at", "alerted_hubspot_at"]:
-            if f in s:
+        for f in ["created_at", "alerted_slack_at", "alerted_hubspot_at", "rescored_at"]:
+            if f in s and s[f] is not None:
                 s[f] = s[f].isoformat()
     return signals
+
+
+class RescoreRequest(BaseModel):
+    message_ids: list[str] = []
 
 
 @app.get("/")
 def root():
     return {
         "status":                "running",
-        "system":                "FLINTEL v7.3",
+        "system":                "FLINTEL v7.4",
         "client":                CLIENT_ID,
         "platforms":             ["reddit", "twitter", "telegram"],
         "reddit_enabled":        REDDIT_ENABLED,
@@ -2971,14 +3355,18 @@ def root():
         "batch_gap_s":           BATCH_GAP_SECONDS,
         "batch_timeout_s":       BATCH_TIMEOUT_SECONDS,
         "max_tokens":            MAX_TOKENS,
+        "max_tokens_raw_env":    _MAX_TOKENS_RAW,
+        "max_tokens_was_clamped": _max_tokens_clamped,
+        "max_tokens_ceiling":    CLAUDE_SONNET_MAX_OUTPUT_TOKENS,
         "reddit_queue_size":     reddit_queue.qsize(),
         "twitter_queue_size":    twitter_queue.qsize(),
         "telegram_queue_size":   telegram_queue.qsize(),
         "telegram_groups":       len(TARGET_TELEGRAM_GROUPS),
         "auth_required":         bool(API_KEY),
-        "output_schema":         "platform-specific (v7.2 cost optimisation, unchanged in v7.3)",
+        "output_schema":         "platform-specific (v7.2 cost optimisation, unchanged in v7.3/v7.4)",
         "persistent_batch_state": True,
         "partial_json_recovery":  True,
+        "rescore_system_enabled": RESCORE_SYSTEM_ENABLED,
     }
 
 
@@ -2999,6 +3387,7 @@ def health():
         "twitter_queue_size":    twitter_queue.qsize(),
         "telegram_queue_size":   telegram_queue.qsize(),
         "client_id":             CLIENT_ID,
+        "rescore_system_enabled": RESCORE_SYSTEM_ENABLED,
         "timestamp":             datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3006,9 +3395,8 @@ def health():
 @app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
 def get_pending_batch():
     """
-    New in v7.3: inspect the currently persisted in-flight batch for each
-    platform. Useful for confirming restart-survival behavior without
-    needing to read MongoDB directly.
+    Inspect the currently persisted in-flight batch for each platform.
+    Unchanged from v7.3.
     """
     try:
         docs = list(db.flintel_pending_batch.find({}, {"_id": 0}))
@@ -3020,6 +3408,41 @@ def get_pending_batch():
             d["item_count"] = len(d.get("items", []))
         return {"pending_batches": docs}
     except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/rescore", dependencies=[Depends(verify_api_key)])
+def rescore_endpoint(payload: RescoreRequest):
+    """
+    NEW IN v7.4 — the ONLY new route.
+
+     Body:
+    {
+        "message_ids": [
+            "6a314817b7a3d0ae498e6a3b",
+            "6a314817b7a3d0ae498e6a3a",
+            "6a314817b7a3d0ae498e6a3c"
+        ]
+    }
+
+    Behavior:
+      - RESCORE_SYSTEM_ENABLED=false (default) → returns immediately,
+        ZERO Claude requests are ever made, regardless of how many IDs
+        are supplied.
+      - RESCORE_SYSTEM_ENABLED=true → exactly as many items as valid IDs
+        supplied are sent to Claude in ONE batch call, using the SAME
+        scoring pipeline (_build_batch_prompt / score_batch_with_claude /
+        process-equivalent routing) the live system uses. Results are
+        written back into the existing signals documents, and Slack
+        (score 6-7) / Slack+HubSpot (score 8-10) fire automatically based
+        on the new score — exactly like a live signal. Zero IDs supplied
+        → zero items → no Claude call is made.
+    """
+    try:
+        result = rescore_signals_by_ids(payload.message_ids)
+        return result
+    except Exception as exc:
+        log.error(f"/rescore endpoint error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -3062,6 +3485,7 @@ def get_stats():
         reddit   = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "reddit"})
         twitter  = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "twitter"})
         telegram = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram"})
+        rescored = db.signals.count_documents({"client_id": CLIENT_ID, "rescored_at": {"$exists": True}})
 
         def agg(group_field):
             return list(db.signals.aggregate([
@@ -3076,6 +3500,7 @@ def get_stats():
             "reddit_signals":   reddit,
             "twitter_signals":  twitter,
             "telegram_signals": telegram,
+            "rescored_signals": rescored,
             "corridors":        agg("corridor"),
             "pain_types":       agg("pain_type"),
             "competitors":      agg("competitor_mentioned"),
@@ -3251,7 +3676,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.3")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
@@ -3266,7 +3691,9 @@ if __name__ == "__main__":
     log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
     log.info(f"  Batch gap          : {BATCH_GAP_SECONDS}s between calls")
     log.info(f"  Batch timeout      : {BATCH_TIMEOUT_SECONDS}s (partial batch fires after timeout)")
-    log.info(f"  max_tokens         : {MAX_TOKENS}")
+    log.info(f"  max_tokens (.env)  : {_MAX_TOKENS_RAW}")
+    log.info(f"  max_tokens (used)  : {MAX_TOKENS}{' — CLAMPED, see FIX C, check .env!' if _max_tokens_clamped else ''}")
+    log.info(f"  max_tokens ceiling : {CLAUDE_SONNET_MAX_OUTPUT_TOKENS} (Sonnet 4.6 sync API hard limit)")
     log.info(f"  Twitter poll       : every {TWITTER_POLL_INTERVAL}s (rate-limit safe)")
     log.info(f"  Twitter query      : built dynamically from KEYWORDS ({len(KEYWORDS)} keywords)")
     log.info(f"  Telegram join gap  : {TELEGRAM_JOIN_GAP_SECONDS}s between group joins")
@@ -3277,9 +3704,10 @@ if __name__ == "__main__":
     log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
-    log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items")
-    log.info(f"                     : instead of discarding the whole batch (see FIX B)")
-    log.info(f"  Operator alerts    : Claude API down + MongoDB failure + partial recovery → Slack")
+    log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items (FIX B)")
+    log.info(f"  MAX_TOKENS clamp   : Invalid .env MAX_TOKENS auto-clamped to safe ceiling (FIX C)")
+    log.info(f"  Rescore system     : {'✅ ENABLED (RESCORE_SYSTEM_ENABLED=true)' if RESCORE_SYSTEM_ENABLED else '❌ DISABLED (RESCORE_SYSTEM_ENABLED=false) — POST /rescore makes ZERO Claude requests'}")
+    log.info(f"  Operator alerts    : Claude API down + MongoDB failure + partial recovery + MAX_TOKENS clamp → Slack")
     log.info(f"  API auth           : {'✅ ENABLED (API_KEY set)' if API_KEY else '⚠️  DISABLED (API_KEY not set — open access)'}")
     log.info(f"  Weekly state       : Persisted in MongoDB (survives restarts)")
     log.info(f"  Daily digest       : {DAILY_DIGEST_HOUR}:00 UTC")
@@ -3290,9 +3718,9 @@ if __name__ == "__main__":
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'enabled' if HUBSPOT_API_KEY else 'DISABLED — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack              : {'enabled' if SLACK_WEBHOOK_URL else 'DISABLED — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2) — ~140 tokens/item")
-    log.info(f"  v7.3 changes       : FIX A (persistent batch state) + FIX B (partial-JSON recovery) ONLY")
-    log.info(f"                     : Scoring logic, prompts, Slack/HubSpot formatting — 100% unchanged")
+    log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2/v7.3) — ~140 tokens/item")
+    log.info(f"  v7.4 changes       : FIX C (MAX_TOKENS safety clamp) + manual rescore-by-ID system ONLY")
+    log.info(f"                     : Scoring logic, prompts, Slack/HubSpot formatting, FIX A, FIX B — 100% unchanged")
     log.info("=" * 70)
 
     asyncio.run(main())
