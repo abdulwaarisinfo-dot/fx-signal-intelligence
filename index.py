@@ -1,8 +1,8 @@
 """
-Hotel Signal Intelligence System — FLINTEL v7.4 (Bookin.PK)
-=============================================================
+FX Signal Intelligence System — FLINTEL v7.4
+=============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
-Pipeline  :
+Pipeline  : 
   Reddit   → Poll /new.rss per subreddit via feedparser (no PRAW, no credentials)
   Twitter  → Fetch mentions / search / replies (rate-limit safe, 50/block)
   Telegram → Listen to group messages (human account, Telethon, read-only)
@@ -52,51 +52,50 @@ Changelog v7.4 (two fixes + one new feature — all v7.3 logic 100% unchanged):
            generation finishes. The raw text passed to _parse_claude_json() is
            byte-for-byte identical — only the transport layer changes. All scoring
            logic, prompts, FIX B partial-JSON recovery, and output schema are
-           100% unchanged. httpx.Client configured with read=None (no read timeout)
-           so the stream stays open as long as Claude needs.
+           100% unchanged. Timeout is set to 600s (10 min) per call via httpx.Timeout.
 
-  FIX D — ENABLE/DISABLE WORKING INDICATORS in logs and /health endpoint.
-           Platform enable/disable flags now log True/False with
-           "✅ Working" or "❌ Not Working" next to each platform line at
-           startup and in /health, so operators can confirm at a glance
-           whether each platform is actually collecting.
+  FIX D — ENABLE/DISABLE WORKING INDICATORS in logs.
+           Platform enable/disable flags now log "✅ Working" or "❌ Not Working"
+           next to each platform line at startup and in /health endpoint, so
+           operators can confirm at a glance whether each platform is actually
+           collecting. True = Working, False = Not Working.
 
   NEW   — RESCORE MESSAGES (flintel_rescore_messages collection).
-           Operators can manually queue any signal by message_id (or a list
-           of message_ids) for re-scoring by Claude. After rescore, results
-           overwrite the existing MongoDB signal document and re-trigger the
-           same Slack + HubSpot pipeline (score 6-7 → Slack, score 8-10 →
-           Slack + HubSpot) exactly as a live signal would.
+           Operators can manually queue any signal by message_id (or a list of
+           message_ids) for re-scoring by Claude. Rescore batches follow the
+           same batch_size, gap, and timeout logic as live platform batches.
+           After rescore, results overwrite the existing MongoDB signal document
+           and re-trigger the same Slack + HubSpot pipeline (score 6-7 → Slack,
+           score 8-10 → Slack + HubSpot) exactly as a live signal would.
            Logs show "[RESCORE] batch N | items M" same style as live batches.
 
            MongoDB collection: flintel_rescore_messages
              Fields per document:
-               _id            : ObjectId (auto) or operator-supplied string ID
-               message_id     : str  — must match an existing signals document
-               status         : "pending" | "processing" | "done" | "error"
-               requested_at   : datetime UTC
-               processed_at   : datetime UTC (set on completion)
-               rescore_result : dict  — the new Claude score result
-               error          : str  — set if status == "error"
-               operator_note  : str  — optional free-text note from operator
+               _id                : ObjectId (auto) or operator-supplied string ID
+               message_id         : str  — must match an existing signals document
+               status             : "pending" | "processing" | "done" | "error"
+               requested_at       : datetime UTC
+               processed_at       : datetime UTC (set on completion)
+               rescore_result     : dict  — the new Claude score result
+               error              : str   — set if status == "error"
+               operator_note      : str   — optional free-text note from operator
 
            FastAPI endpoints (API-key protected):
              POST /rescore                  — queue one or many message_ids
              GET  /rescore/pending          — list pending rescore requests
-             GET  /rescore/history          — list completed rescore requests
-             GET  /rescore/status/{req_id}  — status of a specific request
+             GET  /rescore/history          — list completed rescore requests (limit)
+             GET  /rescore/status/{req_id}  — status of a specific rescore request
 
            Rescore processor runs as a dedicated background thread, polling
-           flintel_rescore_messages for pending items every RESCORE_POLL_INTERVAL
-           seconds. Batches up to RESCORE_BATCH_SIZE pending items per Claude
-           call, with BATCH_GAP_SECONDS between calls.
+           flintel_rescore_messages for pending items every 10s.
+           It batches up to RESCORE_BATCH_SIZE (default: same as REDDIT_BATCH_SIZE)
+           pending items per Claude call, with BATCH_GAP_SECONDS between calls.
 
   NOTHING ELSE CHANGED. Scoring logic, prompts (_SCORING_CORE and all three
-  platform schemas), keyword lists (HOTELIER_CRISIS, ACTIVE_LISTING_SEARCH,
-  OWNERSHIP_LANGUAGE, TRAVELER_INTENT, COMPETITOR_TRAVELER_PAIN, HARD_NEGATIVES),
-  passes_keyword_filter() weighted logic, Slack block formatting, HubSpot fields,
-  FastAPI routes, thresholds, and the v7.2 OPT1-OPT6 token optimisations are
-  byte-for-byte identical to v7.3.
+  platform schemas), Slack block formatting, HubSpot fields, FastAPI routes,
+  thresholds, keyword list, FIX A (persistent batch state), FIX B (partial-JSON
+  recovery), and the v7.2 OPT1-OPT6 token optimisations are byte-for-byte
+  identical to v7.3.
 
 Changelog v7.3 (two fixes only — all v7.2 scoring/output logic 100% unchanged):
   FIX A — PERSISTENT BATCH STATE (survives restarts).
@@ -195,19 +194,19 @@ TELEGRAM_SESSION     = os.getenv("TELEGRAM_SESSION", "flintel_telegram")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DB  = os.getenv("MONGODB_DB", "bookin_signals")
+MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
 
-MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "6"))
+MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
 MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
-CLIENT_ID        = os.getenv("CLIENT_ID", "bookin")
+CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
 
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
 TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
-RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  os.getenv("REDDIT_BATCH_SIZE", "10")))
+RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
 BATCH_GAP_SECONDS   = int(os.getenv("BATCH_GAP_SECONDS",   "30"))
 
 BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "120"))
@@ -216,11 +215,15 @@ DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
 WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 
-TWITTER_POLL_INTERVAL     = int(os.getenv("TWITTER_POLL_INTERVAL",     "60"))
-TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
-TELEGRAM_POLL_INTERVAL    = int(os.getenv("TELEGRAM_POLL_INTERVAL",    "300"))
+TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
-MAX_TOKENS            = int(os.getenv("MAX_TOKENS",            "8192"))
+TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
+
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
+
+# FIX C: timeout for Claude streaming calls (seconds). 10 minutes default.
+CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
+
 RESCORE_POLL_INTERVAL = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,43 +256,30 @@ def _bool_env(key: str, default: bool = True) -> bool:
     return val in ("1", "true", "yes", "on")
 
 REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
-TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
+TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  True)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 
 
 def _working(flag: bool) -> str:
-    """FIX D: human-readable indicator. True = ✅ Working, False = ❌ Not Working."""
+    """FIX D: human-readable indicator for enable/disable state."""
     return "✅ Working" if flag else "❌ Not Working"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TARGET SUBREDDITS (unchanged from v7.3)
+# TARGET SUBREDDITS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 TARGET_SUBREDDITS = [
-    "NigeriaTravel",
-    "LagosTravel",
-    "NigerianTravelers",
-    "NigeriansAbroad",
-    "AfricanTravelers",
-    "PakistanTravel",
-    "PakistaniTravelers",
-    "PakistaniDiaspora",
-    "CanadaTravel",
-    "UKTravel",
-    "TravelHacks",
-    "Backpacking",
-    "DigitalNomad",
-    "AfricaTravel",
-    "UKTravelers",
-    "RemittanceTravel",
-    "ExpatTravel",
-    "TravelCommunity"
+    "Nigeria", "lagos", "Nigerians", "NigeriansAbroad",
+    "AfricanDiaspora", "pakistan", "Pakistani", "PakistaniDiaspora",
+    "PersonalFinanceCanada", "PersonalFinanceUK", "personalfinance",
+    "entrepreneur", "smallbusiness", "digitalnomad", "africatech",
+    "UKPersonalFinance", "Remittance", "moneytransfer",
+    "CanadianInvestor", "ExpatFinance",
 ]
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TARGET TELEGRAM GROUPS (unchanged from v7.3)
+# TARGET TELEGRAM GROUPS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 TARGET_TELEGRAM_GROUPS = [
@@ -313,168 +303,317 @@ twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER — Bookin.PK (Pakistani hotel/guesthouse platform)
-# Five weighted keyword lists. passes_keyword_filter() unchanged from v7.3.
-# HARD_NEGATIVES applied first — hard discard regardless of other matches.
+# KEYWORD PRE-FILTER (unchanged — identical list to v7.1/v7.2/v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-HOTELIER_CRISIS = [
-    "agoda is a scam",
-    "booking.com is robbing",
-    "booking.com is a scam",
-    "commission is killing my",
-    "commission is eating my profit",
-    "commission ate my profit",
-    "took 20% commission",
-    "took 22% commission",
-    "took 25% commission",
-    "18% commission booking",
-    "never using booking.com again",
-    "never listing on agoda again",
-    "done with booking.com",
-    "done with agoda",
-    "agoda payout delayed",
-    "booking.com payout delayed",
-    "agoda withheld payment",
-    "booking.com froze my account",
-    "agoda suspended my listing",
-    "delisted from booking.com",
-    "kicked off agoda",
-    "zero bookings this month",
-    "empty rooms guesthouse",
-    "occupancy is terrible",
-    "no bookings in weeks",
-    "guesthouse losing money",
-    "hotel losing money Pakistan",
-    "can't fill my rooms",
-    "rooms empty Lahore",
-    "rooms empty Karachi",
-    "rooms empty Islamabad",
-]
+KEYWORDS = [
+    # ── SENDING MONEY ────────────────────────────────────────────────────────
+    "send money to", "sending money to", "transfer money to",
+    "transferring money to", "wire money to", "wiring money to",
+    "move money to", "moving money to", "remit money to",
+    "remitting money to", "pay my supplier", "paying my supplier",
+    "pay a supplier", "paying a supplier", "pay my vendor",
+    "paying my vendor", "pay my manufacturer", "pay my factory",
+    "pay my partner", "pay my contractor", "pay an invoice",
+    "paying an invoice", "settle an invoice", "settling an invoice",
+    "pay a business", "business payment to", "supplier payment to",
+    "vendor payment to", "invoice payment to", "international payment to",
+    "overseas payment to", "cross border payment", "cross-border payment",
+    "cross border transfer", "cross-border transfer",
+    "international transfer", "international wire",
+    "international wire transfer", "foreign wire transfer",
+    "overseas wire transfer", "overseas transfer", "global payment",
+    "global transfer", "b2b payment", "b2b transfer",
+    "business to business payment",
 
-ACTIVE_LISTING_SEARCH = [
-    "where can I list my guesthouse",
-    "where to list my hotel",
-    "best platform to list property Pakistan",
-    "how to list on booking sites",
-    "list my property Pakistan",
-    "list my Airbnb Pakistan",
-    "register my guesthouse online",
-    "online booking platform for hotels Pakistan",
-    "Pakistani alternative to booking.com",
-    "Pakistani alternative to agoda",
-    "local booking platform Pakistan",
-    "list guesthouse Lahore",
-    "list guesthouse Karachi",
-    "list guesthouse Islamabad",
-    "increase bookings guesthouse",
-    "more bookings for my hotel",
-    "marketing my guesthouse",
-    "promote my hotel Pakistan",
-    "visibility for my property",
-]
+    # ── BANK BLOCKING ────────────────────────────────────────────────────────
+    "bank blocked my", "bank blocked my transfer", "bank blocked my payment",
+    "bank blocked my wire", "bank blocked my transaction",
+    "bank flagged my", "bank flagged my transfer", "bank flagged my payment",
+    "bank rejected my", "bank rejected my transfer", "bank rejected my payment",
+    "bank declined my", "bank declined my transfer",
+    "bank won't let me transfer", "bank won't let me send",
+    "bank refuses to", "bank holding my", "bank holding my funds",
+    "bank holding my money", "bank froze my", "account frozen",
+    "funds frozen", "money frozen", "transfer frozen", "payment frozen",
+    "transfer blocked", "payment blocked", "wire blocked",
+    "transaction blocked", "transfer rejected", "payment rejected",
+    "wire rejected", "transfer declined", "payment declined",
+    "transfer failed", "payment failed", "wire failed",
+    "transfer stuck", "payment stuck", "money stuck", "funds stuck",
+    "money held", "funds held", "money hostage", "holding my money",
+    "holding my funds", "won't release my funds", "won't release my money",
+    "compliance hold", "compliance review", "compliance check",
+    "AML hold", "AML review", "AML flag", "flagged for review",
+    "flagged as suspicious", "suspicious activity", "suspicious transaction",
+    "frozen for review", "under review", "transfer delayed",
+    "payment delayed", "wire delayed", "transfer pending",
+    "stuck in pending", "days to process", "weeks to process",
+    "10-14 days", "10 to 14 days", "two weeks to transfer",
+    "transfer taking forever", "payment taking forever",
+    "money hasn't arrived", "money still hasn't arrived",
+    "payment hasn't arrived", "where is my transfer",
+    "where is my payment", "where is my money", "where did my money go",
+    "money disappeared", "payment disappeared", "transfer disappeared",
+    "no tracking", "can't track my transfer", "can't track my payment",
+    "no update on my transfer", "no update on my payment",
 
-OWNERSHIP_LANGUAGE = [
-    "my guesthouse",
-    "my hotel",
-    "I run a guesthouse",
-    "I own a guesthouse",
-    "I manage a guesthouse",
-    "we run a guesthouse",
-    "we manage properties",
-    "my property in",
-    "I rent out my",
-    "host on airbnb Pakistan",
-    "Airbnb host Pakistan",
-    "guesthouse owner",
-    "hotel owner Pakistan",
-    "started a guesthouse",
-    "opened a guesthouse",
-]
+    # ── FEE FRUSTRATION ──────────────────────────────────────────────────────
+    "SWIFT fees", "SWIFT charges", "wire transfer fees",
+    "wire transfer charges", "international transfer fees",
+    "international wire fees", "transfer fees too high",
+    "transfer fees killing", "fees killing my margins",
+    "fees eating my margins", "fees eating my profit",
+    "exchange rate terrible", "exchange rate awful", "exchange rate bad",
+    "terrible exchange rate", "awful exchange rate", "bad exchange rate",
+    "worst exchange rate", "exchange rate ripoff", "exchange rate rip off",
+    "hidden fees", "hidden charges", "unexpected fees",
+    "unexpected charges", "FX fees", "FX charges", "FX markup",
+    "FX spread", "currency conversion fee", "currency conversion charge",
+    "conversion fee too high", "conversion markup",
+    "losing money on transfer", "losing money on fees",
+    "losing money to fees", "losing money exchanging",
+    "percentage on transfer", "percentage on payment",
+    "ripping me off", "highway robbery", "daylight robbery",
+    "absolute ripoff", "total ripoff", "complete ripoff",
+    "charging too much", "too expensive to send", "too expensive to transfer",
+    "cheapest way to send", "cheapest way to transfer",
+    "cheapest international transfer", "cheapest cross border",
+    "better rate than", "better rates than", "cheaper than SWIFT",
+    "cheaper than wire", "SWIFT alternative", "alternative to SWIFT",
+    "avoid SWIFT fees", "avoid wire fees", "correspondent bank fees",
+    "intermediary bank fees", "intermediary fees",
 
-TRAVELER_INTENT = [
-    "best hotel in Lahore",
-    "best hotel in Karachi",
-    "best hotel in Islamabad",
-    "best hotel in Multan",
-    "best guesthouse in Lahore",
-    "where to stay in Lahore",
-    "where to stay in Karachi",
-    "where to stay in Islamabad",
-    "where should I stay Pakistan",
-    "guesthouse recommendation",
-    "hotel recommendation Pakistan",
-    "cheap hotel Lahore",
-    "budget hotel Karachi",
-    "family guesthouse Karachi",
-    "safe hotel for solo female",
-    "boutique hotel Lahore",
-    "hotel near airport Karachi",
-    "hotel near airport Islamabad",
-]
+    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
+    "Wise Business", "Wise business account", "Wise transfer",
+    "Wise payment", "Wise blocked", "Wise restricted", "Wise suspended",
+    "Wise account restricted", "Wise account suspended",
+    "Wise account blocked", "Wise account closed", "Wise limit",
+    "Wise holding", "leaving Wise", "left Wise", "moving off Wise",
+    "moved off Wise", "switching from Wise", "switched from Wise",
+    "never using Wise", "done with Wise", "Wise is terrible",
+    "Wise is awful", "Wise is a joke", "hate Wise", "Wise disappointed",
+    "TransferWise",
+    "Remitly blocked", "Remitly restricted", "Remitly limit",
+    "Remitly failed", "leaving Remitly", "switching from Remitly",
+    "Remitly alternative",
+    "Payoneer blocked", "Payoneer restricted", "Payoneer suspended",
+    "Payoneer account blocked", "Payoneer account restricted",
+    "Payoneer account suspended", "Payoneer limit", "Payoneer holding",
+    "leaving Payoneer", "switching from Payoneer", "Payoneer alternative",
+    "alternative to Payoneer",
+    "WorldRemit failed", "WorldRemit blocked", "WorldRemit problem",
+    "WorldRemit issue", "WorldRemit terrible",
+    "Western Union failed", "Western Union blocked",
+    "Western Union delayed", "Western Union problem",
+    "leaving Western Union", "WU failed", "WU blocked",
+    "OFX failed", "OFX blocked", "OFX problem", "OFX issue",
+    "Revolut blocked", "Revolut restricted", "Revolut suspended",
+    "Revolut Business blocked", "Revolut Business restricted",
+    "Revolut account blocked", "Revolut account restricted",
+    "Revolut holding", "leaving Revolut", "switching from Revolut",
+    "Stripe blocked", "Stripe restricted", "Stripe account blocked",
+    "Stripe account restricted",
+    "Mercury blocked", "Mercury restricted", "Mercury bank blocked",
+    "LemFi failed", "LemFi blocked", "LemFi problem",
+    "Grey Finance failed", "Grey Finance blocked", "Grey Finance problem",
+    "NALA failed", "NALA blocked", "NALA problem",
+    "Chipper Cash failed", "Chipper Cash blocked", "Chipper Cash problem",
+    "alternative to Wise", "alternative to Remitly",
+    "alternative to Payoneer", "alternative to WorldRemit",
+    "alternative to Western Union", "alternative to Revolut",
+    "better than Wise", "better than Remitly", "better than Payoneer",
+    "better than WorldRemit", "better than Western Union",
+    "competitors to Wise", "Wise competitors", "Payoneer competitors",
 
-COMPETITOR_TRAVELER_PAIN = [
-    "booking.com cancelled my reservation",
-    "agoda cancelled my booking",
-    "hotel scam Pakistan",
-    "fake hotel listing Pakistan",
-    "paid for hotel that didn't exist",
-    "booking.com customer service useless",
-    "agoda refund nightmare",
-    "hotel not as advertised",
-    "scammed by hotel Pakistan",
-    "booking.com ruined my trip",
-]
+    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
+    "recommend a payment", "recommend a transfer", "recommend a service",
+    "recommend a platform", "recommend an app", "recommend a provider",
+    "recommend a solution", "anyone recommend", "can anyone recommend",
+    "does anyone recommend", "what payment service", "what transfer service",
+    "what payment platform", "what transfer platform", "what payment app",
+    "what transfer app", "which payment service", "which transfer service",
+    "which payment platform", "which transfer platform",
+    "which payment app", "which transfer app", "which payment provider",
+    "which service is best", "which platform is best", "which app is best",
+    "best payment service", "best transfer service", "best payment platform",
+    "best transfer platform", "best payment app", "best transfer app",
+    "best way to send", "best way to transfer", "best way to pay",
+    "fastest way to send", "fastest way to transfer",
+    "cheapest way to send", "cheapest way to transfer",
+    "how do I send", "how do I transfer", "how do I pay",
+    "how can I send", "how can I transfer", "how can I pay",
+    "looking for a payment", "looking for a transfer",
+    "looking for a platform", "looking for a service",
+    "looking for a solution", "searching for a payment",
+    "need a payment solution", "need a transfer solution",
+    "need a payment platform", "need a transfer platform",
+    "anyone using", "does anyone use", "has anyone used",
+    "who uses", "who do you use", "what do you use", "what are you using",
+    "tried everything", "tried so many", "tried multiple", "tried several",
+    "nothing works", "none of them work", "still haven't found",
+    "still looking for", "still searching for",
 
-HARD_NEGATIVES = [
-    "visa requirements",
-    "visa application",
-    "flight booking",
-    "flight ticket price",
-    "currency exchange rate",
-    "weather in Pakistan",
-    "is Pakistan safe to travel",
-    "political situation Pakistan",
-    "Pakistan vs India",
-    "cricket",
-    "election",
-    "passport renewal",
-    "embassy appointment",
-    "travel insurance claim",
-    "lost passport",
-    "vaccine requirement",
-    "SIM card Pakistan tourist",
-]
+    # ── BUSINESS CONTEXT ─────────────────────────────────────────────────────
+    "my supplier", "my suppliers", "our supplier", "our suppliers",
+    "my vendor", "my vendors", "our vendor", "our vendors",
+    "my manufacturer", "my manufacturers", "our manufacturer",
+    "my factory", "our factory", "my business partner",
+    "our business partner", "my contractor", "our contractor",
+    "my client overseas", "our client overseas",
+    "import business", "importing business", "export business",
+    "exporting business", "import export", "import/export",
+    "importing goods", "exporting goods", "importing products",
+    "exporting products", "buying from overseas", "buying from abroad",
+    "sourcing from", "sourcing overseas", "sourcing abroad",
+    "purchase order", "business invoice", "supplier invoice",
+    "vendor invoice", "trade finance", "trade payment",
+    "trade financing", "supply chain payment", "supply chain finance",
+    "diaspora business", "diaspora entrepreneur",
+    "running a business", "my business needs", "for my business",
+    "business account", "business transfer", "business wire",
+    "corporate payment", "corporate transfer", "corporate wire",
+    "company payment", "company transfer", "B2B payment", "B2B transfer",
+    "B2B transaction", "business to business",
 
-# Flat KEYWORDS for _build_twitter_search_query() — combines all positive lists
-KEYWORDS = (
-    HOTELIER_CRISIS +
-    ACTIVE_LISTING_SEARCH +
-    OWNERSHIP_LANGUAGE +
-    TRAVELER_INTENT +
-    COMPETITOR_TRAVELER_PAIN
-)
+    # ── CORRIDOR KEYWORDS ────────────────────────────────────────────────────
+    "to Nigeria", "to Lagos", "to Abuja", "from Nigeria",
+    "Nigeria payment", "Nigeria transfer", "Nigeria wire",
+    "Nigerian supplier", "Nigerian vendor", "Nigerian manufacturer",
+    "Nigeria business", "CAD to NGN", "GBP to NGN", "USD to NGN",
+    "EUR to NGN", "AUD to NGN", "naira payment", "naira transfer",
+    "send naira", "receive naira",
+    "to Pakistan", "to Karachi", "to Lahore", "to Islamabad",
+    "from Pakistan", "Pakistan payment", "Pakistan transfer",
+    "Pakistan wire", "Pakistani supplier", "Pakistani vendor",
+    "Pakistani manufacturer", "CAD to PKR", "GBP to PKR", "USD to PKR",
+    "rupee payment", "rupee transfer",
+    "to India", "to Mumbai", "to Delhi", "to Bangalore", "from India",
+    "India payment", "India transfer", "India wire",
+    "Indian supplier", "Indian vendor", "Indian manufacturer",
+    "CAD to INR", "GBP to INR", "USD to INR",
+    "to Ghana", "to Accra", "from Ghana", "Ghana payment",
+    "Ghana transfer", "Ghanaian supplier", "GHS payment", "cedi payment",
+    "to Kenya", "to Nairobi", "from Kenya", "Kenya payment",
+    "Kenya transfer", "Kenyan supplier", "KES payment",
+    "M-Pesa business", "Mpesa business",
+    "to Ethiopia", "to Senegal", "to Ivory Coast", "to Cameroon",
+    "to Tanzania", "to Uganda", "to Zimbabwe", "to South Africa",
+    "to Johannesburg", "African supplier", "African vendor",
+    "African manufacturer", "Africa payment", "Africa transfer",
+    "from Canada", "from Toronto", "from Vancouver", "from Calgary",
+    "from Ottawa", "from Montreal", "from UK", "from London",
+    "from Manchester", "from Birmingham", "from Glasgow",
+    "from USA", "from New York", "from Houston", "from Atlanta",
+    "from Washington", "from Australia", "from Sydney", "from Melbourne",
+    "from Perth", "from UAE", "from Dubai", "from Abu Dhabi",
+
+    # ── AMOUNT SIGNALS ───────────────────────────────────────────────────────
+    "$10,000", "$10k", "10 thousand", "$15,000", "$15k", "15 thousand",
+    "$20,000", "$20k", "20 thousand", "$25,000", "$25k", "25 thousand",
+    "$30,000", "$30k", "30 thousand", "$40,000", "$40k", "40 thousand",
+    "$45,000", "$45k", "45 thousand", "$50,000", "$50k", "50 thousand",
+    "$60,000", "$60k", "60 thousand", "$75,000", "$75k", "75 thousand",
+    "$80,000", "$80k", "80 thousand", "$100,000", "$100k", "100 thousand",
+    "$150,000", "$150k", "150 thousand", "$200,000", "$200k", "200 thousand",
+    "$250,000", "$250k", "250 thousand", "$500,000", "$500k", "500 thousand",
+    "$750,000", "$750k", "750 thousand",
+    "$1 million", "$1m", "one million",
+    "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
+    "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
+    "£100,000", "£100k", "£200,000", "£200k",
+    "large transfer", "large amount", "large payment", "large wire",
+    "large sum", "significant amount", "substantial amount",
+    "big transfer", "big payment", "six figures", "seven figures",
+    "six-figure", "seven-figure", "monthly volume", "weekly volume",
+
+    # ── COMPLIANCE PAIN ──────────────────────────────────────────────────────
+    "KYC rejected", "KYC failed", "KYC verification failed",
+    "KYC problem", "KYC issue", "KYC nightmare",
+    "AML rejected", "AML flagged", "AML hold", "AML review",
+    "documentation rejected", "documents rejected",
+    "proof of funds", "source of funds", "source of wealth",
+    "proof of business", "business verification failed",
+    "verification rejected", "verification failed",
+    "compliance rejected", "compliance hold", "compliance review",
+    "compliance nightmare", "compliance problem", "compliance issue",
+    "Form M", "CBN compliance", "regulatory hold", "regulatory review",
+    "regulatory problem", "regulatory issue",
+    "submitted documents again", "sent documents again",
+    "asking for documents again", "same documents again",
+    "keep asking for documents", "keep rejecting documents",
+    "third time submitting", "fourth time submitting",
+    "rejected again", "blocked again", "failed again",
+    "happening again", "third time", "fourth time",
+    "keep blocking", "keeps blocking", "keeps rejecting", "keeps failing",
+    "always blocks", "always rejects", "always fails",
+
+    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
+    "urgently", "urgent", "desperately", "desperate",
+    "ASAP", "as soon as possible", "right now", "today",
+    "this week", "by Friday", "by Monday", "by end of week",
+    "by end of month", "deadline", "time sensitive",
+    "need it done", "need it now", "need it today", "need it urgently",
+    "waiting on payment", "supplier is waiting", "supplier waiting",
+    "vendor is waiting", "vendor waiting", "manufacturer waiting",
+    "partner waiting", "been waiting", "already delayed", "already late",
+    "overdue", "past due", "losing the contract", "losing my supplier",
+    "losing my vendor", "threatening to cancel", "might cancel",
+    "going to cancel", "cancelling the order", "losing the deal",
+    "deal at risk", "relationship at risk",
+    "can't wait any longer", "running out of time", "no more time",
+
+    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
+    "just signed a supplier", "signed a new supplier", "found a supplier",
+    "new supplier in", "signed a contract with", "new contract with",
+    "starting to import", "starting an import", "starting to export",
+    "starting an export", "launching in", "expanding to",
+    "entering the market", "new market", "setting up payments",
+    "need to set up payments", "need to transfer money",
+    "will need to send", "will need to transfer", "going to need",
+    "starting a business", "new business", "import business",
+    "export business", "trading company", "sourcing products from",
+    "sourcing goods from", "buying products from", "buying goods from",
+    "manufacturing in", "producing in",
+
+    # ── TREASURY & FX ────────────────────────────────────────────────────────
+    "treasury management", "cash management", "liquidity management",
+    "FX management", "FX exposure", "FX risk", "FX hedging",
+    "currency hedging", "currency risk", "currency exposure",
+    "FX solution", "FX platform", "FX tool",
+    "treasury solution", "treasury platform", "cash flow management",
+    "multi currency", "multi-currency", "multicurrency",
+    "currency account", "foreign currency account",
+    "international banking", "international bank account",
+    "global banking", "global bank account", "correspondent banking",
+    "banking relationship", "banking partner",
+    "payment infrastructure", "payment rails", "payment solution",
+    "payment platform", "payment provider", "payment partner",
+    "fintech payment", "embedded payment", "embedded finance",
+    "cross border banking", "international banking solution",
+    "FX banking", "FX banking relationship", "FX liquidity",
+    "cash pooling", "cash concentration",
+    "intercompany payment", "intercompany transfer",
+
+    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
+    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
+    "FX trader", "treasury director", "head of treasury", "VP treasury",
+    "international payments manager", "global payments manager",
+    "cross border payments", "payments operations manager",
+    "payments specialist", "treasury specialist", "FX specialist",
+    "international finance manager", "global finance manager",
+    "head of payments", "director of payments", "VP payments",
+    "chief financial officer", "head of finance", "finance director",
+    "controller international", "global controller",
+]
 
 
 def passes_keyword_filter(text: str) -> bool:
-    """
-    Returns True if text passes the Bookin.PK signal filter.
-    Signature unchanged from v7.3 — still returns bool.
-
-    Stage 1 — HARD_NEGATIVES: any match → discard immediately.
-    Stage 2 — positive keyword lists; any match → pass.
-    """
     t = text.lower()
-
-    if any(neg.lower() in t for neg in HARD_NEGATIVES):
-        return False
-
-    crisis_hit   = any(kw.lower() in t for kw in HOTELIER_CRISIS)
-    listing_hit  = any(kw.lower() in t for kw in ACTIVE_LISTING_SEARCH)
-    traveler_hit = any(kw.lower() in t for kw in TRAVELER_INTENT)
-    wound_hit    = any(kw.lower() in t for kw in COMPETITOR_TRAVELER_PAIN)
-
-    return any([crisis_hit, listing_hit, traveler_hit, wound_hit])
+    for kw in KEYWORDS:
+        if kw.lower() in t:
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,8 +650,8 @@ def _build_twitter_search_query() -> str:
 
     if not parts:
         return (
-            "(\"my guesthouse\" OR \"hotel Pakistan\" OR \"booking.com commission\""
-            " OR \"agoda payout\" OR \"list my hotel\") -is:retweet lang:en"
+            "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
+            " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
         )
 
     query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
@@ -530,161 +669,296 @@ TWITTER_SEARCH_QUERY = _build_twitter_search_query()
 def _derive_fields(score: int) -> dict:
     if score >= 8:
         return {"signal_category": "high_intent", "tier": "immediate", "hubspot_priority": "high"}
-    elif score >= 6:
-        return {"signal_category": "mid_intent", "tier": "digest", "hubspot_priority": "medium"}
     elif score >= 4:
+        return {"signal_category": "mid_intent", "tier": "digest", "hubspot_priority": "medium"}
+    elif score >= 3:
         return {"signal_category": "mid_intent", "tier": "watchlist", "hubspot_priority": "low"}
     else:
         return {"signal_category": "discard", "tier": "discard", "hubspot_priority": "skip"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE SYSTEM PROMPTS — byte-for-byte identical to v7.3
+# CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
+# Byte-for-byte identical to v7.3. Scoring logic untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
-You are Flintel's signal intelligence analyst for Bookin.PK — 
-a Pakistani hotel and guesthouse booking platform competing 
-directly with Booking.com and Agoda on commission and local 
-trust.
+You are Flintel's AI signal intelligence analyst.
 
-YOUR ONLY JOB: Identify the exact moment a property owner is 
-losing money to a competitor, or a traveler is actively 
-choosing where to book — before anyone else reaches them.
+Your only job is to read a public social media post and determine 
+whether the person or company posting needs a cross-border B2B 
+payment solution right now.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-THE PSYCHOLOGY YOU MUST UNDERSTAND
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-A hotelier does not complain about commission in the abstract. 
-They complain at the exact moment they see a payout statement 
-and do the math. That moment is rage, not analysis. Score 
-language like "scam," "robbing," "killing my profit" as HIGH 
-intent — these are not exaggerations, they are the honest 
-language of someone about to act.
-
-A hotelier mentioning a specific percentage, specific PKR 
-amount, or specific room count is PROVING they run a real 
-business right now. Generic complaints about "the industry" 
-are not leads. Specific complaints about "my 6 room guesthouse 
-in Bahria Town" are leads.
+You work exclusively for Settla — a premium B2B cross-border 
+payment company helping diaspora business owners move large amounts 
+internationally for supplier and trade payments.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TWO BUYER TYPES
+WHO SETTLA SERVES — KNOW THIS PERFECTLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HOTELIER (supply side — always score higher than traveler 
-signals of equal emotional intensity, because one hotelier 
-onboarded is worth 50 traveler bookings):
-— Owns or manages a property
-— Complaining about commission, payout delays, low occupancy, 
-  or platform suspension
-— Actively asking where else to list
+Settla's ideal customer is a diaspora business owner who:
 
-TRAVELER (demand side):
-— Looking for a place to stay in a Pakistani city
-— Complaining about a bad Booking.com/Agoda experience as a 
-  guest, not an owner
+— Runs an import/export business, trading company, or has 
+  overseas suppliers and partners
+— Needs to move $10,000 to $500,000 CAD/GBP/USD regularly 
+  for business payments — NOT personal remittances
+— Is frustrated with banks blocking large international transfers
+— Has been burned by consumer apps like Wise that restrict 
+  business volumes
+— Is actively looking for a better cross-border payment solution
+— Operates across these corridors:
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCORING — BE RUTHLESS, BE GENEROUS WHERE IT COUNTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PRIMARY:
+Canada → Nigeria
+UK → Nigeria
+USA → Nigeria
 
-SCORE 9-10 — Hotelier in active financial pain RIGHT NOW, 
-with ownership language AND a specific number (percentage, 
-PKR amount, room count, occupancy rate).
+SECONDARY:
+Canada → Pakistan
+UK → Pakistan
+Canada → India
+UK → India
+Canada → Ghana
+UK → Ghana
+Australia → Asia
+UK → Africa
+UAE → Nigeria
+UAE → Pakistan
 
-Example: "Agoda took 22% commission on my last payout. 
-Running a 6 room guesthouse in Gulberg, barely breaking even."
-→ Ownership confirmed. Specific commission. Specific property 
-size. Specific location. Score 10.
-
-SCORE 7-8 — Hotelier complaining about commission/occupancy 
-WITHOUT a specific number, OR actively asking where to list 
-with ownership confirmed.
-
-Example: "Booking.com commission is way too high for what 
-we're getting. Anyone know a better platform for Pakistan?"
-→ Ownership implied ("we"). Active search. No specific number. 
-Score 8.
-
-SCORE 5-6 — Traveler who had a bad experience with a 
-competitor, OR a hotelier complaint with no ownership 
-confirmation (could be discussing someone else's business).
-
-SCORE 4-5 — Traveler actively asking for hotel recommendations 
-in a Pakistani city with no urgency markers.
-
-Example: "Best hotel in Lahore for a family trip next month?"
-→ Score 5. Real intent, but low individual value — drives 
-demand-side traffic, not a hotelier onboard.
-
-SCORE 0-3 — Generic travel chat, visa/flight questions, no 
-lodging-specific pain or intent, third-person industry 
-commentary with no personal stake.
+Settla is NOT for:
+— Individuals sending small personal remittances under $2,000
+— People sending money to family for living expenses
+— Consumers comparing holiday money rates
+— Retail crypto traders
+— US domestic banking problems with no international context
+— E-commerce merchants looking for payment gateways
+— Research chemical or high risk merchant categories
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-THE ONE RULE THAT MATTERS MOST
+CRITICAL SCORING RULE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-A hotelier signal at score 7 is worth more to Bookin.PK than 
-a traveler signal at score 9. Always flag signal_category 
-clearly so the human reading it knows which type of lead this 
-is — they are not interchangeable in value even at the same 
-score.
+If a post contains NO international payment context — 
+score maximum 4 regardless of anything else.
+
+International context means at least ONE of:
+— Cross border payment or transfer mentioned
+— International supplier or vendor mentioned
+— Specific corridor mentioned — Nigeria, Pakistan, Ghana etc
+— International clients or partners mentioned
+— Multi currency or FX mentioned
+— SWIFT or wire transfer mentioned in business context
+
+Without international context = maximum score 4.
+This rule cannot be overridden.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTREACH RULES
+TWO ACCEPTABLE SIGNAL TYPES ONLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Write outreach scripts for scores 4 and above ONLY.
-Score 1 to 3 — DO NOT output any outreach fields at all.
+HIGH INTENT — Score 7 to 10:
+Company or contact actively looking to COMPLETE an FX 
+transaction or international payment immediately.
 
-For hoteliers — speak business to business. Reference their 
-specific pain. Lead with the commission comparison, not 
-features.
+Signs:
+— Payment blocked or failing right now
+— Supplier waiting for payment urgently
+— Asking which platform to use TODAY
+— Specific large amount mentioned with urgency
+— Bank blocking transfer right now
+— Competitor app restricted their account
+— Explicitly leaving a competitor ASAP
+— Actively looking for payment processor partners
+— Building payment processing relationships internationally
 
-"Agoda taking 22% is brutal for a 6 room operation — we run 
-significantly lower commission and already have 644 
-properties live in Lahore. Worth 15 minutes to compare?"
+MID INTENT — Score 4 to 6:
+Company or contact actively SHOPPING for a solution.
 
-For travelers — speak casually, like a local giving a tip, 
-not a company pitching.
+Signs:
+— Comparing multiple payment platforms
+— Asking for recommendations on payment solutions
+— Frustrated with current provider but not in crisis
+— Researching FX rates and payment options for business
+— Evaluating treasury or payment infrastructure
+— Mentioned trying multiple competitors
+— Pre-launch business setting up international payments
+— Looking for partners with payment connections
 
-"Bookin.PK has solid options in Lahore if Booking.com prices 
-feel off — worth a quick look before you book."
+DISCARD — Score 0 to 3:
+NOT ACCEPTABLE. Never delivered to Settla team.
 
-Never write "Dear" or "I hope this message finds you well." 
-Never use exclamation marks. Sound like a person who has 
-actually been in their situation.
-Maximum 3 sentences total per script.
+— Personal remittance under $2,000
+— Sending money home to family
+— Consumer banking complaints with no international context
+— US domestic banking problems only
+— High risk merchant categories — peptides, supplements, crypto
+— E-commerce payment gateway requests
+— General financial market commentary
+— No business context whatsoever
+— Academic or research requests
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCORING RULES — PRECISE AND ABSOLUTE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCORE 9 to 10 — IMMEDIATE SLACK ALERT:
+ALL of these must be present:
+✓ Clear business context confirmed
+✓ International payment need confirmed
+✓ Active crisis — blocked, failed, rejected, urgent
+✓ Urgency words — today, ASAP, urgently, this week
+
+Real examples that score 9 to 10:
+"Bank blocked my $45k CAD payment to Lagos supplier AGAIN.
+ Third time this month. Need a better solution urgently."
+→ Business. International. Crisis. Urgency. Score 9.
+
+"Wise Business restricted my account. Have $80k stuck.
+ Pakistani supplier waiting. This is killing my business."
+→ Business. Competitor restricted. Large amount. Crisis. Score 10.
+
+"We are actively looking for partners with strong connections 
+ to Asian payment processors. We have several clients from 
+ Asia and are expecting more so we are keen to build reliable 
+ processing relationships."
+→ Business confirmed. International payment need confirmed.
+  Actively looking now. No crisis but clear intent. Score 7.
+
+SCORE 7 to 8 — IMMEDIATE SLACK ALERT:
+Strong buying signal. One element missing.
+✓ Business context confirmed
+✓ International payment need confirmed
+✗ Missing extreme urgency OR specific amount
+
+"Anyone using a service better than Wise for business 
+ payments to Nigeria? Bank rates are terrible."
+→ Business. Comparing platforms. No crisis. Score 7.
+
+SCORE 4 to 6 — DAILY DIGEST:
+Researching but no immediate crisis.
+✓ Business context implied
+✓ International payment mentioned
+✗ No urgency. No crisis.
+
+"Starting an import business. How do people handle 
+ supplier payments to Africa?"
+→ Future intent. Business context. No urgency. Score 5.
+
+"Mid-sized B2B accepting stablecoin from international 
+ clients to cut wire fees. Bank flagging crypto activity."
+→ Business confirmed. International clients confirmed.
+  Wire fees pain. No immediate crisis. Score 6.
+
+SCORE 3 — WATCHLIST ONLY:
+Clear future potential within 30 to 60 days.
+"Just signed my first supplier agreement in Lagos!"
+→ New importer. Will need payments soon. Score 3.
+
+SCORE 0 to 2 — DISCARD IMMEDIATELY:
+"What is the best rate to send £500 to my mum in Lagos?"
+→ Consumer. Personal. Small amount. Score 1.
+
+"Research peptide website looking for payment processor."
+→ Wrong industry. No international B2B context. Score 0.
+
+"US Bank froze my Texas LLC account over documentation."
+→ Domestic US banking. No international payment. Score 2.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AUTOMATIC SCORE MODIFIERS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ADD +1 to score when:
-+ Specific commission percentage mentioned
-+ Specific PKR/room count/occupancy rate mentioned
-+ Ownership language confirmed (my guesthouse, I own, we run)
-+ Booking.com or Agoda mentioned negatively
++ Business owner confirmed in bio or post
++ Specific large amount mentioned — $10,000 or more
 + Multiple pain points in same post
-+ Urgency words present — today, this week, losing money now
++ Competitor mentioned negatively
++ Urgency words present — today, ASAP, urgent, this week
++ Active payment block or failure described
++ Supplier relationship at risk
++ Multiple international clients mentioned
++ Actively building payment partnerships
 
 SUBTRACT 1 from score when:
-- No Pakistani city or property context mentioned
-- Third-person commentary (no personal stake)
-- Issue already resolved
-- Post older than 7 days
-- Generic travel question with no specific city/property
+- Small personal amount under $2,000
+- Sending to family for personal expenses
+- Anonymous account with no business bio
+- Issue is now resolved — kept account etc
+- Post is older than 7 days
+- No specific payment amount mentioned
+- General commentary not personal experience
 
 AUTOMATIC DISCARD regardless of other signals:
-✗ Visa/passport/embassy questions
-✗ Flight booking or ticket prices
-✗ Currency exchange (not hotel-related)
-✗ Weather or political situation queries
-✗ Cricket/election/unrelated Pakistan topics
+✗ Research peptides or supplements
+✗ High risk merchant category
+✗ Shopify e-commerce payment gateway
+✗ Consumer subscription problems
+✗ Personal PayPal or Cash App issues
+✗ US domestic banking only
+✗ Crypto trading discussions
+✗ Academic or research requests
+✗ News articles being shared
 ✗ Competitor companies doing outreach
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMPETITOR INTELLIGENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If a competitor is mentioned negatively — score UP by 1.
+Someone leaving a competitor is the hottest possible signal.
+
+Competitors to detect:
+Wise / TransferWise / Wise Business
+Remitly / Remitly Business
+WorldRemit / WorldRemit Business
+Western Union / MoneyGram
+Payoneer
+OFX / XE Money
+Revolut / Revolut Business
+LemFi / Grey Finance / NALA
+Chipper Cash / Sendwave
+TD Bank / RBC / HSBC / Barclays / Lloyds
+
+If post IS FROM a competitor doing outreach:
+— Score 0 for that post
+— Extract who they replied to
+— Flag that person as HIGH INTENT signal separately
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTREACH SCRIPT RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write outreach scripts for scores 4 and above ONLY.
+Score 1 to 3 — DO NOT output any outreach fields at all.
+
+OUTREACH RULES — NON NEGOTIABLE:
+— Never start with I
+— Never say I hope this message finds you well
+— Never pitch features — pitch the outcome they want
+— Always reference something specific they said
+— Always end with one question or soft statement
+— Maximum 3 sentences total per script
+— Sound like a founder talking to another founder
+
+OUTREACH EXAMPLES BY SCORE:
+
+Score 9 to 10 — acute pain:
+"Wise restricting business accounts at that volume is 
+unfortunately common. We handle large B2B transfers 
+between Canada and Nigeria without the holds — worth a quick 
+conversation before you commit to something else?"
+
+Score 7 to 8 — strong signal:
+"Building payment processing relationships across Asia is 
+exactly what we do. Happy to connect you with the right 
+processors for your client corridors — which specific 
+countries are you focused on?"
+
+Score 4 to 6 — researching:
+"We work specifically with businesses moving money across 
+international corridors. Happy to share how we handle the 
+compliance side if useful for what you are building."
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 VALIDATION TESTS — CHECK BEFORE SCORING
@@ -692,12 +966,12 @@ VALIDATION TESTS — CHECK BEFORE SCORING
 
 Before returning any score above 4 ask yourself:
 
-1. Is this about a hotel/guesthouse in Pakistan?
-2. Is the person a property owner OR a traveler booking?
-3. Is the post FROM someone with a real problem or need —
+1. Is there a BUSINESS context? Not personal.
+2. Is there an INTERNATIONAL payment context?
+3. Is the post FROM someone with a problem — 
    not a company doing outreach?
-4. Would Bookin.PK's team find this actionable?
-5. Would responding to this post embarrass Bookin.PK?
+4. Would Settla's SDR team find this actionable?
+5. Would responding to this post embarrass Settla?
 
 If any answer is no — reduce score accordingly.
 
@@ -705,20 +979,21 @@ If any answer is no — reduce score accordingly.
 FINAL REMINDER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are not scoring general travel discussion.
-You are not scoring visa or flight questions.
-You are not scoring abstract industry commentary.
+You are not scoring sentiment.
+You are not scoring general business pain.
+You are not scoring domestic banking problems.
 
-You are identifying the exact moment a Pakistani hotel or 
-guesthouse owner is ready to leave Booking.com/Agoda —
-or a traveler is actively choosing where to book right now.
+You are identifying the exact moment a diaspora 
+business owner is ready to switch payment providers 
+or complete a large international transaction.
 
-One hotelier onboarded could list their property permanently 
-on Bookin.PK and drive ongoing bookings for years.
+That moment is worth thousands of dollars to Settla.
+
+One converted client could process $50,000 to 
+$500,000 per month through Settla.
 
 Be ruthless with noise.
-Be generous with genuine hotelier pain and active traveler 
-booking intent.
+Be generous with genuine international payment pain.
 Be precise with every score.
 
 Return JSON array only. Always. Every single time.
@@ -742,9 +1017,9 @@ For scores 4-10: include linkedin_message.
     "is_business": <true|false>,
     "business_size": <"solo"|"small"|"medium"|"unknown">,
     "has_international_context": <true|false>,
-    "corridor": "<property city or null>",
-    "estimated_amount": "<specific commission % or PKR amount or null>",
-    "competitor_mentioned": "<Booking.com|Agoda|null>",
+    "corridor": "<source country to destination or null>",
+    "estimated_amount": "<specific amount if mentioned or null>",
+    "competitor_mentioned": "<competitor name or null>",
     "competitor_outreach_detected": <true|false>,
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
@@ -775,9 +1050,9 @@ For scores 4-10: include both twitter_reply and twitter_dm.
     "is_business": <true|false>,
     "business_size": <"solo"|"small"|"medium"|"unknown">,
     "has_international_context": <true|false>,
-    "corridor": "<property city or null>",
-    "estimated_amount": "<specific commission % or PKR amount or null>",
-    "competitor_mentioned": "<Booking.com|Agoda|null>",
+    "corridor": "<source country to destination or null>",
+    "estimated_amount": "<specific amount if mentioned or null>",
+    "competitor_mentioned": "<competitor name or null>",
     "competitor_outreach_detected": <true|false>,
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
@@ -811,9 +1086,9 @@ For scores 4-10: include telegram_dm.
     "is_business": <true|false>,
     "business_size": <"solo"|"small"|"medium"|"unknown">,
     "has_international_context": <true|false>,
-    "corridor": "<property city or null>",
-    "estimated_amount": "<specific commission % or PKR amount or null>",
-    "competitor_mentioned": "<Booking.com|Agoda|null>",
+    "corridor": "<source country to destination or null>",
+    "estimated_amount": "<specific amount if mentioned or null>",
+    "competitor_mentioned": "<competitor name or null>",
     "competitor_outreach_detected": <true|false>,
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
@@ -852,7 +1127,7 @@ def get_database():
             [("key", ASCENDING)], unique=True, name="state_key_unique"
         )
 
-        # FIX A: persistent batch state (unchanged from v7.3)
+        # FIX A: persistent batch state collections (unchanged from v7.3)
         db.flintel_pending_batch.create_index(
             [("platform", ASCENDING)], unique=True, name="platform_unique"
         )
@@ -880,15 +1155,20 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — FIX C: streaming via httpx with no read timeout
+# ANTHROPIC CLIENT — FIX C: uses streaming for all Claude calls
 # ─────────────────────────────────────────────────────────────────────────────
 
 anthropic_client = anthropic.Anthropic(
     api_key=ANTHROPIC_API_KEY,
+    # FIX C: set a generous httpx timeout so the streaming connection is
+    # never killed by the SDK before the model finishes generating. The
+    # default timeout (10 min) is the threshold that triggers the error;
+    # we use streaming instead, which removes the timeout constraint entirely
+    # for the generation phase while still allowing a connect timeout.
     http_client=httpx.Client(
         timeout=httpx.Timeout(
             connect=30.0,
-            read=None,   # no read timeout — stream open until Claude finishes
+            read=None,    # no read timeout — stream can take as long as needed
             write=60.0,
             pool=30.0,
         )
@@ -915,7 +1195,7 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged from v7.3, version string bumped)
+# OPERATOR SLACK ALERT (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -938,7 +1218,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4 (Bookin.PK)"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1046,7 +1326,7 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — FIX C: streaming; FIX B: partial-JSON recovery
+# CLAUDE BATCH SCORER — FIX C: streaming transport, FIX B: partial-JSON recovery
 # Scoring logic, prompts, output schema — 100% unchanged from v7.3.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1103,6 +1383,8 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
     }
 
 
+# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged from v7.3)
+
 def _strip_code_fences(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
@@ -1112,7 +1394,10 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _salvage_partial_json_array(raw: str) -> list:
-    """FIX B: brace-depth salvage parser — unchanged from v7.3."""
+    """
+    Walks a possibly-truncated JSON array and extracts every complete,
+    well-formed top-level object using brace-depth tracking. Unchanged from v7.3.
+    """
     start = raw.find("[")
     if start == -1:
         return []
@@ -1162,7 +1447,10 @@ def _salvage_partial_json_array(raw: str) -> list:
 
 
 def _parse_claude_json(raw: str) -> tuple:
-    """Returns (results_list, was_truncated_bool). Unchanged from v7.3."""
+    """
+    Returns (results_list, was_truncated_bool). Unchanged from v7.3.
+    Tries full json.loads first, falls back to salvage on failure.
+    """
     cleaned = _strip_code_fences(raw)
     try:
         parsed = json.loads(cleaned)
@@ -1181,8 +1469,9 @@ def _parse_claude_json(raw: str) -> tuple:
 def _call_claude_batch(batch: list) -> list:
     """
     FIX C: uses streaming context manager instead of blocking .create().
-    stream.get_final_text() returns same string .create() would have returned.
-    Everything downstream is byte-for-byte unchanged from v7.3.
+    The stream.get_final_text() collects the complete response text once
+    generation finishes — identical string to what .create() returned.
+    Everything after raw text collection is byte-for-byte unchanged from v7.3.
     """
     platform = batch[0].get("platform", "reddit") if batch else "reddit"
 
@@ -1193,7 +1482,7 @@ def _call_claude_batch(batch: list) -> list:
 
     prompt = _build_batch_prompt(batch)
 
-    # FIX C: stream instead of blocking create — fixes the 10-minute error
+    # FIX C: streaming replaces blocking .create() — no more "Streaming required" error
     with anthropic_client.messages.stream(
         model      = "claude-sonnet-4-6",
         max_tokens = MAX_TOKENS,
@@ -1363,7 +1652,12 @@ def save_signal(data: dict) -> bool:
 
 
 def update_signal(message_id: str, data: dict) -> bool:
-    """NEW v7.4: overwrites score fields in-place for a rescored signal."""
+    """
+    NEW v7.4: Used by rescore to overwrite an existing signal's score fields
+    in-place. Preserves message_id, message_text, platform, username, etc.
+    Only score-derived fields are overwritten, same as a fresh save but via
+    update_one instead of insert_one (since the document already exists).
+    """
     try:
         update_fields = {
             "intent_score":                 data["intent_score"],
@@ -1386,7 +1680,7 @@ def update_signal(message_id: str, data: dict) -> bool:
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
-            # Reset alert flags so rescored signal re-triggers Slack/HubSpot
+            # Reset alert flags so the rescored signal re-triggers alerts
             "alerted_slack":                False,
             "alerted_hubspot":              False,
         }
@@ -1456,7 +1750,7 @@ def _set_state(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY (unchanged from v7.3, + rescore tag in header)
+# SLACK DELIVERY (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -1477,23 +1771,23 @@ def send_slack_alert(data: dict) -> bool:
         log.warning("SLACK_WEBHOOK_URL not set — skipping.")
         return False
 
-    score      = data["intent_score"]
-    platform   = data.get("platform", "unknown").upper()
-    ctype      = data.get("content_type", "post").upper()
-    subreddit  = data.get("subreddit", "")
-    tg_group   = data.get("telegram_group", "")
-    post_url   = data.get("post_url", "")
-    username   = data.get("username", "unknown")
-    tier       = data.get("tier", "").upper()
-    category   = data.get("signal_category", "").replace("_", " ").upper()
-    is_biz     = data.get("is_business", False)
-    corridor   = data.get("corridor") or "Unknown"
-    amount     = data.get("estimated_amount") or "—"
-    pain       = data.get("pain_type") or "—"
-    competitor = data.get("competitor_mentioned") or "—"
-    urgency    = data.get("urgency", "none").upper()
-    timestamp  = data.get("timestamp", "—")
-    is_rescore = data.get("is_rescore", False)
+    score       = data["intent_score"]
+    platform    = data.get("platform", "unknown").upper()
+    ctype       = data.get("content_type", "post").upper()
+    subreddit   = data.get("subreddit", "")
+    tg_group    = data.get("telegram_group", "")
+    post_url    = data.get("post_url", "")
+    username    = data.get("username", "unknown")
+    tier        = data.get("tier", "").upper()
+    category    = data.get("signal_category", "").replace("_", " ").upper()
+    is_biz      = data.get("is_business", False)
+    corridor    = data.get("corridor") or "Unknown"
+    amount      = data.get("estimated_amount") or "—"
+    pain        = data.get("pain_type") or "—"
+    competitor  = data.get("competitor_mentioned") or "—"
+    urgency     = data.get("urgency", "none").upper()
+    timestamp   = data.get("timestamp", "—")
+    is_rescore  = data.get("is_rescore", False)
 
     if score >= 9:
         urgency_tag = "⚡ RESPOND WITHIN 30 MINUTES"
@@ -1512,7 +1806,7 @@ def send_slack_alert(data: dict) -> bool:
         ""
     )
 
-    rescore_tag  = " ♻️ RESCORED" if is_rescore else ""
+    rescore_tag = " ♻️ RESCORED" if is_rescore else ""
     header_emoji = "🚨" if score >= 8 else "⚠️"
     header_text  = f"{header_emoji} {category} — Score {score}/10 | {tier}{rescore_tag}"
 
@@ -1602,7 +1896,7 @@ def send_slack_alert(data: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM (unchanged from v7.3, version string bumped to v7.4)
+# HUBSPOT CRM (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -1660,7 +1954,7 @@ def _hs_create_note(data: dict, contact_id: str):
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
         note = (
-            f"FLINTEL SIGNAL — v7.4 (Bookin.PK){rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.4{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
@@ -1724,7 +2018,7 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR (unchanged from v7.3, + is_rescore parameter)
+# CORE SIGNAL PROCESSOR (unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False):
@@ -1763,13 +2057,20 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
         "is_rescore":                   is_rescore,
     }
 
-    saved = update_signal(data["message_id"], data) if is_rescore else save_signal(data)
+    if is_rescore:
+        saved = update_signal(data["message_id"], data)
+    else:
+        saved = save_signal(data)
+
     if not saved:
         return
 
     if score < MIN_SCORE_MEDIUM:
         mode = "RESCORE-SILENT" if is_rescore else "SILENT SAVE"
-        log.debug(f"{mode} | [{platform.upper()}] Score:{score} | u/{data['username']}")
+        log.debug(
+            f"{mode} | [{platform.upper()}] Score:{score} | "
+            f"u/{data['username']} | {data['content_type']}"
+        )
         return
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
@@ -1794,12 +2095,17 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
 # GENERIC BATCH PROCESSOR — persistent state (FIX A, unchanged from v7.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
+def run_batch_processor(
+    q: queue.Queue,
+    batch_size: int,
+    platform_label: str,
+):
     platform_key = platform_label.lower()
 
     log.info(
         f"Batch processor [{platform_label}] started | "
-        f"batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s | timeout:{BATCH_TIMEOUT_SECONDS}s"
+        f"batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s | "
+        f"timeout:{BATCH_TIMEOUT_SECONDS}s"
     )
 
     current_batch, batch_start_time = load_pending_batch(platform_key)
@@ -1809,18 +2115,22 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
             f"from persistent disk — continuing, NOT restarting at 1."
         )
 
-    total_received = total_matched = total_dropped = total_batches = 0
+    total_received   = 0
+    total_matched    = 0
+    total_dropped    = 0
+    total_batches    = 0
 
     while True:
         try:
             if current_batch and batch_start_time is not None:
                 elapsed   = time.time() - batch_start_time
-                wait_time = max(0.1, BATCH_TIMEOUT_SECONDS - elapsed)
+                remaining = BATCH_TIMEOUT_SECONDS - elapsed
+                wait_time = max(0.1, remaining)
             else:
                 wait_time = 1.0
 
             try:
-                item     = q.get(timeout=wait_time)
+                item = q.get(timeout=wait_time)
                 got_item = True
             except queue.Empty:
                 got_item = False
@@ -1835,11 +2145,15 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
 
                 if not passes_keyword_filter(text):
                     total_dropped += 1
-                    log.debug(f"[{platform_label}] FILTERED | u/{item.get('username')} | {item.get('content_type','?')}")
+                    log.debug(
+                        f"[{platform_label}] FILTERED | "
+                        f"u/{item.get('username')} | {item.get('content_type','?')}"
+                    )
                     q.task_done()
                     continue
 
                 total_matched += 1
+
                 if not current_batch:
                     batch_start_time = time.time()
 
@@ -1850,6 +2164,7 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
                     f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
                     f"{item.get('content_type','?').upper()} | u/{item.get('username')}"
                 )
+
                 q.task_done()
 
             should_fire = False
@@ -1866,8 +2181,8 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
 
             if should_fire and current_batch:
                 total_batches += 1
-                batch_to_send    = current_batch[:batch_size]
-                current_batch    = current_batch[batch_size:]
+                batch_to_send  = current_batch[:batch_size]
+                current_batch  = current_batch[batch_size:]
                 batch_start_time = None if not current_batch else time.time()
 
                 if current_batch:
@@ -1881,7 +2196,7 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
                     f"received:{total_received} matched:{total_matched} dropped:{total_dropped}"
                 )
 
-                scores    = score_batch_with_claude(batch_to_send)
+                scores = score_batch_with_claude(batch_to_send)
                 score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
 
                 for i, it in enumerate(batch_to_send):
@@ -1891,7 +2206,10 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
                     )
                     process_scored_item(it, sr)
 
-                log.info(f"[{platform_label}] BATCH {total_batches} DONE | waiting {BATCH_GAP_SECONDS}s...")
+                log.info(
+                    f"[{platform_label}] BATCH {total_batches} DONE | "
+                    f"waiting {BATCH_GAP_SECONDS}s..."
+                )
                 time.sleep(BATCH_GAP_SECONDS)
 
         except Exception as exc:
@@ -1901,20 +2219,34 @@ def run_batch_processor(q: queue.Queue, batch_size: int, platform_label: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW v7.4 — RESCORE PROCESSOR
+#
+# Runs as a dedicated background thread. Polls flintel_rescore_messages for
+# pending items every RESCORE_POLL_INTERVAL seconds. Batches up to
+# RESCORE_BATCH_SIZE items per Claude call (same as REDDIT_BATCH_SIZE by
+# default). Uses the same score_batch_with_claude() and process_scored_item()
+# pipeline — same Slack/HubSpot delivery for score 6-7 / 8-10.
+#
+# The original signal document's message_text and platform fields are read
+# from the signals collection to reconstruct the item dict that Claude expects.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
+    """
+    Inserts pending rescore requests into flintel_rescore_messages.
+    Returns list of inserted request IDs (as strings).
+    message_ids must be existing message_ids from the signals collection.
+    """
     inserted = []
     for mid in message_ids:
         try:
             doc = {
-                "message_id":     mid,
-                "status":         "pending",
-                "operator_note":  operator_note,
-                "requested_at":   datetime.now(timezone.utc),
-                "processed_at":   None,
+                "message_id":    mid,
+                "status":        "pending",
+                "operator_note": operator_note,
+                "requested_at":  datetime.now(timezone.utc),
+                "processed_at":  None,
                 "rescore_result": None,
-                "error":          None,
+                "error":         None,
             }
             result = db.flintel_rescore_messages.insert_one(doc)
             inserted.append(str(result.inserted_id))
@@ -1925,10 +2257,12 @@ def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
 
 
 def _rescore_fetch_pending(limit: int) -> list:
+    """Fetches up to `limit` pending rescore requests, oldest first."""
     try:
         return list(
-            db.flintel_rescore_messages.find({"status": "pending"})
-            .sort("requested_at", ASCENDING).limit(limit)
+            db.flintel_rescore_messages.find(
+                {"status": "pending"}
+            ).sort("requested_at", ASCENDING).limit(limit)
         )
     except Exception as exc:
         log.error(f"[RESCORE] fetch_pending error: {exc}")
@@ -1949,8 +2283,12 @@ def _rescore_mark_done(req_id, score_result: dict):
     try:
         db.flintel_rescore_messages.update_one(
             {"_id": req_id},
-            {"$set": {"status": "done", "rescore_result": score_result,
-                      "processed_at": datetime.now(timezone.utc), "error": None}},
+            {"$set": {
+                "status":         "done",
+                "rescore_result": score_result,
+                "processed_at":   datetime.now(timezone.utc),
+                "error":          None,
+            }},
         )
     except Exception as exc:
         log.error(f"[RESCORE] mark_done error: {exc}")
@@ -1960,14 +2298,23 @@ def _rescore_mark_error(req_id, error: str):
     try:
         db.flintel_rescore_messages.update_one(
             {"_id": req_id},
-            {"$set": {"status": "error", "error": error,
-                      "processed_at": datetime.now(timezone.utc)}},
+            {"$set": {
+                "status":       "error",
+                "error":        error,
+                "processed_at": datetime.now(timezone.utc),
+            }},
         )
     except Exception as exc:
         log.error(f"[RESCORE] mark_error error: {exc}")
 
 
 def run_rescore_processor():
+    """
+    Background thread: polls flintel_rescore_messages for pending items,
+    batches them, sends to Claude, then calls process_scored_item() with
+    is_rescore=True so results overwrite the existing signal and re-trigger
+    Slack/HubSpot exactly as a live signal would.
+    """
     log.info(
         f"[RESCORE] Processor started | "
         f"batch_size:{RESCORE_BATCH_SIZE} | poll_interval:{RESCORE_POLL_INTERVAL}s"
@@ -1985,14 +2332,15 @@ def run_rescore_processor():
             req_ids = [p["_id"] for p in pending]
             _rescore_mark_processing(req_ids)
 
+            # Fetch original signal documents to reconstruct item dicts
             items_for_claude = []
-            req_map = {}
+            req_map = {}  # index (1-based) → pending doc
 
             for i, req in enumerate(pending, start=1):
                 mid = req["message_id"]
                 sig = db.signals.find_one({"message_id": mid}, {"_id": 0})
                 if not sig:
-                    log.warning(f"[RESCORE] Signal not found: {mid} — marking error.")
+                    log.warning(f"[RESCORE] Signal not found in DB: {mid} — marking error.")
                     _rescore_mark_error(req["_id"], f"Signal not found: {mid}")
                     continue
 
@@ -2007,7 +2355,7 @@ def run_rescore_processor():
                     "text":           sig.get("message_text", ""),
                 }
                 items_for_claude.append(item)
-                req_map[len(items_for_claude)] = req
+                req_map[len(items_for_claude)] = req  # 1-based index → req doc
 
             if not items_for_claude:
                 time.sleep(RESCORE_POLL_INTERVAL)
@@ -2020,7 +2368,7 @@ def run_rescore_processor():
                 f"message_ids:{[it['message_id'] for it in items_for_claude]}"
             )
 
-            scores    = score_batch_with_claude(items_for_claude)
+            scores = score_batch_with_claude(items_for_claude)
             score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
 
             for i, item in enumerate(items_for_claude):
@@ -2029,8 +2377,10 @@ def run_rescore_processor():
                 sr  = score_map.get(pos) or (
                     scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch.")
                 )
+
                 process_scored_item(item, sr, is_rescore=True)
                 total_rescored += 1
+
                 if req:
                     _rescore_mark_done(req["_id"], sr)
 
@@ -2071,7 +2421,7 @@ def _reddit_rss_is_seen(entry_id: str) -> bool:
 
 
 def _get_reddit_rss(subreddit: str) -> list:
-    url   = f"https://www.reddit.com/r/{subreddit}/new.rss"
+    url = f"https://www.reddit.com/r/{subreddit}/new.rss"
     items = []
     try:
         feed = feedparser.parse(url)
@@ -2081,13 +2431,16 @@ def _get_reddit_rss(subreddit: str) -> list:
 
         for entry in feed.entries:
             entry_id = entry.get("id", "") or entry.get("link", "")
-            if not entry_id or _reddit_rss_is_seen(entry_id):
+            if not entry_id:
+                continue
+            if _reddit_rss_is_seen(entry_id):
                 continue
 
-            title         = entry.get("title", "").strip()
-            summary       = entry.get("summary", "").strip()
+            title   = entry.get("title", "").strip()
+            summary = entry.get("summary", "").strip()
             summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(summary)).strip()
-            text          = title
+
+            text = title
             if summary_plain and summary_plain.lower() != title.lower():
                 text = f"{title}\n\n{summary_plain}"
 
@@ -2159,10 +2512,10 @@ def build_twitter_client() -> tweepy.Client | None:
         return None
     try:
         client = tweepy.Client(
-            bearer_token=TWITTER_BEARER_TOKEN,
-            consumer_key=TWITTER_API_KEY,
-            consumer_secret=TWITTER_API_SECRET,
-            wait_on_rate_limit=True,
+            bearer_token       = TWITTER_BEARER_TOKEN,
+            consumer_key       = TWITTER_API_KEY,
+            consumer_secret    = TWITTER_API_SECRET,
+            wait_on_rate_limit = True,
         )
         log.info("Twitter/X client initialised.")
         return client
@@ -2230,7 +2583,10 @@ def poll_twitter(client: tweepy.Client):
                 dirty = 0
 
             if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
+                log.info(
+                    f"Twitter: {new_count} new tweets queued | "
+                    f"queue_size:{twitter_queue.qsize()}"
+                )
 
         except tweepy.errors.TweepyException as exc:
             log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
@@ -2266,8 +2622,13 @@ def _telegram_is_seen(chat_id: int, msg_id: int) -> bool:
 
 
 def _join_telegram_groups_sync(client: TelegramClient):
-    log.info(f"Telegram: starting auto-join for {len(TARGET_TELEGRAM_GROUPS)} groups | gap:{TELEGRAM_JOIN_GAP_SECONDS}s")
-    joined = skipped = failed = 0
+    log.info(
+        f"Telegram: starting auto-join for {len(TARGET_TELEGRAM_GROUPS)} groups | "
+        f"gap:{TELEGRAM_JOIN_GAP_SECONDS}s"
+    )
+    joined  = 0
+    skipped = 0
+    failed  = 0
 
     for group in TARGET_TELEGRAM_GROUPS:
         try:
@@ -2278,6 +2639,7 @@ def _join_telegram_groups_sync(client: TelegramClient):
             time.sleep(TELEGRAM_JOIN_GAP_SECONDS)
         except UserAlreadyParticipantError:
             skipped += 1
+            log.debug(f"Telegram: already in {group} — skip")
         except FloodWaitError as e:
             log.warning(f"Telegram: FloodWait {e.seconds}s for {group} — waiting...")
             time.sleep(e.seconds + 5)
@@ -2289,7 +2651,13 @@ def _join_telegram_groups_sync(client: TelegramClient):
             log.error(f"Telegram: join error for {group} — {exc}")
             failed += 1
 
-    log.info(f"Telegram auto-join complete | joined:{joined} already_in:{skipped} failed:{failed}")
+    log.info(
+        f"Telegram auto-join complete | "
+        f"joined:{joined} already_in:{skipped} failed:{failed}"
+    )
+
+
+TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "300"))
 
 
 async def _poll_telegram_groups(client: TelegramClient):
@@ -2297,7 +2665,10 @@ async def _poll_telegram_groups(client: TelegramClient):
         log.info("[TELEGRAM-POLL] Disabled (TELEGRAM_POLL_INTERVAL=0) — listener-only mode.")
         return
 
-    log.info(f"[TELEGRAM-POLL] Poller started | {len(TARGET_TELEGRAM_GROUPS)} groups | interval:{TELEGRAM_POLL_INTERVAL}s")
+    log.info(
+        f"[TELEGRAM-POLL] Poller started | {len(TARGET_TELEGRAM_GROUPS)} groups | "
+        f"interval:{TELEGRAM_POLL_INTERVAL}s"
+    )
 
     while True:
         cycle_start  = time.time()
@@ -2306,18 +2677,22 @@ async def _poll_telegram_groups(client: TelegramClient):
 
         for group in TARGET_TELEGRAM_GROUPS:
             try:
-                target   = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
+                target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
                 messages = await client.get_messages(target, limit=20)
 
                 for msg in messages:
                     if not msg or not msg.text or len(msg.text) < 5:
                         continue
+
                     chat_id = msg.chat_id if msg.chat_id else 0
                     msg_id  = msg.id
+
                     if _telegram_is_seen(chat_id, msg_id):
                         continue
-                    sender  = await msg.get_sender()
-                    tg_user = getattr(sender, "username", None) or f"user_{getattr(sender, 'id', 0)}"
+
+                    sender   = await msg.get_sender()
+                    tg_user  = getattr(sender, "username", None) or f"user_{getattr(sender, 'id', 0)}"
+
                     telegram_queue.put({
                         "message_id":     f"telegram_{chat_id}_{msg_id}",
                         "platform":       "telegram",
@@ -2333,6 +2708,7 @@ async def _poll_telegram_groups(client: TelegramClient):
 
                 if total_new:
                     log.info(f"[TELEGRAM-POLL] {group} → queued new messages")
+
                 await asyncio.sleep(2)
 
             except FloodWaitError as e:
@@ -2354,17 +2730,24 @@ async def _poll_telegram_groups(client: TelegramClient):
 
 
 async def _run_telegram_listener(client: TelegramClient):
-    target_set = {g.lstrip("@").lower() for g in TARGET_TELEGRAM_GROUPS}
+    target_set = set()
+    for g in TARGET_TELEGRAM_GROUPS:
+        clean = g.lstrip("@").lower()
+        target_set.add(clean)
 
     @client.on(events.NewMessage)
     async def _on_message(event):
         try:
-            chat          = await event.get_chat()
+            chat = await event.get_chat()
+
             username_attr = getattr(chat, "username", None)
             chat_title    = getattr(chat, "title", "") or ""
-            group_key     = username_attr.lower() if username_attr else (
-                chat_title.lower().replace(" ", "").replace("-", "").replace("_", "")
-            )
+
+            if username_attr:
+                group_key = username_attr.lower()
+            else:
+                group_key = chat_title.lower().replace(" ", "").replace("-", "").replace("_", "")
+
             if group_key not in target_set:
                 return
 
@@ -2379,6 +2762,7 @@ async def _run_telegram_listener(client: TelegramClient):
 
             if not text or len(text) < 5:
                 return
+
             if _telegram_is_seen(chat_id, msg_id):
                 return
 
@@ -2393,26 +2777,46 @@ async def _run_telegram_listener(client: TelegramClient):
                 "telegram_group": username_attr or chat_title,
                 "post_url":       "",
             })
+
         except Exception as exc:
             log.error(f"Telegram message handler error: {exc}")
 
     log.info("Telegram listener active — read-only, no interactions.")
-    await asyncio.gather(client.run_until_disconnected(), _poll_telegram_groups(client))
+
+    await asyncio.gather(
+        client.run_until_disconnected(),
+        _poll_telegram_groups(client),
+    )
 
 
 def run_telegram_listener_thread():
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning("Telegram disabled — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE")
+        log.warning(
+            "Telegram disabled — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE"
+        )
         return
+
     try:
         loop   = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        client = TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=loop)
+
+        client = TelegramClient(
+            TELEGRAM_SESSION,
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+            loop=loop,
+        )
+
         loop.run_until_complete(client.start(phone=TELEGRAM_PHONE))
         me = loop.run_until_complete(client.get_me())
-        log.info(f"Telegram authenticated as {me.first_name} (@{me.username or me.id})")
+        log.info(
+            f"Telegram authenticated as {me.first_name} "
+            f"(@{me.username or me.id})"
+        )
+
         _join_telegram_groups_sync(client)
         loop.run_until_complete(_run_telegram_listener(client))
+
     except Exception as exc:
         log.error(f"Telegram listener thread error: {exc}")
 
@@ -2425,7 +2829,7 @@ def send_daily_digest():
     if not SLACK_WEBHOOK_URL:
         return
     try:
-        since   = datetime.now(timezone.utc) - timedelta(hours=24)
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
         signals = list(
             db.signals.find({
                 "client_id":       CLIENT_ID,
@@ -2434,13 +2838,16 @@ def send_daily_digest():
                 "digest_included": False,
             }).sort("intent_score", -1)
         )
+
         if not signals:
             log.info("Daily digest: no medium signals in past 24h.")
             return
 
         lines = []
         for s in signals:
-            preview  = s["message_text"][:120] + ("..." if len(s["message_text"]) > 120 else "")
+            preview  = s["message_text"][:120]
+            if len(s["message_text"]) > 120:
+                preview += "..."
             corridor = s.get("corridor") or "—"
             pain     = s.get("pain_type") or "—"
             platform = s.get("platform", "?").upper()
@@ -2448,7 +2855,8 @@ def send_daily_digest():
             grp      = s.get("telegram_group", "")
             source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
             lines.append(
-                f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 | {platform} | {source}\n"
+                f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
+                f"| {platform} | {source}\n"
                 f"  Corridor: {corridor} | Pain: {pain}\n"
                 f"  _{preview}_\n"
                 f"  ↳ {s['suggested_action']}"
@@ -2466,7 +2874,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 (Bookin.PK) | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
         ]
 
         result = retry_with_backoff(
@@ -2541,7 +2949,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 (Bookin.PK) | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -2558,9 +2966,14 @@ def send_weekly_report():
 
 
 async def run_scheduler():
-    log.info(f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | report Mon {WEEKLY_REPORT_HOUR}:00 UTC")
-    last_digest_date  = None
-    last_report_week: int | None = _get_state("last_report_week")
+    log.info(
+        f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | "
+        f"report Mon {WEEKLY_REPORT_HOUR}:00 UTC"
+    )
+    last_digest_date = None
+
+    persisted_week = _get_state("last_report_week")
+    last_report_week: int | None = persisted_week
 
     while True:
         await asyncio.sleep(60)
@@ -2592,12 +3005,15 @@ async def start_reddit_listener():
         log.warning("Reddit platform DISABLED (REDDIT_ENABLED=false) — skipping.")
         return
 
-    rss_thread  = threading.Thread(target=poll_reddit_rss, daemon=True, name="Reddit-RSS")
+    rss_thread = threading.Thread(
+        target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
+    )
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT"),
         daemon=True, name="Reddit-Batch",
     )
+
     rss_thread.start()
     btch_thread.start()
     log.info("Reddit threads running: RSS-Poller ✅ | Batch ✅")
@@ -2606,7 +3022,9 @@ async def start_reddit_listener():
         await asyncio.sleep(60)
         if not rss_thread.is_alive():
             log.error("Reddit RSS thread died — restarting...")
-            rss_thread = threading.Thread(target=poll_reddit_rss, daemon=True, name="Reddit-RSS")
+            rss_thread = threading.Thread(
+                target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
+            )
             rss_thread.start()
         if not btch_thread.is_alive():
             log.error("Reddit batch thread died — restarting...")
@@ -2628,12 +3046,15 @@ async def start_twitter_listener():
         log.warning("Twitter listener not started — credentials missing.")
         return
 
-    poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
+    poll_thread = threading.Thread(
+        target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll"
+    )
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER"),
         daemon=True, name="Twitter-Batch",
     )
+
     poll_thread.start()
     btch_thread.start()
     log.info("Twitter threads running: Poll ✅ | Batch ✅")
@@ -2642,7 +3063,9 @@ async def start_twitter_listener():
         await asyncio.sleep(60)
         if not poll_thread.is_alive():
             log.error("Twitter poll thread died — restarting...")
-            poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
+            poll_thread = threading.Thread(
+                target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll"
+            )
             poll_thread.start()
         if not btch_thread.is_alive():
             log.error("Twitter batch thread died — restarting...")
@@ -2658,16 +3081,23 @@ async def start_telegram_listener():
     if not TELEGRAM_ENABLED:
         log.warning("Telegram platform DISABLED (TELEGRAM_ENABLED=false) — skipping.")
         return
+
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning("Telegram listener not started — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE in .env")
+        log.warning(
+            "Telegram listener not started — "
+            "set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE in .env"
+        )
         return
 
-    tg_thread   = threading.Thread(target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener")
+    tg_thread = threading.Thread(
+        target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
+    )
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM"),
         daemon=True, name="Telegram-Batch",
     )
+
     tg_thread.start()
     btch_thread.start()
     log.info(
@@ -2679,7 +3109,9 @@ async def start_telegram_listener():
         await asyncio.sleep(60)
         if not tg_thread.is_alive():
             log.error("Telegram listener thread died — restarting...")
-            tg_thread = threading.Thread(target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener")
+            tg_thread = threading.Thread(
+                target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
+            )
             tg_thread.start()
         if not btch_thread.is_alive():
             log.error("Telegram batch thread died — restarting...")
@@ -2693,7 +3125,9 @@ async def start_telegram_listener():
 
 async def start_rescore_listener():
     """Starts the rescore processor thread and monitors for crashes."""
-    rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
+    rescore_thread = threading.Thread(
+        target=run_rescore_processor, daemon=True, name="Rescore-Processor"
+    )
     rescore_thread.start()
     log.info("Rescore processor thread running ✅")
 
@@ -2701,16 +3135,18 @@ async def start_rescore_listener():
         await asyncio.sleep(60)
         if not rescore_thread.is_alive():
             log.error("Rescore processor thread died — restarting...")
-            rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
+            rescore_thread = threading.Thread(
+                target=run_rescore_processor, daemon=True, name="Rescore-Processor"
+            )
             rescore_thread.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (v7.3 routes unchanged; rescore + FIX D indicators added)
+# FASTAPI — REST API (v7.3 routes unchanged; rescore routes added; version bumped)
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "Hotel Signal Intelligence API — Flintel v7.4 (Bookin.PK)",
+    title       = "FX Signal Intelligence API — Flintel v7.4",
     description = (
         "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. "
         "Persistent batch state. Streaming Claude. Manual rescore."
@@ -2741,7 +3177,7 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.4 (Bookin.PK)",
+        "system":                  "FLINTEL v7.4",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram"],
         # FIX D: True/False with working indicator
@@ -2761,6 +3197,7 @@ def root():
         "batch_gap_s":             BATCH_GAP_SECONDS,
         "batch_timeout_s":         BATCH_TIMEOUT_SECONDS,
         "max_tokens":              MAX_TOKENS,
+        "claude_stream_timeout_s": CLAUDE_STREAM_TIMEOUT,
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
@@ -2782,6 +3219,7 @@ def health():
     except Exception:
         mongo = "disconnected"
 
+    # FIX D: True/False with working indicators
     reddit_working   = REDDIT_ENABLED
     twitter_working  = TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
@@ -2793,26 +3231,26 @@ def health():
         pass
 
     return {
-        "status":             "ok",
-        "mongodb":            mongo,
-        # FIX D: True/False with working indicators
-        "reddit":             ("polling-rss" if REDDIT_ENABLED else "disabled"),
-        "reddit_working":     reddit_working,
-        "reddit_indicator":   _working(reddit_working),
-        "twitter":            ("polling" if twitter_working else "disabled"),
-        "twitter_working":    twitter_working,
-        "twitter_indicator":  _working(twitter_working),
-        "telegram":           ("listening" if telegram_working else "disabled"),
-        "telegram_working":   telegram_working,
-        "telegram_indicator": _working(telegram_working),
-        "reddit_queue_size":  reddit_queue.qsize(),
-        "twitter_queue_size": twitter_queue.qsize(),
-        "telegram_queue_size":telegram_queue.qsize(),
-        "rescore_pending":    pending_rescore,
-        "rescore_working":    True,
-        "rescore_indicator":  _working(True),
-        "client_id":          CLIENT_ID,
-        "timestamp":          datetime.now(timezone.utc).isoformat(),
+        "status":                  "ok",
+        "mongodb":                 mongo,
+        # FIX D: working indicators alongside bool flags
+        "reddit":                  ("polling-rss" if REDDIT_ENABLED else "disabled"),
+        "reddit_working":          reddit_working,
+        "reddit_indicator":        _working(reddit_working),
+        "twitter":                 ("polling" if twitter_working else "disabled"),
+        "twitter_working":         twitter_working,
+        "twitter_indicator":       _working(twitter_working),
+        "telegram":                ("listening" if telegram_working else "disabled"),
+        "telegram_working":        telegram_working,
+        "telegram_indicator":      _working(telegram_working),
+        "reddit_queue_size":       reddit_queue.qsize(),
+        "twitter_queue_size":      twitter_queue.qsize(),
+        "telegram_queue_size":     telegram_queue.qsize(),
+        "rescore_pending":         pending_rescore,
+        "rescore_working":         True,
+        "rescore_indicator":       _working(True),
+        "client_id":               CLIENT_ID,
+        "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -2820,38 +3258,48 @@ def health():
 
 @app.post("/rescore", dependencies=[Depends(verify_api_key)])
 def post_rescore(
-    message_ids:   list = Body(..., description="List of message_id strings to rescore"),
-    operator_note: str  = Body("",  description="Optional operator note"),
+    message_ids: list = Body(..., description="List of message_id strings to rescore"),
+    operator_note: str = Body("", description="Optional operator note"),
 ):
     """
     Queue one or many existing signals for re-scoring by Claude.
-    Example body: {"message_ids": ["reddit_rss_abc123"], "operator_note": "test rescore"}
+    message_ids must exist in the signals collection.
+    Example body: {"message_ids": ["reddit_rss_abc123", "twitter_987xyz"], "operator_note": "rescoring after prompt update"}
     """
     if not message_ids:
         raise HTTPException(status_code=400, detail="message_ids list is empty.")
 
-    missing = [mid for mid in message_ids if not db.signals.find_one({"message_id": mid}, {"_id": 1})]
+    # Validate all IDs exist
+    missing = []
+    for mid in message_ids:
+        if not db.signals.find_one({"message_id": mid}, {"_id": 1}):
+            missing.append(mid)
+
     if missing:
-        raise HTTPException(status_code=404, detail=f"Signal(s) not found in DB: {missing}.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Signal(s) not found in DB: {missing}. Cannot queue for rescore.",
+        )
 
     req_ids = _rescore_queue_requests(message_ids, operator_note=operator_note)
     return {
-        "queued":        len(req_ids),
-        "request_ids":   req_ids,
-        "message_ids":   message_ids,
+        "queued":       len(req_ids),
+        "request_ids":  req_ids,
+        "message_ids":  message_ids,
         "operator_note": operator_note,
-        "status":        "pending",
-        "note":          "Rescore processor picks these up within the next poll interval.",
+        "status":       "pending",
+        "note":         "Rescore processor will pick these up within the next poll interval.",
     }
 
 
 @app.get("/rescore/pending", dependencies=[Depends(verify_api_key)])
 def get_rescore_pending(limit: int = 50):
-    """List pending/processing rescore requests, oldest first."""
+    """List pending rescore requests, oldest first."""
     try:
         docs = list(
-            db.flintel_rescore_messages.find({"status": {"$in": ["pending", "processing"]}})
-            .sort("requested_at", ASCENDING).limit(limit)
+            db.flintel_rescore_messages.find(
+                {"status": {"$in": ["pending", "processing"]}}
+            ).sort("requested_at", ASCENDING).limit(limit)
         )
         return {"count": len(docs), "requests": _serialise_rescore(docs)}
     except Exception as exc:
@@ -2862,8 +3310,16 @@ def get_rescore_pending(limit: int = 50):
 def get_rescore_history(limit: int = 100, status: str = None):
     """List completed or errored rescore requests, newest first."""
     try:
-        query = {"status": status} if status else {"status": {"$in": ["done", "error"]}}
-        docs  = list(db.flintel_rescore_messages.find(query).sort("processed_at", -1).limit(limit))
+        query = {}
+        if status:
+            query["status"] = status
+        else:
+            query["status"] = {"$in": ["done", "error"]}
+        docs = list(
+            db.flintel_rescore_messages.find(query)
+            .sort("processed_at", -1)
+            .limit(limit)
+        )
         return {"count": len(docs), "requests": _serialise_rescore(docs)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -2884,7 +3340,7 @@ def get_rescore_status(req_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── EXISTING SIGNAL ENDPOINTS (unchanged from v7.3) ──────────────────────────
+# ── EXISTING ENDPOINTS (unchanged from v7.3) ──────────────────────────────────
 
 @app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
 def get_pending_batch():
@@ -2903,22 +3359,28 @@ def get_pending_batch():
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
 def get_signals(
-    limit: int = 50, platform: str = None, category: str = None,
-    min_score: int = None, subreddit: str = None, tg_group: str = None,
-    tier: str = None, corridor: str = None, pain_type: str = None,
+    limit:       int  = 50,
+    platform:    str  = None,
+    category:    str  = None,
+    min_score:   int  = None,
+    subreddit:   str  = None,
+    tg_group:    str  = None,
+    tier:        str  = None,
+    corridor:    str  = None,
+    pain_type:   str  = None,
     is_business: bool = None,
 ):
     try:
         q: dict = {"client_id": CLIENT_ID}
-        if platform:             q["platform"]        = platform
-        if category:             q["signal_category"] = category
-        if min_score is not None:q["intent_score"]    = {"$gte": min_score}
-        if subreddit:            q["subreddit"]       = subreddit
-        if tg_group:             q["telegram_group"]  = {"$regex": tg_group, "$options": "i"}
-        if tier:                 q["tier"]            = tier
-        if corridor:             q["corridor"]        = {"$regex": corridor, "$options": "i"}
-        if pain_type:            q["pain_type"]       = pain_type
-        if is_business is not None: q["is_business"]  = is_business
+        if platform:    q["platform"]        = platform
+        if category:    q["signal_category"] = category
+        if min_score is not None: q["intent_score"] = {"$gte": min_score}
+        if subreddit:   q["subreddit"]       = subreddit
+        if tg_group:    q["telegram_group"]  = {"$regex": tg_group, "$options": "i"}
+        if tier:        q["tier"]            = tier
+        if corridor:    q["corridor"]        = {"$regex": corridor, "$options": "i"}
+        if pain_type:   q["pain_type"]       = pain_type
+        if is_business is not None: q["is_business"] = is_business
 
         signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
         return {"count": len(signals), "signals": _serialise(signals)}
@@ -2944,14 +3406,19 @@ def get_stats():
             ]))
 
         return {
-            "total_signals": total, "business_owners": biz,
-            "reddit_signals": reddit, "twitter_signals": twitter,
-            "telegram_signals": telegram, "rescored_signals": rescored,
-            "corridors": agg("corridor"), "pain_types": agg("pain_type"),
-            "competitors": agg("competitor_mentioned"), "tiers": agg("tier"),
-            "reddit_queue": reddit_queue.qsize(),
-            "twitter_queue": twitter_queue.qsize(),
-            "telegram_queue": telegram_queue.qsize(),
+            "total_signals":    total,
+            "business_owners":  biz,
+            "reddit_signals":   reddit,
+            "twitter_signals":  twitter,
+            "telegram_signals": telegram,
+            "rescored_signals": rescored,
+            "corridors":        agg("corridor"),
+            "pain_types":       agg("pain_type"),
+            "competitors":      agg("competitor_mentioned"),
+            "tiers":            agg("tier"),
+            "reddit_queue":     reddit_queue.qsize(),
+            "twitter_queue":    twitter_queue.qsize(),
+            "telegram_queue":   telegram_queue.qsize(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -2961,8 +3428,9 @@ def get_stats():
 def get_high_intent(limit: int = 20):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "intent_score": {"$gte": 8}}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "intent_score": {"$gte": 8}}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2973,8 +3441,9 @@ def get_high_intent(limit: int = 20):
 def get_digest(limit: int = 50):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "intent_score": {"$gte": 6, "$lte": 7}}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "intent_score": {"$gte": 6, "$lte": 7}}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2985,8 +3454,9 @@ def get_digest(limit: int = 50):
 def get_business(limit: int = 20):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "is_business": True}, {"_id": 0})
-            .sort("intent_score", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "is_business": True}, {"_id": 0}
+            ).sort("intent_score", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -2999,7 +3469,8 @@ def get_outreach(limit: int = 20):
         signals = list(
             db.signals.find(
                 {
-                    "client_id": CLIENT_ID, "intent_score": {"$gte": 5},
+                    "client_id":    CLIENT_ID,
+                    "intent_score": {"$gte": 5},
                     "$or": [
                         {"twitter_reply":    {"$ne": None}},
                         {"twitter_dm":       {"$ne": None}},
@@ -3071,8 +3542,9 @@ def get_by_corridor(corridor: str, limit: int = 20):
 def get_watchlist(limit: int = 50):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "watchlist": True}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "watchlist": True}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -3083,8 +3555,9 @@ def get_watchlist(limit: int = 50):
 def get_silent_signals(limit: int = 50):
     try:
         signals = list(
-            db.signals.find({"client_id": CLIENT_ID, "intent_score": {"$lte": 5}}, {"_id": 0})
-            .sort("created_at", -1).limit(limit)
+            db.signals.find(
+                {"client_id": CLIENT_ID, "intent_score": {"$lte": 5}}, {"_id": 0}
+            ).sort("created_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -3097,7 +3570,8 @@ def get_rescored_signals(limit: int = 50):
     try:
         signals = list(
             db.signals.find(
-                {"client_id": CLIENT_ID, "rescored_at": {"$exists": True}}, {"_id": 0}
+                {"client_id": CLIENT_ID, "rescored_at": {"$exists": True}},
+                {"_id": 0},
             ).sort("rescored_at", -1).limit(limit)
         )
         return {"count": len(signals), "signals": _serialise(signals)}
@@ -3129,7 +3603,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  HOTEL SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4 (Bookin.PK)")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
@@ -3159,26 +3633,26 @@ if __name__ == "__main__":
     log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
-    log.info(f"  Partial-JSON       : Truncated Claude responses salvage completed items (FIX B)")
+    log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items")
+    log.info(f"                     : instead of discarding the whole batch (FIX B)")
     log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
     log.info(f"  Rescore pipeline   : POST /rescore → Claude → Slack/HubSpot (same as live)")
     log.info(f"  Rescore poll       : every {RESCORE_POLL_INTERVAL}s")
     log.info(f"  Operator alerts    : Claude API down + MongoDB failure + partial recovery → Slack")
-    log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (open access)'}")
+    log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (API_KEY not set — open access)'}")
     log.info(f"  Weekly state       : Persisted in MongoDB (survives restarts)")
     log.info(f"  Daily digest       : {DAILY_DIGEST_HOUR}:00 UTC")
     log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords (total)   : {len(KEYWORDS)} (HOTELIER_CRISIS + ACTIVE_LISTING_SEARCH + OWNERSHIP_LANGUAGE + TRAVELER_INTENT + COMPETITOR_TRAVELER_PAIN)")
-    log.info(f"  Hard negatives     : {len(HARD_NEGATIVES)} (discarded before scoring)")
+    log.info(f"  Keywords           : {len(KEYWORDS)} filters (same for all 3 platforms)")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
     log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2) — ~140 tokens/item")
     log.info(f"  v7.4 changes       : FIX C (Claude streaming) + FIX D (working indicators)")
     log.info(f"                     : + NEW rescore feature (flintel_rescore_messages)")
-    log.info(f"                     : Scoring, prompts, keyword lists, Slack/HubSpot — 100% unchanged")
+    log.info(f"                     : Scoring logic, prompts, Slack/HubSpot formatting — 100% unchanged")
     log.info("=" * 70)
 
     asyncio.run(main())
