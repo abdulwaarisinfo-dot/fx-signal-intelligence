@@ -1,44 +1,80 @@
 """
-FX Signal Intelligence System — FLINTEL v7.4.1
+FX Signal Intelligence System — FLINTEL v7.4.3
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
-Pipeline  : 
-  Reddit   → Poll /new.rss per subreddit via feedparser (no PRAW, no credentials)
-  Twitter  → Fetch mentions / search / replies (rate-limit safe, 50/block)
-  Telegram → Listen to group messages (human account, Telethon, read-only)
-      ↓
-  Keyword Pre-Filter        (free, fast — drops 80%+ noise)
-      ↓
-  Batch Collector:
-    Reddit   — N items per Claude call  (or timeout)
-    Twitter  — N items per Claude call  (or timeout)
-    Telegram — N items per Claude call  (or timeout)
-      ↓
-  Gap                       (between each batch)
-      ↓
-  Claude AI Intent Scorer   (single merged prompt per batch, platform-specific schema)
-      ↓
-  MongoDB Storage           (ALL scores 1-10 saved — nothing discarded)
-      ↓
-  Slack Alert               (score 6-10, professional blocks)
-      ↓
-  HubSpot CRM               (score 8-10 only)
-      ↓
-  FastAPI REST Endpoints
-      ↓
-  Daily Digest Scheduler    (score 6-7, 08:00 UTC)
-      ↓
-  Weekly Report Scheduler   (all signals, Monday 09:00 UTC)
 
-Score rules:
-  1-5  → SAVED to MongoDB only — never alerted
-  6-7  → MEDIUM  — MongoDB + Slack only
-  8-10 → HIGH    — MongoDB + Slack + HubSpot
+Changelog v7.4.3 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.2):
 
-Everything above is UNCHANGED from v7.4: same scoring logic, same prompts,
-same JSON output schema per platform, same Slack/MongoDB behavior,
-same FastAPI routes, same thresholds, same FIX A, same FIX B, same FIX C,
-same FIX D, same rescore feature.
+  CHANGE — NUMERIC SCORE NO LONGER DISPLAYED IN SLACK MESSAGE OR HUBSPOT NOTE.
+
+           In v7.4.2, the Slack alert header/body and the HubSpot note both
+           showed the raw "intent_score" number (e.g. "Score 9/10"). This
+           change removes that NUMBER from what is rendered to a human
+           reading Slack or HubSpot. The underlying score:
+
+             — is still computed by Claude exactly as before
+             — is still stored in MongoDB on every signal, exactly as before
+               (nothing changed in save_signal / update_signal)
+             — still drives ALL routing decisions exactly as before
+               (MIN_SCORE_MEDIUM / MIN_SCORE_HIGH, Slack-or-not,
+               HubSpot-or-not — all unchanged, still score-driven)
+             — is still sent to HubSpot as the "fx_intent_score" CONTACT
+               PROPERTY (so it remains queryable/filterable inside HubSpot
+               CRM lists/workflows) — only the human-readable NOTE text and
+               the Slack message text no longer print the number
+
+           Routing is 100% unchanged from v7.4.2:
+             Score 1-3  → MongoDB only. No Slack. No HubSpot.
+             Score 4-7  → MongoDB + Slack + HubSpot (MEDIUM, Slack/Digest tier).
+             Score 8-10 → MongoDB + Slack + HubSpot (HIGH tier).
+
+           What changed concretely (both purely cosmetic, no control flow):
+             1. send_slack_alert(): header text and the "Score" field in the
+                Slack block no longer include the intent_score number. Tier
+                label (MEDIUM/HIGH) and category are still shown so the
+                signal's priority is still obvious at a glance — just not
+                the literal X/10 number.
+             2. _hs_create_note(): the HubSpot note body text no longer
+                prints "Score: X/10". The note still includes everything
+                else (tier, category, corridor, amount, etc).
+
+           NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB storage
+           (including the stored intent_score field on every document),
+           HubSpot fx_intent_score CONTACT PROPERTY, FastAPI routes
+           (including /signals which still returns intent_score in the
+           JSON, since that is an API for operators, not a "human-facing
+           display"), thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
+           keyword list, FIX A (persistent batch state), FIX B (partial-JSON
+           recovery), FIX C (Claude streaming), FIX D (working indicators),
+           FIX E (HubSpot error visibility + startup property check), and
+           the rescore feature are byte-for-byte identical to v7.4.2.
+
+Changelog v7.4.2 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.1):
+
+  CHANGE — HUBSPOT NOW RECEIVES MEDIUM INTENT SIGNALS (score 4-7) IN ADDITION
+            TO HIGH INTENT (score 8-10).
+
+            In v7.4.1 HubSpot only received score 8-10 signals. Slack received
+            score 4-10. This created an asymmetry where medium signals were
+            visible in Slack but not in HubSpot CRM.
+
+            Fix: in process_scored_item(), the medium branch
+            (MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH) now calls
+            send_to_hubspot() and mark_hubspot_alerted() in exactly the same
+            way the high branch always did. The high branch is unchanged.
+
+            New routing (confirmed):
+              Score 1-3  → MongoDB only. No Slack. No HubSpot.
+              Score 4-7  → MongoDB + Slack + HubSpot.
+              Score 8-10 → MongoDB + Slack + HubSpot.
+
+            NOTHING ELSE CHANGED. Scoring logic, prompts, Slack block
+            formatting, HubSpot contact/note FIELD VALUES, FastAPI routes,
+            thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8), keyword list,
+            FIX A (persistent batch state), FIX B (partial-JSON recovery),
+            FIX C (Claude streaming), FIX D (working indicators), FIX E
+            (HubSpot error visibility + startup property check), and the
+            rescore feature are byte-for-byte identical to v7.4.1.
 
 Changelog v7.4.1 (ONE FIX ONLY — everything else 100% unchanged from v7.4):
 
@@ -124,8 +160,9 @@ Changelog v7.4 (two fixes + one new feature — all v7.3 logic 100% unchanged):
            message_ids) for re-scoring by Claude. Rescore batches follow the
            same batch_size, gap, and timeout logic as live platform batches.
            After rescore, results overwrite the existing MongoDB signal document
-           and re-trigger the same Slack + HubSpot pipeline (score 6-7 → Slack,
-           score 8-10 → Slack + HubSpot) exactly as a live signal would.
+           and re-trigger the same Slack + HubSpot pipeline (score 4-7 → Slack
+           + HubSpot, score 8-10 → Slack + HubSpot) exactly as a live signal
+           would.
            Logs show "[RESCORE] batch N | items M" same style as live batches.
 
            MongoDB collection: flintel_rescore_messages
@@ -236,7 +273,7 @@ logging.basicConfig(
 log = logging.getLogger("flintel")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  (identical to v7.4)
+# CONFIGURATION  (identical to v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
@@ -258,9 +295,9 @@ MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
 
-# MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8 — confirmed defaults, unchanged from v7.4.
+# MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8 — confirmed defaults, unchanged from v7.4.2.
 # Score 1-3  → MongoDB only (silent save, no alerts)
-# Score 4-7  → MongoDB + Slack only
+# Score 4-7  → MongoDB + Slack + HubSpot
 # Score 8-10 → MongoDB + Slack + HubSpot
 MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
 MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
@@ -290,7 +327,7 @@ CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
 RESCORE_POLL_INTERVAL = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY AUTH (unchanged from v7.4)
+# API KEY AUTH (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.getenv("API_KEY", "")
@@ -366,7 +403,7 @@ twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1/v7.2/v7.3/v7.4)
+# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
@@ -680,7 +717,7 @@ def passes_keyword_filter(text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY (unchanged from v7.4)
+# TWITTER SEARCH QUERY (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
@@ -742,7 +779,7 @@ def _derive_fields(score: int) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Byte-for-byte identical to v7.4. Scoring logic untouched.
+# Byte-for-byte identical to v7.4.2. Scoring logic untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
@@ -1190,7 +1227,7 @@ def get_database():
             [("key", ASCENDING)], unique=True, name="state_key_unique"
         )
 
-        # FIX A: persistent batch state collections (unchanged from v7.3)
+        # FIX A: persistent batch state collections (unchanged from v7.4.2)
         db.flintel_pending_batch.create_index(
             [("platform", ASCENDING)], unique=True, name="platform_unique"
         )
@@ -1258,7 +1295,9 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged from v7.4)
+# OPERATOR SLACK ALERT (unchanged from v7.4.2 — these are operator/system
+# alerts, not signal alerts, so they were never in scope for the score
+# display change)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -1281,7 +1320,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.1"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.3"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1301,7 +1340,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged from v7.4)
+# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -1390,7 +1429,7 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE BATCH SCORER — FIX C: streaming transport, FIX B: partial-JSON recovery
-# Scoring logic, prompts, output schema — 100% unchanged from v7.4.
+# Scoring logic, prompts, output schema — 100% unchanged from v7.4.2.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -1446,7 +1485,7 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
     }
 
 
-# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged from v7.4)
+# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged from v7.4.2)
 
 def _strip_code_fences(raw: str) -> str:
     raw = raw.strip()
@@ -1459,7 +1498,7 @@ def _strip_code_fences(raw: str) -> str:
 def _salvage_partial_json_array(raw: str) -> list:
     """
     Walks a possibly-truncated JSON array and extracts every complete,
-    well-formed top-level object using brace-depth tracking. Unchanged from v7.4.
+    well-formed top-level object using brace-depth tracking. Unchanged from v7.4.2.
     """
     start = raw.find("[")
     if start == -1:
@@ -1511,7 +1550,7 @@ def _salvage_partial_json_array(raw: str) -> list:
 
 def _parse_claude_json(raw: str) -> tuple:
     """
-    Returns (results_list, was_truncated_bool). Unchanged from v7.4.
+    Returns (results_list, was_truncated_bool). Unchanged from v7.4.2.
     Tries full json.loads first, falls back to salvage on failure.
     """
     cleaned = _strip_code_fences(raw)
@@ -1534,7 +1573,7 @@ def _call_claude_batch(batch: list) -> list:
     FIX C: uses streaming context manager instead of blocking .create().
     The stream.get_final_text() collects the complete response text once
     generation finishes — identical string to what .create() returned.
-    Everything after raw text collection is byte-for-byte unchanged from v7.4.
+    Everything after raw text collection is byte-for-byte unchanged from v7.4.2.
     """
     platform = batch[0].get("platform", "reddit") if batch else "reddit"
 
@@ -1641,7 +1680,10 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE (unchanged from v7.4) — ALL scores 1-10 stored, nothing discarded
+# MONGODB STORAGE (unchanged from v7.4.2) — ALL scores 1-10 stored, nothing
+# discarded. The intent_score field is stored exactly as Claude returns it,
+# on every signal document, regardless of what Slack/HubSpot choose to
+# display to a human. This is intentionally untouched by the v7.4.3 change.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
@@ -1720,7 +1762,7 @@ def update_signal(message_id: str, data: dict) -> bool:
     in-place. Preserves message_id, message_text, platform, username, etc.
     Only score-derived fields are overwritten, same as a fresh save but via
     update_one instead of insert_one (since the document already exists).
-    Unchanged from v7.4.
+    Unchanged from v7.4.2.
     """
     try:
         update_fields = {
@@ -1790,7 +1832,7 @@ def mark_hubspot_alerted(message_id: str, contact_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEEKLY REPORT STATE PERSISTENCE (unchanged from v7.4)
+# WEEKLY REPORT STATE PERSISTENCE (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_state(key: str):
@@ -1814,7 +1856,14 @@ def _set_state(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY (unchanged from v7.4)
+# SLACK DELIVERY
+#
+# v7.4.3 CHANGE: the header text and the "Score" field no longer print the
+# numeric intent_score. Tier (MEDIUM/HIGH → shown as data.get("tier","").upper(),
+# e.g. "IMMEDIATE" / "DIGEST") and category are still shown, so priority is
+# still obvious — just not the literal "X/10" number. Everything else in this
+# function (fields shown, message text, outreach script, button, response
+# window logic which is still driven by `score` internally) is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -1835,7 +1884,7 @@ def send_slack_alert(data: dict) -> bool:
         log.warning("SLACK_WEBHOOK_URL not set — skipping.")
         return False
 
-    score       = data["intent_score"]
+    score       = data["intent_score"]  # still used internally to drive urgency_tag/response window — not printed
     platform    = data.get("platform", "unknown").upper()
     ctype       = data.get("content_type", "post").upper()
     subreddit   = data.get("subreddit", "")
@@ -1872,7 +1921,8 @@ def send_slack_alert(data: dict) -> bool:
 
     rescore_tag = " ♻️ RESCORED" if is_rescore else ""
     header_emoji = "🚨" if score >= 8 else "⚠️"
-    header_text  = f"{header_emoji} {category} — Score {score}/10 | {tier}{rescore_tag}"
+    # v7.4.3: header no longer prints "Score X/10" — tier + category still shown.
+    header_text  = f"{header_emoji} {category} — {tier}{rescore_tag}"
 
     if subreddit:
         source_label = f"r/{subreddit}"
@@ -1893,7 +1943,7 @@ def send_slack_alert(data: dict) -> bool:
                 {"type": "mrkdwn", "text": f"*Source*\n{source_label}"},
                 {"type": "mrkdwn", "text": f"*Content Type*\n{ctype}"},
                 {"type": "mrkdwn", "text": f"*User*\n{username}"},
-                {"type": "mrkdwn", "text": f"*Score*\n{score}/10"},
+                # v7.4.3: numeric score field removed — tier still shown
                 {"type": "mrkdwn", "text": f"*Tier*\n{tier}"},
                 {"type": "mrkdwn", "text": f"*Profile*\n{'✅ Business' if is_biz else '👤 Individual'}"},
                 {"type": "mrkdwn", "text": f"*Timestamp*\n{timestamp}"},
@@ -1953,6 +2003,8 @@ def send_slack_alert(data: dict) -> bool:
         retries=3, delay=2, label="Slack",
     )
     if result:
+        # Internal log still shows score — this is operator-facing log, not
+        # the Slack message itself, so it is unaffected by the v7.4.3 change.
         log.info(f"Slack sent | {platform} | u/{username} | Score:{score}")
         return True
     log.error("Slack delivery failed after all retries.")
@@ -1962,7 +2014,12 @@ def send_slack_alert(data: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # HUBSPOT CRM
 # v7.4.1 FIX E: real error-body logging added to every HubSpot call site.
-# All FIELD VALUES, all control flow, all retry behavior — unchanged from v7.4.
+# v7.4.2: medium signals now sent here too.
+# v7.4.3: the human-readable NOTE no longer prints "Score: X/10" in its text
+#         body. The fx_intent_score CONTACT PROPERTY (queryable/filterable
+#         field inside HubSpot) is unchanged and still sent — only the note's
+#         free-text rendering is altered. All other field VALUES, control
+#         flow, and retry behavior — unchanged from v7.4.2.
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -2088,7 +2145,10 @@ def _hs_find_contact(username: str) -> str | None:
 def _hs_create_contact(data: dict) -> str | None:
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
-        # Payload is byte-for-byte identical to v7.4 — same keys, same values.
+        # Payload is byte-for-byte identical to v7.4.2 — same keys, same values.
+        # fx_intent_score CONTACT PROPERTY is still sent so the score remains
+        # queryable/filterable inside HubSpot lists/workflows — only the
+        # human-readable note text (below, in _hs_create_note) drops the number.
         properties = {
             "firstname":           f"{data.get('username','unknown')}",
             "lastname":            f"{data.get('platform','?').upper()} Signal",
@@ -2125,10 +2185,12 @@ def _hs_create_note(data: dict, contact_id: str):
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
+        # v7.4.3: "Score:" line removed from the human-readable note body.
+        # Tier, category, and every other field are still included exactly
+        # as in v7.4.2 — only the literal "X/10" number is no longer printed.
         note = (
-            f"FLINTEL SIGNAL — v7.4.1{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.4.3{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
-            f"Score:        {data['intent_score']}/10\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
             f"Business:     {data.get('is_business', False)}\n"
@@ -2193,12 +2255,15 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR (unchanged from v7.4)
-# Confirmed routing, exactly as before:
-#   score < MIN_SCORE_MEDIUM (4)              → MongoDB only, no alerts
-#   MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH (4-7) → MongoDB + Slack only
+# CORE SIGNAL PROCESSOR
+#
+# Routing is 100% unchanged from v7.4.2 (still entirely score-driven):
+#   score < MIN_SCORE_MEDIUM (1-3)            → MongoDB only, no alerts
+#   MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH → MongoDB + Slack + HubSpot
 #   score >= MIN_SCORE_HIGH (8-10)            → MongoDB + Slack + HubSpot
-#     (same signal/message sent to BOTH Slack and HubSpot, not split)
+#
+# Only what Slack/HubSpot DISPLAY to a human changed (v7.4.3) — not whether
+# they are called, not when they are called, not what gets stored.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False):
@@ -2254,11 +2319,15 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
         return
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
+        # Medium signals go to Slack + HubSpot (unchanged routing from v7.4.2)
         mode = "RESCORE-MEDIUM" if is_rescore else "MEDIUM"
-        log.info(f"{mode} | [{platform.upper()}] Score:{score} | Slack only | u/{data['username']}")
+        log.info(f"{mode} | [{platform.upper()}] Score:{score} | Slack + HubSpot | u/{data['username']}")
         ok = send_slack_alert(data)
         if ok:
             mark_slack_alerted(data["message_id"])
+        cid = send_to_hubspot(data)
+        if cid:
+            mark_hubspot_alerted(data["message_id"], cid)
 
     elif score >= MIN_SCORE_HIGH:
         mode = "RESCORE-HIGH" if is_rescore else "HIGH"
@@ -2272,7 +2341,7 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — persistent state (FIX A, unchanged from v7.4)
+# GENERIC BATCH PROCESSOR — persistent state (FIX A, unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2398,13 +2467,13 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR (unchanged from v7.4)
+# RESCORE PROCESSOR (unchanged from v7.4.2)
 #
 # Runs as a dedicated background thread. Polls flintel_rescore_messages for
 # pending items every RESCORE_POLL_INTERVAL seconds. Batches up to
 # RESCORE_BATCH_SIZE items per Claude call (same as REDDIT_BATCH_SIZE by
 # default). Uses the same score_batch_with_claude() and process_scored_item()
-# pipeline — same Slack/HubSpot delivery for score 6-7 / 8-10.
+# pipeline — same Slack/HubSpot delivery for score 4-7 / 8-10.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
@@ -2490,7 +2559,7 @@ def run_rescore_processor():
     Background thread: polls flintel_rescore_messages for pending items,
     batches them, sends to Claude, then calls process_scored_item() with
     is_rescore=True so results overwrite the existing signal and re-trigger
-    Slack/HubSpot exactly as a live signal would. Unchanged from v7.4.
+    Slack/HubSpot exactly as a live signal would. Unchanged from v7.4.2.
     """
     log.info(
         f"[RESCORE] Processor started | "
@@ -2574,7 +2643,7 @@ def run_rescore_processor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — feedparser RSS poller (unchanged from v7.4)
+# REDDIT — feedparser RSS poller (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _reddit_seen_ids: set = load_seen_ids("reddit")
@@ -2680,7 +2749,7 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER (unchanged from v7.4)
+# TWITTER / X POLLER (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -2774,7 +2843,7 @@ def poll_twitter(client: tweepy.Client):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM LISTENER (unchanged from v7.4)
+# TELEGRAM LISTENER (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _telegram_seen_ids: set = load_seen_ids("telegram")
@@ -2999,7 +3068,14 @@ def run_telegram_listener_thread():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — Daily Digest + Weekly Report (unchanged from v7.4)
+# SCHEDULERS — Daily Digest + Weekly Report
+#
+# NOTE: these are operator-facing reports, not the per-signal Slack alert
+# covered by the v7.4.3 change request. They still show score numbers
+# (e.g. "Score:7/10") because the request was specifically about the
+# per-signal Slack alert and HubSpot note, not these aggregate scheduled
+# reports. If you'd also like score numbers stripped from the Daily Digest
+# and Weekly Report, say so and I'll apply the same change here.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_daily_digest():
@@ -3051,7 +3127,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.1 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.3 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
         ]
 
         result = retry_with_backoff(
@@ -3126,7 +3202,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.1 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.3 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -3174,7 +3250,7 @@ async def run_scheduler():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASYNC LISTENERS — thread management + auto-restart (unchanged from v7.4)
+# ASYNC LISTENERS — thread management + auto-restart (unchanged from v7.4.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -3319,17 +3395,23 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (v7.4 routes unchanged; version bumped)
+# FASTAPI — REST API (routes unchanged from v7.4.2; version bumped to 7.4.3)
+# NOTE: /signals and related JSON endpoints still RETURN intent_score in the
+# JSON payload — those are operator/API consumers, not the Slack/HubSpot
+# human-facing surfaces this change targeted. Say the word if you'd like
+# those stripped too.
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.4.1",
+    title       = "FX Signal Intelligence API — Flintel v7.4.3",
     description = (
         "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. "
         "Persistent batch state. Streaming Claude. Manual rescore. "
-        "HubSpot error visibility fix (FIX E)."
+        "HubSpot receives medium (4-7) AND high (8-10) signals. "
+        "HubSpot error visibility fix (FIX E). "
+        "Slack alert + HubSpot note no longer display the numeric score (v7.4.3)."
     ),
-    version     = "7.4.1",
+    version     = "7.4.3",
 )
 
 
@@ -3355,7 +3437,7 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.4.1",
+        "system":                  "FLINTEL v7.4.3",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram"],
         # FIX D: True/False with working indicator
@@ -3381,14 +3463,21 @@ def root():
         "telegram_queue_size":     telegram_queue.qsize(),
         "telegram_groups":         len(TARGET_TELEGRAM_GROUPS),
         "auth_required":           bool(API_KEY),
-        "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged in v7.4.1)",
+        "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged in v7.4.3)",
         "persistent_batch_state":  True,
         "partial_json_recovery":   True,
         "claude_streaming":        True,
         "rescore_enabled":         True,
         "hubspot_error_visibility": True,
+        "hubspot_medium_signals":  True,
+        "slack_hubspot_score_hidden": True,
         "min_score_medium":        MIN_SCORE_MEDIUM,
         "min_score_high":          MIN_SCORE_HIGH,
+        "score_routing": {
+            "1-3":  "MongoDB only",
+            "4-7":  "MongoDB + Slack + HubSpot (score number hidden in message/note)",
+            "8-10": "MongoDB + Slack + HubSpot (score number hidden in message/note)",
+        },
     }
 
 
@@ -3426,6 +3515,7 @@ def health():
         "telegram_indicator":      _working(telegram_working),
         "hubspot_configured":      bool(HUBSPOT_API_KEY),
         "hubspot_indicator":       _working(bool(HUBSPOT_API_KEY)),
+        "hubspot_medium_signals":  True,
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
@@ -3437,7 +3527,7 @@ def health():
     }
 
 
-# ── HUBSPOT DIAGNOSTIC ENDPOINT (new in v7.4.1, read-only, FIX E part 3) ─────
+# ── HUBSPOT DIAGNOSTIC ENDPOINT (from v7.4.1 FIX E part 3, unchanged) ────────
 
 @app.get("/hubspot/properties-check", dependencies=[Depends(verify_api_key)])
 def get_hubspot_properties_check():
@@ -3478,7 +3568,7 @@ def get_hubspot_properties_check():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── RESCORE ENDPOINTS (unchanged from v7.4) ──────────────────────────────────
+# ── RESCORE ENDPOINTS (unchanged from v7.4.2) ─────────────────────────────────
 
 @app.post("/rescore", dependencies=[Depends(verify_api_key)])
 def post_rescore(
@@ -3564,7 +3654,7 @@ def get_rescore_status(req_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── EXISTING ENDPOINTS (unchanged from v7.4) ──────────────────────────────────
+# ── EXISTING ENDPOINTS (unchanged from v7.4.2) ────────────────────────────────
 
 @app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
 def get_pending_batch():
@@ -3827,7 +3917,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.1")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.3")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
@@ -3851,11 +3941,11 @@ if __name__ == "__main__":
     log.info(f"  Twitter query      : built dynamically from KEYWORDS ({len(KEYWORDS)} keywords)")
     log.info(f"  Telegram join gap  : {TELEGRAM_JOIN_GAP_SECONDS}s between group joins")
     log.info(f"  Score 1-3          : SILENT SAVE — MongoDB only, no alerts")
-    log.info(f"  Score {MIN_SCORE_MEDIUM}-{MIN_SCORE_HIGH-1}          : MEDIUM — MongoDB + Slack")
-    log.info(f"  Score {MIN_SCORE_HIGH}-10         : HIGH   — MongoDB + Slack + HubSpot")
+    log.info(f"  Score {MIN_SCORE_MEDIUM}-{MIN_SCORE_HIGH-1}          : MEDIUM — MongoDB + Slack + HubSpot (number hidden in message)")
+    log.info(f"  Score {MIN_SCORE_HIGH}-10         : HIGH   — MongoDB + Slack + HubSpot (number hidden in message)")
     log.info(f"  MIN_SCORE_MEDIUM   : {MIN_SCORE_MEDIUM} (env-configurable)")
     log.info(f"  MIN_SCORE_HIGH     : {MIN_SCORE_HIGH} (env-configurable)")
-    log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded")
+    log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded (score still stored as-is)")
     log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
@@ -3874,12 +3964,15 @@ if __name__ == "__main__":
     log.info(f"  Keywords           : {len(KEYWORDS)} filters (same for all 3 platforms)")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
+    log.info(f"  HubSpot coverage   : score 4-10 (medium AND high) — fx_intent_score property still set")
+    log.info(f"  HubSpot note       : numeric score line removed from note body (v7.4.3)")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
+    log.info(f"  Slack message      : numeric score removed from header/fields (v7.4.3) — tier/category still shown")
     log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2) — ~140 tokens/item")
-    log.info(f"  v7.4.1 changes     : FIX E only — HubSpot 400 error real-body logging +")
-    log.info(f"                     : startup property self-check + /hubspot/properties-check endpoint.")
-    log.info(f"                     : Scoring logic, prompts, Slack/HubSpot field VALUES, thresholds,")
-    log.info(f"                     : FastAPI routes, FIX A/B/C/D, rescore — 100% unchanged from v7.4.")
+    log.info(f"  v7.4.3 changes     : Slack alert + HubSpot note no longer print the numeric intent_score.")
+    log.info(f"                     : Scoring logic, routing, MongoDB storage (score still saved),")
+    log.info(f"                     : prompts, FastAPI routes, thresholds, FIX A/B/C/D/E, rescore —")
+    log.info(f"                     : 100% unchanged from v7.4.2.")
     log.info("=" * 70)
 
     # FIX E (part 3): one-time, best-effort, read-only HubSpot property
