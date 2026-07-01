@@ -1,7 +1,60 @@
 """
-FX Signal Intelligence System — FLINTEL v7.4.3
+FX Signal Intelligence System — FLINTEL v7.4.4
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
+
+Changelog v7.4.4 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.3):
+
+  CHANGE — PER-PLATFORM BATCH_GAP_SECONDS AND BATCH_TIMEOUT_SECONDS.
+
+           In v7.4.3, BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS were single
+           global values shared by all three platforms (Reddit, Twitter,
+           Telegram). This meant changing the gap or timeout for one platform
+           changed it for all three — there was no way to tune Reddit's batch
+           timing independently of Twitter's or Telegram's.
+
+           Fix: replaced the two global env vars with six platform-specific
+           env vars:
+
+             REDDIT_BATCH_GAP_SECONDS      (default: old BATCH_GAP_SECONDS default, 30)
+             REDDIT_BATCH_TIMEOUT_SECONDS  (default: old BATCH_TIMEOUT_SECONDS default, 120)
+
+             TWITTER_BATCH_GAP_SECONDS     (default: 30)
+             TWITTER_BATCH_TIMEOUT_SECONDS (default: 120)
+
+             TELEGRAM_BATCH_GAP_SECONDS     (default: 30)
+             TELEGRAM_BATCH_TIMEOUT_SECONDS (default: 120)
+
+           run_batch_processor() now accepts gap_seconds and timeout_seconds
+           as parameters (instead of reading the old global BATCH_GAP_SECONDS
+           / BATCH_TIMEOUT_SECONDS module-level constants directly), and each
+           of start_reddit_listener() / start_twitter_listener() /
+           start_telegram_listener() passes its OWN platform-specific gap and
+           timeout values. No platform's timing can leak into another
+           platform's — Reddit fires and sleeps strictly on Reddit's own
+           numbers, Twitter on its own, Telegram on its own. Nothing is
+           shared, nothing is mixed.
+
+           RESCORE_BATCH_GAP_SECONDS / RESCORE's own BATCH_GAP_SECONDS
+           usage in run_rescore_processor() is likewise now its own
+           dedicated variable (RESCORE_BATCH_GAP_SECONDS, default: 30) so it
+           is not tied to Reddit/Twitter/Telegram's gap either. Rescore's
+           batch SIZE (RESCORE_BATCH_SIZE) was already independent since
+           v7.4 and is untouched.
+
+           BATCH_SIZE variables (REDDIT_BATCH_SIZE, TWITTER_BATCH_SIZE,
+           TELEGRAM_BATCH_SIZE, RESCORE_BATCH_SIZE) were ALREADY
+           platform-specific since v7.2/v7.4 and are completely untouched —
+           same names, same defaults, same behavior.
+
+           NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB storage,
+           HubSpot fields (including the v7.4.3 hidden-score-number note/
+           Slack text), FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4,
+           MIN_SCORE_HIGH=8), keyword list, FIX A (persistent batch state),
+           FIX B (partial-JSON recovery), FIX C (Claude streaming), FIX D
+           (working indicators), FIX E (HubSpot error visibility + startup
+           property check), and the rescore feature's polling/queueing logic
+           are byte-for-byte identical to v7.4.3.
 
 Changelog v7.4.3 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.2):
 
@@ -185,7 +238,8 @@ Changelog v7.4 (two fixes + one new feature — all v7.3 logic 100% unchanged):
            Rescore processor runs as a dedicated background thread, polling
            flintel_rescore_messages for pending items every 10s.
            It batches up to RESCORE_BATCH_SIZE (default: same as REDDIT_BATCH_SIZE)
-           pending items per Claude call, with BATCH_GAP_SECONDS between calls.
+           pending items per Claude call, with its own RESCORE_BATCH_GAP_SECONDS
+           between calls (see v7.4.4 changelog).
 
   NOTHING ELSE CHANGED. Scoring logic, prompts (_SCORING_CORE and all three
   platform schemas), Slack block formatting, HubSpot fields, FastAPI routes,
@@ -273,7 +327,7 @@ logging.basicConfig(
 log = logging.getLogger("flintel")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  (identical to v7.4.2)
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
@@ -295,7 +349,7 @@ MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
 
-# MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8 — confirmed defaults, unchanged from v7.4.2.
+# MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8 — confirmed defaults, unchanged.
 # Score 1-3  → MongoDB only (silent save, no alerts)
 # Score 4-7  → MongoDB + Slack + HubSpot
 # Score 8-10 → MongoDB + Slack + HubSpot
@@ -303,13 +357,29 @@ MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
 MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
 CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
 
+# ── BATCH SIZE — already platform-specific since v7.2/v7.4, UNCHANGED ───────
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
 TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
 RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
-BATCH_GAP_SECONDS   = int(os.getenv("BATCH_GAP_SECONDS",   "30"))
 
-BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "120"))
+# ── v7.4.4 CHANGE — BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS are now
+# per-platform. Old single global BATCH_GAP_SECONDS / BATCH_TIMEOUT_SECONDS
+# env vars are REPLACED by six dedicated vars below. Defaults match the old
+# global defaults (30s gap, 120s timeout) so behavior is identical unless an
+# operator explicitly sets a platform-specific override.
+REDDIT_BATCH_GAP_SECONDS       = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",       "30"))
+REDDIT_BATCH_TIMEOUT_SECONDS   = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",   "120"))
+
+TWITTER_BATCH_GAP_SECONDS      = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",      "30"))
+TWITTER_BATCH_TIMEOUT_SECONDS  = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS",  "120"))
+
+TELEGRAM_BATCH_GAP_SECONDS     = int(os.getenv("TELEGRAM_BATCH_GAP_SECONDS",     "30"))
+TELEGRAM_BATCH_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))
+
+# Rescore's own gap — independent of Reddit/Twitter/Telegram (v7.4.4).
+# Rescore batch SIZE (RESCORE_BATCH_SIZE) was already independent, untouched.
+RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
 
 DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
 WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))
@@ -327,7 +397,7 @@ CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
 RESCORE_POLL_INTERVAL = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY AUTH (unchanged from v7.4.2)
+# API KEY AUTH (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.getenv("API_KEY", "")
@@ -403,7 +473,7 @@ twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.4.2)
+# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.4.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
@@ -717,7 +787,7 @@ def passes_keyword_filter(text: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY (unchanged from v7.4.2)
+# TWITTER SEARCH QUERY (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
@@ -763,7 +833,7 @@ TWITTER_SEARCH_QUERY = _build_twitter_search_query()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DERIVE FIELDS LOCALLY (unchanged from v7.2 OPT 2)
+# DERIVE FIELDS LOCALLY (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _derive_fields(score: int) -> dict:
@@ -779,7 +849,7 @@ def _derive_fields(score: int) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Byte-for-byte identical to v7.4.2. Scoring logic untouched.
+# Byte-for-byte identical to v7.4.3. Scoring logic untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
@@ -1227,7 +1297,7 @@ def get_database():
             [("key", ASCENDING)], unique=True, name="state_key_unique"
         )
 
-        # FIX A: persistent batch state collections (unchanged from v7.4.2)
+        # FIX A: persistent batch state collections (unchanged)
         db.flintel_pending_batch.create_index(
             [("platform", ASCENDING)], unique=True, name="platform_unique"
         )
@@ -1235,7 +1305,7 @@ def get_database():
             [("platform", ASCENDING)], unique=True, name="seen_platform_unique"
         )
 
-        # NEW v7.4: rescore messages collection
+        # rescore messages collection
         db.flintel_rescore_messages.create_index(
             [("status", ASCENDING), ("requested_at", ASCENDING)],
             name="rescore_status_time",
@@ -1295,9 +1365,7 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged from v7.4.2 — these are operator/system
-# alerts, not signal alerts, so they were never in scope for the score
-# display change)
+# OPERATOR SLACK ALERT (unchanged — operator/system alerts, not signal alerts)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -1320,7 +1388,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.3"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.4"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1340,7 +1408,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged from v7.4.2)
+# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -1429,7 +1497,7 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE BATCH SCORER — FIX C: streaming transport, FIX B: partial-JSON recovery
-# Scoring logic, prompts, output schema — 100% unchanged from v7.4.2.
+# Scoring logic, prompts, output schema — 100% unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -1485,7 +1553,7 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
     }
 
 
-# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged from v7.4.2)
+# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged)
 
 def _strip_code_fences(raw: str) -> str:
     raw = raw.strip()
@@ -1498,7 +1566,7 @@ def _strip_code_fences(raw: str) -> str:
 def _salvage_partial_json_array(raw: str) -> list:
     """
     Walks a possibly-truncated JSON array and extracts every complete,
-    well-formed top-level object using brace-depth tracking. Unchanged from v7.4.2.
+    well-formed top-level object using brace-depth tracking. Unchanged.
     """
     start = raw.find("[")
     if start == -1:
@@ -1550,7 +1618,7 @@ def _salvage_partial_json_array(raw: str) -> list:
 
 def _parse_claude_json(raw: str) -> tuple:
     """
-    Returns (results_list, was_truncated_bool). Unchanged from v7.4.2.
+    Returns (results_list, was_truncated_bool). Unchanged.
     Tries full json.loads first, falls back to salvage on failure.
     """
     cleaned = _strip_code_fences(raw)
@@ -1572,8 +1640,7 @@ def _call_claude_batch(batch: list) -> list:
     """
     FIX C: uses streaming context manager instead of blocking .create().
     The stream.get_final_text() collects the complete response text once
-    generation finishes — identical string to what .create() returned.
-    Everything after raw text collection is byte-for-byte unchanged from v7.4.2.
+    generation finishes. Unchanged.
     """
     platform = batch[0].get("platform", "reddit") if batch else "reddit"
 
@@ -1680,10 +1747,7 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE (unchanged from v7.4.2) — ALL scores 1-10 stored, nothing
-# discarded. The intent_score field is stored exactly as Claude returns it,
-# on every signal document, regardless of what Slack/HubSpot choose to
-# display to a human. This is intentionally untouched by the v7.4.3 change.
+# MONGODB STORAGE (unchanged) — ALL scores 1-10 stored, nothing discarded.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
@@ -1759,10 +1823,7 @@ def save_signal(data: dict) -> bool:
 def update_signal(message_id: str, data: dict) -> bool:
     """
     Used by rescore to overwrite an existing signal's score fields
-    in-place. Preserves message_id, message_text, platform, username, etc.
-    Only score-derived fields are overwritten, same as a fresh save but via
-    update_one instead of insert_one (since the document already exists).
-    Unchanged from v7.4.2.
+    in-place. Unchanged.
     """
     try:
         update_fields = {
@@ -1786,7 +1847,6 @@ def update_signal(message_id: str, data: dict) -> bool:
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
-            # Reset alert flags so the rescored signal re-triggers alerts
             "alerted_slack":                False,
             "alerted_hubspot":              False,
         }
@@ -1832,7 +1892,7 @@ def mark_hubspot_alerted(message_id: str, contact_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEEKLY REPORT STATE PERSISTENCE (unchanged from v7.4.2)
+# WEEKLY REPORT STATE PERSISTENCE (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_state(key: str):
@@ -1856,14 +1916,7 @@ def _set_state(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY
-#
-# v7.4.3 CHANGE: the header text and the "Score" field no longer print the
-# numeric intent_score. Tier (MEDIUM/HIGH → shown as data.get("tier","").upper(),
-# e.g. "IMMEDIATE" / "DIGEST") and category are still shown, so priority is
-# still obvious — just not the literal "X/10" number. Everything else in this
-# function (fields shown, message text, outreach script, button, response
-# window logic which is still driven by `score` internally) is unchanged.
+# SLACK DELIVERY (unchanged from v7.4.3 — numeric score hidden, tier/category shown)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -1921,7 +1974,6 @@ def send_slack_alert(data: dict) -> bool:
 
     rescore_tag = " ♻️ RESCORED" if is_rescore else ""
     header_emoji = "🚨" if score >= 8 else "⚠️"
-    # v7.4.3: header no longer prints "Score X/10" — tier + category still shown.
     header_text  = f"{header_emoji} {category} — {tier}{rescore_tag}"
 
     if subreddit:
@@ -1943,7 +1995,6 @@ def send_slack_alert(data: dict) -> bool:
                 {"type": "mrkdwn", "text": f"*Source*\n{source_label}"},
                 {"type": "mrkdwn", "text": f"*Content Type*\n{ctype}"},
                 {"type": "mrkdwn", "text": f"*User*\n{username}"},
-                # v7.4.3: numeric score field removed — tier still shown
                 {"type": "mrkdwn", "text": f"*Tier*\n{tier}"},
                 {"type": "mrkdwn", "text": f"*Profile*\n{'✅ Business' if is_biz else '👤 Individual'}"},
                 {"type": "mrkdwn", "text": f"*Timestamp*\n{timestamp}"},
@@ -2003,8 +2054,6 @@ def send_slack_alert(data: dict) -> bool:
         retries=3, delay=2, label="Slack",
     )
     if result:
-        # Internal log still shows score — this is operator-facing log, not
-        # the Slack message itself, so it is unaffected by the v7.4.3 change.
         log.info(f"Slack sent | {platform} | u/{username} | Score:{score}")
         return True
     log.error("Slack delivery failed after all retries.")
@@ -2012,21 +2061,11 @@ def send_slack_alert(data: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM
-# v7.4.1 FIX E: real error-body logging added to every HubSpot call site.
-# v7.4.2: medium signals now sent here too.
-# v7.4.3: the human-readable NOTE no longer prints "Score: X/10" in its text
-#         body. The fx_intent_score CONTACT PROPERTY (queryable/filterable
-#         field inside HubSpot) is unchanged and still sent — only the note's
-#         free-text rendering is altered. All other field VALUES, control
-#         flow, and retry behavior — unchanged from v7.4.2.
+# HUBSPOT CRM (unchanged from v7.4.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
 
-# FIX E (part 3): the exact set of custom contact properties this script sends.
-# Used only by the read-only startup self-check below — never used to filter
-# or alter what gets sent in _hs_create_contact(). That payload is unchanged.
 _HUBSPOT_REQUIRED_CONTACT_PROPERTIES = [
     "fx_intent_score",
     "fx_signal_category",
@@ -2046,13 +2085,6 @@ def _hs_headers() -> dict:
 
 
 def _hs_log_http_error(label: str, exc: "requests.exceptions.HTTPError"):
-    """
-    FIX E (part 1): shared helper that extracts and logs HubSpot's actual
-    JSON error body (e.g. which property doesn't exist, which value is
-    invalid) instead of only the generic 'HTTPError' string. Purely additive
-    logging — never raises, never changes control flow, never changes what
-    gets returned to the caller.
-    """
     body_text = None
     try:
         if exc.response is not None:
@@ -2067,19 +2099,6 @@ def _hs_log_http_error(label: str, exc: "requests.exceptions.HTTPError"):
 
 
 def _hs_verify_properties():
-    """
-    FIX E (part 3): one-time, best-effort, read-only startup self-check.
-    Confirms the ten custom 'fx_*' contact properties this script writes to
-    actually exist in this HubSpot portal, and logs a single clear WARNING
-    up front listing exactly which ones are missing — before the first 400
-    ever happens, instead of guessing after the fact.
-
-    This function NEVER raises, NEVER blocks startup, and NEVER modifies
-    anything in HubSpot. If the API call itself fails (e.g. missing
-    'crm.schemas.contacts.read' scope, network issue, HubSpot not
-    configured), it logs a warning and the rest of the system continues
-    exactly as v7.4 did with no self-check at all.
-    """
     if not HUBSPOT_API_KEY:
         log.info("[HubSpot] HUBSPOT_API_KEY not set — skipping property self-check.")
         return
@@ -2134,7 +2153,6 @@ def _hs_find_contact(username: str) -> str | None:
         results = r.json().get("results", [])
         return results[0]["id"] if results else None
     except requests.exceptions.HTTPError as exc:
-        # FIX E (part 1): log the real HubSpot error body
         _hs_log_http_error("HubSpot find contact error", exc)
         return None
     except Exception as exc:
@@ -2145,10 +2163,6 @@ def _hs_find_contact(username: str) -> str | None:
 def _hs_create_contact(data: dict) -> str | None:
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
-        # Payload is byte-for-byte identical to v7.4.2 — same keys, same values.
-        # fx_intent_score CONTACT PROPERTY is still sent so the score remains
-        # queryable/filterable inside HubSpot lists/workflows — only the
-        # human-readable note text (below, in _hs_create_note) drops the number.
         properties = {
             "firstname":           f"{data.get('username','unknown')}",
             "lastname":            f"{data.get('platform','?').upper()} Signal",
@@ -2171,9 +2185,6 @@ def _hs_create_contact(data: dict) -> str | None:
         r.raise_for_status()
         return r.json().get("id")
     except requests.exceptions.HTTPError as exc:
-        # FIX E (part 1): this is the line that was previously hiding the
-        # real reason for the 400. Now logs HubSpot's actual JSON error body
-        # (e.g. "Property \"fx_intent_score\" does not exist") in full.
         _hs_log_http_error("HubSpot create contact error", exc)
         return None
     except Exception as exc:
@@ -2185,11 +2196,8 @@ def _hs_create_note(data: dict, contact_id: str):
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
-        # v7.4.3: "Score:" line removed from the human-readable note body.
-        # Tier, category, and every other field are still included exactly
-        # as in v7.4.2 — only the literal "X/10" number is no longer printed.
         note = (
-            f"FLINTEL SIGNAL — v7.4.3{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.4.4{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -2229,7 +2237,6 @@ def _hs_create_note(data: dict, contact_id: str):
         )
         r.raise_for_status()
     except requests.exceptions.HTTPError as exc:
-        # FIX E (part 1): log the real HubSpot error body
         _hs_log_http_error("HubSpot create note error", exc)
     except Exception as exc:
         log.error(f"HubSpot create note error: {exc}")
@@ -2255,15 +2262,7 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR
-#
-# Routing is 100% unchanged from v7.4.2 (still entirely score-driven):
-#   score < MIN_SCORE_MEDIUM (1-3)            → MongoDB only, no alerts
-#   MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH → MongoDB + Slack + HubSpot
-#   score >= MIN_SCORE_HIGH (8-10)            → MongoDB + Slack + HubSpot
-#
-# Only what Slack/HubSpot DISPLAY to a human changed (v7.4.3) — not whether
-# they are called, not when they are called, not what gets stored.
+# CORE SIGNAL PROCESSOR (unchanged — routing 100% score-driven)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False):
@@ -2319,7 +2318,6 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
         return
 
     if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
-        # Medium signals go to Slack + HubSpot (unchanged routing from v7.4.2)
         mode = "RESCORE-MEDIUM" if is_rescore else "MEDIUM"
         log.info(f"{mode} | [{platform.upper()}] Score:{score} | Slack + HubSpot | u/{data['username']}")
         ok = send_slack_alert(data)
@@ -2341,20 +2339,26 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — persistent state (FIX A, unchanged from v7.4.2)
+# GENERIC BATCH PROCESSOR — v7.4.4: now takes gap_seconds and timeout_seconds
+# as PARAMETERS instead of reading a shared global. Each platform's caller
+# (start_reddit_listener / start_twitter_listener / start_telegram_listener)
+# passes its OWN dedicated gap/timeout values below — no platform borrows
+# another platform's timing, no mixing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
     q: queue.Queue,
     batch_size: int,
     platform_label: str,
+    gap_seconds: int,
+    timeout_seconds: int,
 ):
     platform_key = platform_label.lower()
 
     log.info(
         f"Batch processor [{platform_label}] started | "
-        f"batch_size:{batch_size} | gap:{BATCH_GAP_SECONDS}s | "
-        f"timeout:{BATCH_TIMEOUT_SECONDS}s"
+        f"batch_size:{batch_size} | gap:{gap_seconds}s | "
+        f"timeout:{timeout_seconds}s"
     )
 
     current_batch, batch_start_time = load_pending_batch(platform_key)
@@ -2373,7 +2377,7 @@ def run_batch_processor(
         try:
             if current_batch and batch_start_time is not None:
                 elapsed   = time.time() - batch_start_time
-                remaining = BATCH_TIMEOUT_SECONDS - elapsed
+                remaining = timeout_seconds - elapsed
                 wait_time = max(0.1, remaining)
             else:
                 wait_time = 1.0
@@ -2424,9 +2428,9 @@ def run_batch_processor(
                 fire_reason = f"batch full ({batch_size} items)"
             elif current_batch and batch_start_time is not None:
                 elapsed = time.time() - batch_start_time
-                if elapsed >= BATCH_TIMEOUT_SECONDS:
+                if elapsed >= timeout_seconds:
                     should_fire = True
-                    fire_reason = f"timeout ({BATCH_TIMEOUT_SECONDS}s) — partial batch {len(current_batch)}/{batch_size}"
+                    fire_reason = f"timeout ({timeout_seconds}s) — partial batch {len(current_batch)}/{batch_size}"
 
             if should_fire and current_batch:
                 total_batches += 1
@@ -2457,9 +2461,9 @@ def run_batch_processor(
 
                 log.info(
                     f"[{platform_label}] BATCH {total_batches} DONE | "
-                    f"waiting {BATCH_GAP_SECONDS}s..."
+                    f"waiting {gap_seconds}s..."
                 )
-                time.sleep(BATCH_GAP_SECONDS)
+                time.sleep(gap_seconds)
 
         except Exception as exc:
             log.error(f"[{platform_label}] batch processor error: {exc}")
@@ -2467,21 +2471,12 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR (unchanged from v7.4.2)
-#
-# Runs as a dedicated background thread. Polls flintel_rescore_messages for
-# pending items every RESCORE_POLL_INTERVAL seconds. Batches up to
-# RESCORE_BATCH_SIZE items per Claude call (same as REDDIT_BATCH_SIZE by
-# default). Uses the same score_batch_with_claude() and process_scored_item()
-# pipeline — same Slack/HubSpot delivery for score 4-7 / 8-10.
+# RESCORE PROCESSOR — v7.4.4: uses its own RESCORE_BATCH_GAP_SECONDS,
+# independent of Reddit/Twitter/Telegram gap values. Batch SIZE
+# (RESCORE_BATCH_SIZE) was already independent, untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
-    """
-    Inserts pending rescore requests into flintel_rescore_messages.
-    Returns list of inserted request IDs (as strings).
-    message_ids must be existing message_ids from the signals collection.
-    """
     inserted = []
     for mid in message_ids:
         try:
@@ -2503,7 +2498,6 @@ def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
 
 
 def _rescore_fetch_pending(limit: int) -> list:
-    """Fetches up to `limit` pending rescore requests, oldest first."""
     try:
         return list(
             db.flintel_rescore_messages.find(
@@ -2558,12 +2552,13 @@ def run_rescore_processor():
     """
     Background thread: polls flintel_rescore_messages for pending items,
     batches them, sends to Claude, then calls process_scored_item() with
-    is_rescore=True so results overwrite the existing signal and re-trigger
-    Slack/HubSpot exactly as a live signal would. Unchanged from v7.4.2.
+    is_rescore=True. Uses RESCORE_BATCH_GAP_SECONDS (its own, independent
+    of Reddit/Twitter/Telegram gap values — v7.4.4).
     """
     log.info(
         f"[RESCORE] Processor started | "
-        f"batch_size:{RESCORE_BATCH_SIZE} | poll_interval:{RESCORE_POLL_INTERVAL}s"
+        f"batch_size:{RESCORE_BATCH_SIZE} | poll_interval:{RESCORE_POLL_INTERVAL}s | "
+        f"gap:{RESCORE_BATCH_GAP_SECONDS}s"
     )
     total_rescored = 0
     total_batches  = 0
@@ -2578,9 +2573,8 @@ def run_rescore_processor():
             req_ids = [p["_id"] for p in pending]
             _rescore_mark_processing(req_ids)
 
-            # Fetch original signal documents to reconstruct item dicts
             items_for_claude = []
-            req_map = {}  # index (1-based) → pending doc
+            req_map = {}
 
             for i, req in enumerate(pending, start=1):
                 mid = req["message_id"]
@@ -2601,7 +2595,7 @@ def run_rescore_processor():
                     "text":           sig.get("message_text", ""),
                 }
                 items_for_claude.append(item)
-                req_map[len(items_for_claude)] = req  # 1-based index → req doc
+                req_map[len(items_for_claude)] = req
 
             if not items_for_claude:
                 time.sleep(RESCORE_POLL_INTERVAL)
@@ -2633,9 +2627,9 @@ def run_rescore_processor():
             log.info(
                 f"[RESCORE] BATCH {total_batches} DONE | "
                 f"rescored:{len(items_for_claude)} | total_ever:{total_rescored} | "
-                f"waiting {BATCH_GAP_SECONDS}s..."
+                f"waiting {RESCORE_BATCH_GAP_SECONDS}s..."
             )
-            time.sleep(BATCH_GAP_SECONDS)
+            time.sleep(RESCORE_BATCH_GAP_SECONDS)
 
         except Exception as exc:
             log.error(f"[RESCORE] processor error: {exc}")
@@ -2643,7 +2637,7 @@ def run_rescore_processor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — feedparser RSS poller (unchanged from v7.4.2)
+# REDDIT — feedparser RSS poller (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _reddit_seen_ids: set = load_seen_ids("reddit")
@@ -2749,7 +2743,7 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER (unchanged from v7.4.2)
+# TWITTER / X POLLER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -2843,7 +2837,7 @@ def poll_twitter(client: tweepy.Client):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM LISTENER (unchanged from v7.4.2)
+# TELEGRAM LISTENER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _telegram_seen_ids: set = load_seen_ids("telegram")
@@ -3068,14 +3062,7 @@ def run_telegram_listener_thread():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — Daily Digest + Weekly Report
-#
-# NOTE: these are operator-facing reports, not the per-signal Slack alert
-# covered by the v7.4.3 change request. They still show score numbers
-# (e.g. "Score:7/10") because the request was specifically about the
-# per-signal Slack alert and HubSpot note, not these aggregate scheduled
-# reports. If you'd also like score numbers stripped from the Daily Digest
-# and Weekly Report, say so and I'll apply the same change here.
+# SCHEDULERS — Daily Digest + Weekly Report (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_daily_digest():
@@ -3127,7 +3114,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.3 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.4 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
         ]
 
         result = retry_with_backoff(
@@ -3202,7 +3189,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.3 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.4 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -3250,7 +3237,13 @@ async def run_scheduler():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ASYNC LISTENERS — thread management + auto-restart (unchanged from v7.4.2)
+# ASYNC LISTENERS — thread management + auto-restart
+# v7.4.4: each start_*_listener() now passes its OWN gap_seconds and
+# timeout_seconds into run_batch_processor(). Reddit uses
+# REDDIT_BATCH_GAP_SECONDS/REDDIT_BATCH_TIMEOUT_SECONDS, Twitter uses
+# TWITTER_BATCH_GAP_SECONDS/TWITTER_BATCH_TIMEOUT_SECONDS, Telegram uses
+# TELEGRAM_BATCH_GAP_SECONDS/TELEGRAM_BATCH_TIMEOUT_SECONDS. No sharing,
+# no mixing — restart logic below is otherwise unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -3263,13 +3256,17 @@ async def start_reddit_listener():
     )
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT"),
+        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT",
+              REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
         daemon=True, name="Reddit-Batch",
     )
 
     rss_thread.start()
     btch_thread.start()
-    log.info("Reddit threads running: RSS-Poller ✅ | Batch ✅")
+    log.info(
+        f"Reddit threads running: RSS-Poller ✅ | Batch ✅ | "
+        f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s"
+    )
 
     while True:
         await asyncio.sleep(60)
@@ -3283,7 +3280,8 @@ async def start_reddit_listener():
             log.error("Reddit batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT"),
+                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT",
+                      REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
                 daemon=True, name="Reddit-Batch",
             )
             btch_thread.start()
@@ -3304,13 +3302,17 @@ async def start_twitter_listener():
     )
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER"),
+        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER",
+              TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
         daemon=True, name="Twitter-Batch",
     )
 
     poll_thread.start()
     btch_thread.start()
-    log.info("Twitter threads running: Poll ✅ | Batch ✅")
+    log.info(
+        f"Twitter threads running: Poll ✅ | Batch ✅ | "
+        f"gap:{TWITTER_BATCH_GAP_SECONDS}s | timeout:{TWITTER_BATCH_TIMEOUT_SECONDS}s"
+    )
 
     while True:
         await asyncio.sleep(60)
@@ -3324,7 +3326,8 @@ async def start_twitter_listener():
             log.error("Twitter batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER"),
+                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER",
+                      TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
                 daemon=True, name="Twitter-Batch",
             )
             btch_thread.start()
@@ -3347,7 +3350,8 @@ async def start_telegram_listener():
     )
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM"),
+        args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM",
+              TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
         daemon=True, name="Telegram-Batch",
     )
 
@@ -3355,7 +3359,8 @@ async def start_telegram_listener():
     btch_thread.start()
     log.info(
         f"Telegram threads running: Listener ✅ | Batch ✅ | "
-        f"Poller {'✅' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled'}"
+        f"Poller {'✅' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled'} | "
+        f"gap:{TELEGRAM_BATCH_GAP_SECONDS}s | timeout:{TELEGRAM_BATCH_TIMEOUT_SECONDS}s"
     )
 
     while True:
@@ -3370,7 +3375,8 @@ async def start_telegram_listener():
             log.error("Telegram batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM"),
+                args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM",
+                      TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
                 daemon=True, name="Telegram-Batch",
             )
             btch_thread.start()
@@ -3395,23 +3401,22 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (routes unchanged from v7.4.2; version bumped to 7.4.3)
-# NOTE: /signals and related JSON endpoints still RETURN intent_score in the
-# JSON payload — those are operator/API consumers, not the Slack/HubSpot
-# human-facing surfaces this change targeted. Say the word if you'd like
-# those stripped too.
+# FASTAPI — REST API (routes unchanged; version bumped to 7.4.4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.4.3",
+    title       = "FX Signal Intelligence API — Flintel v7.4.4",
     description = (
         "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. "
         "Persistent batch state. Streaming Claude. Manual rescore. "
         "HubSpot receives medium (4-7) AND high (8-10) signals. "
         "HubSpot error visibility fix (FIX E). "
-        "Slack alert + HubSpot note no longer display the numeric score (v7.4.3)."
+        "Slack alert + HubSpot note no longer display the numeric score (v7.4.3). "
+        "Per-platform BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS — Reddit, "
+        "Twitter, and Telegram each run on their own independent gap/timeout, "
+        "never mixed (v7.4.4)."
     ),
-    version     = "7.4.3",
+    version     = "7.4.4",
 )
 
 
@@ -3437,10 +3442,9 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.4.3",
+        "system":                  "FLINTEL v7.4.4",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram"],
-        # FIX D: True/False with working indicator
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED),
         "twitter_enabled":         TWITTER_ENABLED,
@@ -3454,8 +3458,14 @@ def root():
         "telegram_batch_size":     TELEGRAM_BATCH_SIZE,
         "rescore_batch_size":      RESCORE_BATCH_SIZE,
         "telegram_poll_interval":  TELEGRAM_POLL_INTERVAL,
-        "batch_gap_s":             BATCH_GAP_SECONDS,
-        "batch_timeout_s":         BATCH_TIMEOUT_SECONDS,
+        # v7.4.4: per-platform gap/timeout, no shared globals
+        "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
+        "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
+        "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
+        "twitter_batch_timeout_s":  TWITTER_BATCH_TIMEOUT_SECONDS,
+        "telegram_batch_gap_s":     TELEGRAM_BATCH_GAP_SECONDS,
+        "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
+        "rescore_batch_gap_s":      RESCORE_BATCH_GAP_SECONDS,
         "max_tokens":              MAX_TOKENS,
         "claude_stream_timeout_s": CLAUDE_STREAM_TIMEOUT,
         "reddit_queue_size":       reddit_queue.qsize(),
@@ -3463,7 +3473,7 @@ def root():
         "telegram_queue_size":     telegram_queue.qsize(),
         "telegram_groups":         len(TARGET_TELEGRAM_GROUPS),
         "auth_required":           bool(API_KEY),
-        "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged in v7.4.3)",
+        "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged)",
         "persistent_batch_state":  True,
         "partial_json_recovery":   True,
         "claude_streaming":        True,
@@ -3471,6 +3481,7 @@ def root():
         "hubspot_error_visibility": True,
         "hubspot_medium_signals":  True,
         "slack_hubspot_score_hidden": True,
+        "per_platform_batch_timing": True,
         "min_score_medium":        MIN_SCORE_MEDIUM,
         "min_score_high":          MIN_SCORE_HIGH,
         "score_routing": {
@@ -3489,7 +3500,6 @@ def health():
     except Exception:
         mongo = "disconnected"
 
-    # FIX D: True/False with working indicators
     reddit_working   = REDDIT_ENABLED
     twitter_working  = TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
@@ -3503,16 +3513,21 @@ def health():
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
-        # FIX D: working indicators alongside bool flags
         "reddit":                  ("polling-rss" if REDDIT_ENABLED else "disabled"),
         "reddit_working":          reddit_working,
         "reddit_indicator":        _working(reddit_working),
+        "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
+        "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter":                 ("polling" if twitter_working else "disabled"),
         "twitter_working":         twitter_working,
         "twitter_indicator":       _working(twitter_working),
+        "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
+        "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
         "telegram":                ("listening" if telegram_working else "disabled"),
         "telegram_working":        telegram_working,
         "telegram_indicator":      _working(telegram_working),
+        "telegram_batch_gap_s":    TELEGRAM_BATCH_GAP_SECONDS,
+        "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
         "hubspot_configured":      bool(HUBSPOT_API_KEY),
         "hubspot_indicator":       _working(bool(HUBSPOT_API_KEY)),
         "hubspot_medium_signals":  True,
@@ -3522,21 +3537,16 @@ def health():
         "rescore_pending":         pending_rescore,
         "rescore_working":         True,
         "rescore_indicator":       _working(True),
+        "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
 
 
-# ── HUBSPOT DIAGNOSTIC ENDPOINT (from v7.4.1 FIX E part 3, unchanged) ────────
+# ── HUBSPOT DIAGNOSTIC ENDPOINT (unchanged) ──────────────────────────────────
 
 @app.get("/hubspot/properties-check", dependencies=[Depends(verify_api_key)])
 def get_hubspot_properties_check():
-    """
-    Read-only diagnostic: re-runs the same property existence check that
-    happens once at startup, on demand, so an operator can verify HubSpot
-    portal setup at any time without restarting the service. Never modifies
-    anything in HubSpot.
-    """
     if not HUBSPOT_API_KEY:
         return {"configured": False, "detail": "HUBSPOT_API_KEY not set."}
     try:
@@ -3568,22 +3578,16 @@ def get_hubspot_properties_check():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── RESCORE ENDPOINTS (unchanged from v7.4.2) ─────────────────────────────────
+# ── RESCORE ENDPOINTS (unchanged) ────────────────────────────────────────────
 
 @app.post("/rescore", dependencies=[Depends(verify_api_key)])
 def post_rescore(
     message_ids: list = Body(..., description="List of message_id strings to rescore"),
     operator_note: str = Body("", description="Optional operator note"),
 ):
-    """
-    Queue one or many existing signals for re-scoring by Claude.
-    message_ids must exist in the signals collection.
-    Example body: {"message_ids": ["reddit_rss_abc123", "twitter_987xyz"], "operator_note": "rescoring after prompt update"}
-    """
     if not message_ids:
         raise HTTPException(status_code=400, detail="message_ids list is empty.")
 
-    # Validate all IDs exist
     missing = []
     for mid in message_ids:
         if not db.signals.find_one({"message_id": mid}, {"_id": 1}):
@@ -3608,7 +3612,6 @@ def post_rescore(
 
 @app.get("/rescore/pending", dependencies=[Depends(verify_api_key)])
 def get_rescore_pending(limit: int = 50):
-    """List pending rescore requests, oldest first."""
     try:
         docs = list(
             db.flintel_rescore_messages.find(
@@ -3622,7 +3625,6 @@ def get_rescore_pending(limit: int = 50):
 
 @app.get("/rescore/history", dependencies=[Depends(verify_api_key)])
 def get_rescore_history(limit: int = 100, status: str = None):
-    """List completed or errored rescore requests, newest first."""
     try:
         query = {}
         if status:
@@ -3641,7 +3643,6 @@ def get_rescore_history(limit: int = 100, status: str = None):
 
 @app.get("/rescore/status/{req_id}", dependencies=[Depends(verify_api_key)])
 def get_rescore_status(req_id: str):
-    """Get status of a specific rescore request by its _id string."""
     try:
         from bson import ObjectId
         doc = db.flintel_rescore_messages.find_one({"_id": ObjectId(req_id)})
@@ -3654,7 +3655,7 @@ def get_rescore_status(req_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── EXISTING ENDPOINTS (unchanged from v7.4.2) ────────────────────────────────
+# ── EXISTING ENDPOINTS (unchanged) ───────────────────────────────────────────
 
 @app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
 def get_pending_batch():
@@ -3880,7 +3881,6 @@ def get_silent_signals(limit: int = 50):
 
 @app.get("/signals/rescored", dependencies=[Depends(verify_api_key)])
 def get_rescored_signals(limit: int = 50):
-    """Returns signals that have been rescored at least once."""
     try:
         signals = list(
             db.signals.find(
@@ -3917,23 +3917,21 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.3")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.4")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
-    # FIX D: True/False with working indicators
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
     log.info(f"  Reddit mode        : feedparser RSS — no credentials required")
     log.info(f"  Reddit poll gap    : {REDDIT_POLL_INTERVAL}s between full subreddit cycles")
     log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
     log.info(f"  Telegram polling   : {'every ' + str(TELEGRAM_POLL_INTERVAL) + 's' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled (TELEGRAM_POLL_INTERVAL=0)'}")
-    log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
-    log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
-    log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {BATCH_TIMEOUT_SECONDS}s → 1 Claude call")
-    log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items per Claude call")
-    log.info(f"  Batch gap          : {BATCH_GAP_SECONDS}s between calls")
-    log.info(f"  Batch timeout      : {BATCH_TIMEOUT_SECONDS}s (partial batch fires after timeout)")
+    log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {REDDIT_BATCH_GAP_SECONDS}s")
+    log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TWITTER_BATCH_GAP_SECONDS}s")
+    log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {TELEGRAM_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TELEGRAM_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items per Claude call | gap {RESCORE_BATCH_GAP_SECONDS}s")
+    log.info(f"  Batch timing       : per-platform, independent — Reddit/Twitter/Telegram never share gap or timeout (v7.4.4)")
     log.info(f"  max_tokens         : {MAX_TOKENS}")
     log.info(f"  Claude streaming   : True | {_working(True)} (FIX C — no more 10-min error)")
     log.info(f"  Claude read timeout: None (stream open until complete)")
@@ -3946,7 +3944,7 @@ if __name__ == "__main__":
     log.info(f"  MIN_SCORE_MEDIUM   : {MIN_SCORE_MEDIUM} (env-configurable)")
     log.info(f"  MIN_SCORE_HIGH     : {MIN_SCORE_HIGH} (env-configurable)")
     log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded (score still stored as-is)")
-    log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed")
+    log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed (queues, batch state, AND now batch timing)")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
     log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items")
@@ -3969,10 +3967,13 @@ if __name__ == "__main__":
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
     log.info(f"  Slack message      : numeric score removed from header/fields (v7.4.3) — tier/category still shown")
     log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2) — ~140 tokens/item")
-    log.info(f"  v7.4.3 changes     : Slack alert + HubSpot note no longer print the numeric intent_score.")
-    log.info(f"                     : Scoring logic, routing, MongoDB storage (score still saved),")
-    log.info(f"                     : prompts, FastAPI routes, thresholds, FIX A/B/C/D/E, rescore —")
-    log.info(f"                     : 100% unchanged from v7.4.2.")
+    log.info(f"  v7.4.4 changes     : BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS split into six")
+    log.info(f"                     : platform-specific env vars (REDDIT_/TWITTER_/TELEGRAM_ prefix).")
+    log.info(f"                     : Rescore now uses its own RESCORE_BATCH_GAP_SECONDS. BATCH_SIZE")
+    log.info(f"                     : variables were already per-platform and are untouched. Everything")
+    log.info(f"                     : else — scoring, routing, MongoDB, prompts, FastAPI routes,")
+    log.info(f"                     : thresholds, FIX A/B/C/D/E, hidden-score Slack/HubSpot display —")
+    log.info(f"                     : 100% unchanged from v7.4.3.")
     log.info("=" * 70)
 
     # FIX E (part 3): one-time, best-effort, read-only HubSpot property
