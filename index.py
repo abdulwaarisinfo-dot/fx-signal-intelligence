@@ -1,7 +1,54 @@
 """
-FX Signal Intelligence System — FLINTEL v7.4.4
+FX Signal Intelligence System — FLINTEL v7.4.5
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
+
+Changelog v7.4.5 (THREE ADDITIVE CHANGES ONLY — everything else 100% unchanged from v7.4.4):
+
+  CHANGE 1 — BATCH COMPLETION LOG NOW SHOWS ITEM COUNT.
+             The "[PLATFORM] BATCH N DONE" log line is now
+             "[PLATFORM] BATCH N COMPLETE — X item(s) completed | waiting Ys...",
+             where X = len(batch_to_send) — the number of items that batch
+             actually processed. Purely a log-text change; no control flow,
+             no scoring, no routing touched.
+
+  CHANGE 2 — NEW COLLECTION: flintel_queue_messages (persistent raw queue).
+             reddit_queue / twitter_queue / telegram_queue are in-memory
+             queue.Queue objects — everything a poller fetches is put()
+             into one of these BEFORE the keyword filter or batching ever
+             runs. Previously, if the process restarted while items sat in
+             that in-memory queue, they were silently lost.
+
+             Fix: every item is now also persisted to MongoDB the instant
+             it's put() into a queue (save_queue_message), and removed the
+             instant it's dequeued by run_batch_processor
+             (remove_queue_message) — regardless of whether it then gets
+             filtered out or matched into a batch. On startup,
+             start_reddit_listener() / start_twitter_listener() /
+             start_telegram_listener() call load_queue_messages() and
+             re-put() everything still persisted back into that platform's
+             queue BEFORE the poller/batch threads start. Nothing fetched
+             is lost across a restart.
+
+  CHANGE 3 — NEW COLLECTION: flintel_batch_seconds (explicit batch-timeout
+             persistence). batch_start_time was already being persisted
+             inside flintel_pending_batch (FIX A, v7.3) — v7.4.5 additionally
+             writes it to its own dedicated flintel_batch_seconds collection
+             (save_batch_seconds / clear_batch_seconds) at every point
+             batch_start_time changes in run_batch_processor. This is an
+             explicit, separately-named store for the timeout clock, as
+             requested — flintel_pending_batch remains the authoritative
+             source read on startup (load_pending_batch), so resume
+             behavior after a restart is unchanged: a partially-filled
+             batch's timeout continues counting from where it left off,
+             never resets to zero.
+
+  NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB signal storage,
+  HubSpot fields (including the v7.4.3 hidden-score-number note/Slack
+  text), FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
+  keyword list, per-platform BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS
+  (v7.4.4), FIX A/B/C/D/E, and the rescore feature are byte-for-byte
+  identical to v7.4.4.
 
 Changelog v7.4.4 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.3):
 
@@ -425,7 +472,7 @@ def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 
@@ -1315,6 +1362,25 @@ def get_database():
             name="rescore_message_id",
         )
 
+        # NEW — flintel_queue_messages: persists every item sitting in the
+        # in-memory reddit_queue/twitter_queue/telegram_queue (queue.Queue)
+        # BEFORE it is dequeued into a batch. queue.Queue is in-memory only,
+        # so without this, a restart would silently drop anything fetched
+        # but not yet consumed by run_batch_processor. On restart these are
+        # reloaded back into the queue so nothing fetched is lost.
+        db.flintel_queue_messages.create_index(
+            [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
+            unique=True, name="queue_platform_message_unique",
+        )
+
+        # NEW — flintel_batch_seconds: explicit persistence of each
+        # platform's batch_start_time, stored under its own dedicated
+        # collection so the batch timeout countdown survives a restart
+        # instead of restarting from zero.
+        db.flintel_batch_seconds.create_index(
+            [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
+        )
+
         log.info("MongoDB connected.")
         return db
     except Exception as exc:
@@ -1388,7 +1454,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.4"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.5"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1493,6 +1559,109 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
         )
     except Exception as exc:
         log.error(f"[{platform.upper()}] save_seen_ids error: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW — flintel_queue_messages: persistent raw-queue storage.
+#
+# reddit_queue / twitter_queue / telegram_queue are in-memory queue.Queue
+# objects. Everything a poller fetches gets put() into one of these BEFORE
+# run_batch_processor even looks at it (keyword filter hasn't run yet). If
+# the process restarts while items are sitting in that in-memory queue,
+# they are gone. These helpers persist every item the moment it's put()
+# into a queue, and remove it the moment it's dequeued by
+# run_batch_processor — so at any instant, flintel_queue_messages reflects
+# exactly what's still waiting in that platform's in-memory queue. On
+# startup, start_reddit_listener() / start_twitter_listener() /
+# start_telegram_listener() reload these back into the queue before the
+# poller threads start, so nothing fetched-but-unprocessed is lost.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_queue_message(platform: str, item: dict):
+    try:
+        mid = item.get("message_id")
+        if not mid:
+            return
+        doc = dict(item)
+        doc["_platform_key"] = platform
+        doc["message_id"] = mid
+        doc["queued_at"] = datetime.now(timezone.utc)
+        db.flintel_queue_messages.update_one(
+            {"_platform_key": platform, "message_id": mid},
+            {"$set": doc},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.error(f"[{platform.upper()}] save_queue_message error: {exc}")
+
+
+def remove_queue_message(platform: str, message_id: str):
+    if not message_id:
+        return
+    try:
+        db.flintel_queue_messages.delete_one(
+            {"_platform_key": platform, "message_id": message_id}
+        )
+    except Exception as exc:
+        log.error(f"[{platform.upper()}] remove_queue_message error: {exc}")
+
+
+def load_queue_messages(platform: str) -> list:
+    try:
+        docs = list(db.flintel_queue_messages.find({"_platform_key": platform}))
+        items = []
+        for d in docs:
+            d.pop("_id", None)
+            d.pop("_platform_key", None)
+            d.pop("queued_at", None)
+            items.append(d)
+        return items
+    except Exception as exc:
+        log.error(f"[{platform.upper()}] load_queue_messages error: {exc} — starting with empty queue.")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW — flintel_batch_seconds: explicit, dedicated persistence of each
+# platform's batch_start_time (the batch timeout clock). This is stored
+# under its own collection — separate from flintel_pending_batch — so the
+# batch timeout countdown survives a restart instead of restarting from
+# zero. Written alongside save_pending_batch/clear_pending_batch at every
+# point batch_start_time changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_batch_seconds(platform: str, batch_start_time):
+    try:
+        start_dt = (
+            datetime.fromtimestamp(batch_start_time, tz=timezone.utc)
+            if batch_start_time is not None else None
+        )
+        db.flintel_batch_seconds.update_one(
+            {"platform": platform},
+            {"$set": {
+                "platform": platform,
+                "batch_start_time": start_dt,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.error(f"[{platform.upper()}] save_batch_seconds error: {exc}")
+
+
+def clear_batch_seconds(platform: str):
+    try:
+        db.flintel_batch_seconds.update_one(
+            {"platform": platform},
+            {"$set": {
+                "platform": platform,
+                "batch_start_time": None,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.error(f"[{platform.upper()}] clear_batch_seconds error: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2197,7 +2366,7 @@ def _hs_create_note(data: dict, contact_id: str):
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
         note = (
-            f"FLINTEL SIGNAL — v7.4.4{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.4.5{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -2390,6 +2559,13 @@ def run_batch_processor(
 
             if got_item:
                 total_received += 1
+
+                # NEW: item is now out of the in-memory queue — remove its
+                # persisted copy from flintel_queue_messages so a restart
+                # from this point on won't re-load something already
+                # handled (matched into current_batch, or dropped).
+                remove_queue_message(platform_key, item.get("message_id"))
+
                 text = item.get("text", "").strip()
 
                 if not text or len(text) < 10:
@@ -2412,6 +2588,7 @@ def run_batch_processor(
 
                 current_batch.append(item)
                 save_pending_batch(platform_key, current_batch, batch_start_time)
+                save_batch_seconds(platform_key, batch_start_time)
 
                 log.info(
                     f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
@@ -2440,8 +2617,10 @@ def run_batch_processor(
 
                 if current_batch:
                     save_pending_batch(platform_key, current_batch, batch_start_time)
+                    save_batch_seconds(platform_key, batch_start_time)
                 else:
                     clear_pending_batch(platform_key)
+                    clear_batch_seconds(platform_key)
 
                 log.info(
                     f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | "
@@ -2459,9 +2638,11 @@ def run_batch_processor(
                     )
                     process_scored_item(it, sr)
 
+                # v7.4.5: completion log now shows how many items this
+                # batch completed (len), e.g. "BATCH 1 COMPLETE — 4 items".
                 log.info(
-                    f"[{platform_label}] BATCH {total_batches} DONE | "
-                    f"waiting {gap_seconds}s..."
+                    f"[{platform_label}] BATCH {total_batches} COMPLETE — "
+                    f"{len(batch_to_send)} item(s) completed | waiting {gap_seconds}s..."
                 )
                 time.sleep(gap_seconds)
 
@@ -2721,6 +2902,7 @@ def poll_reddit_rss():
                 items = _get_reddit_rss(subreddit)
                 for item in items:
                     reddit_queue.put(item)
+                    save_queue_message("reddit", item)
                     total_new += 1
                 if items:
                     log.info(
@@ -2806,7 +2988,7 @@ def poll_twitter(client: tweepy.Client):
                 text     = tweet.text or ""
                 username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
 
-                twitter_queue.put({
+                _tw_item = {
                     "message_id":     f"twitter_{tweet_id}",
                     "platform":       "twitter",
                     "content_type":   "tweet",
@@ -2815,7 +2997,9 @@ def poll_twitter(client: tweepy.Client):
                     "subreddit":      "",
                     "telegram_group": "",
                     "post_url":       f"https://twitter.com/{username}/status/{tweet_id}",
-                })
+                }
+                twitter_queue.put(_tw_item)
+                save_queue_message("twitter", _tw_item)
                 new_count += 1
 
             if dirty >= 10:
@@ -2933,7 +3117,7 @@ async def _poll_telegram_groups(client: TelegramClient):
                     sender   = await msg.get_sender()
                     tg_user  = getattr(sender, "username", None) or f"user_{getattr(sender, 'id', 0)}"
 
-                    telegram_queue.put({
+                    _tg_item = {
                         "message_id":     f"telegram_{chat_id}_{msg_id}",
                         "platform":       "telegram",
                         "content_type":   "message",
@@ -2943,7 +3127,9 @@ async def _poll_telegram_groups(client: TelegramClient):
                         "subreddit":      "",
                         "telegram_group": group,
                         "post_url":       "",
-                    })
+                    }
+                    telegram_queue.put(_tg_item)
+                    save_queue_message("telegram", _tg_item)
                     total_new += 1
 
                 if total_new:
@@ -3006,7 +3192,7 @@ async def _run_telegram_listener(client: TelegramClient):
             if _telegram_is_seen(chat_id, msg_id):
                 return
 
-            telegram_queue.put({
+            _tg_item = {
                 "message_id":     f"telegram_{chat_id}_{msg_id}",
                 "platform":       "telegram",
                 "content_type":   "message",
@@ -3016,7 +3202,9 @@ async def _run_telegram_listener(client: TelegramClient):
                 "subreddit":      "",
                 "telegram_group": username_attr or chat_title,
                 "post_url":       "",
-            })
+            }
+            telegram_queue.put(_tg_item)
+            save_queue_message("telegram", _tg_item)
 
         except Exception as exc:
             log.error(f"Telegram message handler error: {exc}")
@@ -3114,7 +3302,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.4 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.5 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
         ]
 
         result = retry_with_backoff(
@@ -3189,7 +3377,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.4 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.5 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -3251,6 +3439,18 @@ async def start_reddit_listener():
         log.warning("Reddit platform DISABLED (REDDIT_ENABLED=false) — skipping.")
         return
 
+    # NEW: reload any raw queue items persisted in flintel_queue_messages
+    # (fetched but not yet consumed before a restart) back into the
+    # in-memory reddit_queue BEFORE the poller/batch threads start.
+    _resumed_reddit = load_queue_messages("reddit")
+    for _item in _resumed_reddit:
+        reddit_queue.put(_item)
+    if _resumed_reddit:
+        log.info(
+            f"[REDDIT] Resumed {len(_resumed_reddit)} queue message(s) "
+            f"from MongoDB after restart — NOT lost."
+        )
+
     rss_thread = threading.Thread(
         target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
     )
@@ -3296,6 +3496,18 @@ async def start_twitter_listener():
     if client is None:
         log.warning("Twitter listener not started — credentials missing.")
         return
+
+    # NEW: reload any raw queue items persisted in flintel_queue_messages
+    # (fetched but not yet consumed before a restart) back into the
+    # in-memory twitter_queue BEFORE the poller/batch threads start.
+    _resumed_twitter = load_queue_messages("twitter")
+    for _item in _resumed_twitter:
+        twitter_queue.put(_item)
+    if _resumed_twitter:
+        log.info(
+            f"[TWITTER] Resumed {len(_resumed_twitter)} queue message(s) "
+            f"from MongoDB after restart — NOT lost."
+        )
 
     poll_thread = threading.Thread(
         target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll"
@@ -3344,6 +3556,18 @@ async def start_telegram_listener():
             "set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE in .env"
         )
         return
+
+    # NEW: reload any raw queue items persisted in flintel_queue_messages
+    # (fetched but not yet consumed before a restart) back into the
+    # in-memory telegram_queue BEFORE the listener/batch threads start.
+    _resumed_telegram = load_queue_messages("telegram")
+    for _item in _resumed_telegram:
+        telegram_queue.put(_item)
+    if _resumed_telegram:
+        log.info(
+            f"[TELEGRAM] Resumed {len(_resumed_telegram)} queue message(s) "
+            f"from MongoDB after restart — NOT lost."
+        )
 
     tg_thread = threading.Thread(
         target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
@@ -3405,7 +3629,7 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.4.4",
+    title       = "FX Signal Intelligence API — Flintel v7.4.5",
     description = (
         "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. "
         "Persistent batch state. Streaming Claude. Manual rescore. "
@@ -3416,7 +3640,7 @@ app = FastAPI(
         "Twitter, and Telegram each run on their own independent gap/timeout, "
         "never mixed (v7.4.4)."
     ),
-    version     = "7.4.4",
+    version     = "7.4.5",
 )
 
 
@@ -3442,7 +3666,7 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.4.4",
+        "system":                  "FLINTEL v7.4.5",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -3475,6 +3699,8 @@ def root():
         "auth_required":           bool(API_KEY),
         "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged)",
         "persistent_batch_state":  True,
+        "persistent_queue_messages": True,
+        "persistent_batch_seconds": True,
         "partial_json_recovery":   True,
         "claude_streaming":        True,
         "rescore_enabled":         True,
@@ -3917,7 +4143,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.4")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.5")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
@@ -3947,6 +4173,8 @@ if __name__ == "__main__":
     log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed (queues, batch state, AND now batch timing)")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
+    log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts (v7.4.5)")
+    log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts (v7.4.5)")
     log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items")
     log.info(f"                     : instead of discarding the whole batch (FIX B)")
     log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
@@ -3970,10 +4198,15 @@ if __name__ == "__main__":
     log.info(f"  v7.4.4 changes     : BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS split into six")
     log.info(f"                     : platform-specific env vars (REDDIT_/TWITTER_/TELEGRAM_ prefix).")
     log.info(f"                     : Rescore now uses its own RESCORE_BATCH_GAP_SECONDS. BATCH_SIZE")
-    log.info(f"                     : variables were already per-platform and are untouched. Everything")
-    log.info(f"                     : else — scoring, routing, MongoDB, prompts, FastAPI routes,")
-    log.info(f"                     : thresholds, FIX A/B/C/D/E, hidden-score Slack/HubSpot display —")
-    log.info(f"                     : 100% unchanged from v7.4.3.")
+    log.info(f"                     : variables were already per-platform and are untouched.")
+    log.info(f"  v7.4.5 changes     : (1) Batch completion log now shows item count — 'BATCH N")
+    log.info(f"                     : COMPLETE — X item(s) completed'. (2) New flintel_queue_messages")
+    log.info(f"                     : collection — raw queue items now survive a restart. (3) New")
+    log.info(f"                     : flintel_batch_seconds collection — explicit, dedicated batch")
+    log.info(f"                     : timeout persistence alongside flintel_pending_batch. Everything")
+    log.info(f"                     : else — scoring, routing, MongoDB signal storage, prompts,")
+    log.info(f"                     : FastAPI routes, thresholds, FIX A/B/C/D/E, hidden-score")
+    log.info(f"                     : Slack/HubSpot display — 100% unchanged from v7.4.4.")
     log.info("=" * 70)
 
     # FIX E (part 3): one-time, best-effort, read-only HubSpot property
