@@ -496,7 +496,13 @@ TARGET_SUBREDDITS = [
     "netsec", "AskNetsec", "sysadmin", "msp",
     "blueteamsec", "Scams", "personalfinance", "computerforensics",
     "GRC", "ThreatIntel", "Malware", "ThreatIntel", "hacking", "privacy",
-    "Stripe", "Banking", "SecurityCareerAdvice",
+    "Stripe", "Banking", "SecurityCareerAdvice", "sales", "salestechniques", "SaaS", "CRM", "freelance",
+    "salesforce", "Sales_Tech", "smallbusiness", "startups_marketing", "digital_marketing", "RevOps", "ProductManagement", "consulting",
+    "startups", "Entrepreneur", "EntrepreneurRideAlong",
+    "growmybusiness", "b2b_marketing", "marketing", 
+        "nocode", "automation", "productivity",
+    "software", "SoftwareEngineering", "webdev", "smallbusinessowner", "solopreneur", "indiehackers",
+    "microsaas", "SideProject", "Business_Ideas", "software", "SoftwareEngineering", "webdev",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,13 +518,7 @@ TARGET_TELEGRAM_GROUPS = [
     "moneytransfertips", "fxtraders_ng", "diaspora_finance",
     "crossborderpayments", "africabusiness", "africaentrepreneurs",
     "africatrade", "africafintech", "expatfinance", "diasporamoney",
-    "internationaltransfer", "wisealternatives", "sales", "salestechniques", "SaaS", "CRM", "freelance",
-    "salesforce", "Sales_Tech", "smallbusiness", "startups_marketing", "digital_marketing", "RevOps", "ProductManagement", "consulting",
-    "startups", "Entrepreneur", "EntrepreneurRideAlong",
-    "growmybusiness", "b2b_marketing", "marketing", 
-        "nocode", "automation", "productivity",
-    "software", "SoftwareEngineering", "webdev", "smallbusinessowner", "solopreneur", "indiehackers",
-    "microsaas", "SideProject", "Business_Ideas", "software", "SoftwareEngineering", "webdev",
+    "internationaltransfer", "wisealternatives",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
