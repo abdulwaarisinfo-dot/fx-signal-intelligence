@@ -1,72 +1,66 @@
 """
-FLINTEL v8.0 — Generic Signal Scorer (Slack + HubSpot removed)
-================================================================
-Platforms : Reddit (feedparser RSS, public .json enrichment) +
-            Twitter/X (tweepy v2) + Telegram (Telethon)
+FLINTEL v9.4 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE)
+                + Twitter/X Signal Scorer
+=================================================================================
+Platforms : Reddit — DataForSEO SERP discovery ONLY (Google search,
+            site:reddit.com, real per-post rank -> Reddit public .json)
+          + Twitter/X (tweepy v2)
 
-WHAT CHANGED FROM v7.4.5 — CONTENT + FORMAT ONLY, ARCHITECTURE AS-IS:
+WHAT CHANGED FROM v9.3 — per explicit instruction:
 
-  REMOVED ENTIRELY:
-    - Slack delivery (send_slack_alert, send_operator_alert-to-Slack,
-      daily digest, weekly report, the whole scheduler loop)
-    - HubSpot delivery (all _hs_* functions, HUBSPOT_API_KEY,
-      fx_intent_score / fx_* contact properties)
-    - Old FX-specific Claude prompts (_SCORING_CORE +
-      CLAUDE_SYSTEM_PROMPT_REDDIT/TWITTER/TELEGRAM) and their output
-      fields (corridor, competitor_mentioned, pain_type, twitter_dm,
-      twitter_reply, linkedin_message, telegram_dm, tier,
-      signal_category, hubspot_priority, MIN_SCORE_MEDIUM/HIGH tiers)
+  1. CHANGED — flintel_keywords is now FETCH-ONCE-FOREVER, not TTL-based.
+     Every keyword in REDDIT_SEARCH_KEYWORDS gets its own document:
+         { keyword, fetched, last_fetched_at, created_at }
+     There is NO next_due_at, NO 12h/24h re-fetch, NO expiry of any kind:
+       - fetched=False (never fetched, or brand new)  -> due NOW, gets
+         fetched from DataForSEO exactly once
+       - fetched=True                                  -> PERMANENTLY
+         skipped, forever, even after restarts, even after any amount
+         of time passes. There is no scenario in which an already-
+         fetched keyword goes back to DataForSEO on its own.
+     This guarantees Claude/signals data is never disturbed by the same
+     keyword being re-searched and re-processed again later — each
+     keyword contributes exactly one discovery pass to the system, ever.
 
-  REPLACED:
-    - ONE new generic, niche-agnostic Claude prompt (CLAUDE_SYSTEM_PROMPT)
-      used for all three platforms, scoring 1-100 via three weighted
-      components (relevance / google visibility / engagement) instead of
-      the old 1-10 FX-specific model. Output: intent_score, is_relevant,
-      reply_draft — nothing else.
-    - New MongoDB `signals` schema: message_id, platform, post_url, text,
-      username, subreddit_or_channel, posted_at, fetched_at, google_rank,
-      search_volume, upvotes, comments, search_keyword, intent_score,
-      is_relevant, reply_draft, client_id, status, created_at.
+  2. New keywords are still picked up automatically and sequentially:
+     sync_keywords_to_db() inserts any brand-new keyword with
+     fetched=False on every poll pass (KEYWORD_CHECK_INTERVAL_SECONDS,
+     default 60s) — so adding a keyword gets it fetched on the very
+     next pass, one at a time, same as before. Only the "what happens
+     after it's fetched" behavior changed (permanent True vs TTL-expiry).
 
-  KEPT 100% AS-IS (architecture, not content):
-    - queue.Queue per platform (reddit_queue/twitter_queue/telegram_queue)
-    - Keyword pre-filter list + passes_keyword_filter()
-    - TARGET_SUBREDDITS, TARGET_TELEGRAM_GROUPS — verbatim
-    - Persistent batch state (flintel_pending_batch), persistent dedup
-      (flintel_seen_ids), persistent raw-queue (flintel_queue_messages),
-      persistent batch-timeout clock (flintel_batch_seconds) — all the
-      v7.3/v7.4.5 restart-survival fixes
-    - Per-platform BATCH_GAP_SECONDS / BATCH_TIMEOUT_SECONDS (v7.4.4)
-    - Claude streaming transport (FIX C) + partial-JSON truncation
-      recovery (FIX B)
-    - Twitter search query built dynamically from KEYWORDS (FIX 1)
-    - Platform enable/disable flags + working indicators (FIX D)
-    - API-key-protected FastAPI read endpoints
-    - Rescore batch/poll/gap timing variables and mechanism shape —
-      only the SOURCE changed: instead of polling a separate
-      flintel_rescore_messages collection, run_rescore_processor() now
-      polls the `signals` collection directly for {"status": "pending"}
-      documents (written by the separate rescore.py migration helper
-      after it re-enriches an old document). Confirmed documents are
-      never re-touched; new live documents never carry a pending status
-      in the first place.
+  3. RESTART-SAFE BY DESIGN — sync_keywords_to_db() uses $setOnInsert,
+     so it is 100% idempotent: existing keyword documents (their
+     fetched/last_fetched_at state) are NEVER reset or touched on
+     restart. Only brand-new keywords get inserted, with fetched=False.
+     This means:
+       - Restart mid-run -> already-fetched keywords stay permanently
+         skipped, picks up exactly where it left off. NEVER starts
+         from zero, NEVER re-fetches a keyword it already did.
+       - Add new keywords to REDDIT_SEARCH_KEYWORDS -> they appear in
+         flintel_keywords as fetched=False on the very next sync pass
+         and get fetched immediately, one at a time (sequential).
 
-  NEW ENRICHMENT (real, not placeholder):
-    - Reddit upvotes/comments: fetched from Reddit's public
-      `<post_url>.json` endpoint — no OAuth/PRAW credentials needed,
-      same "no credentials required" philosophy as the RSS poller.
-    - Twitter likes/replies: already returned by tweepy's
-      `public_metrics` tweet field at poll time — no extra call needed.
-    - Telegram views/forwards: already present on the Telethon message
-      object at poll/listen time — no extra call needed.
-    - Google rank + search volume: fetched via SerpApi (SERPAPI_KEY) for
-      rank, and via DataForSEO Labs (DATAFORSEO_LOGIN/PASSWORD) for
-      monthly search volume. NOTE: Google Search Console is NOT the
-      right tool here — GSC only reports performance for a site YOU
-      OWN in Search Console; it cannot tell you a random Reddit post's
-      organic rank for a keyword. A SERP-tracking API (SerpApi,
-      DataForSEO, etc.) is what actually answers "where does this
-      keyword rank on Google" for arbitrary URLs.
+  4. KEPT AS-IS — everything from v9.3:
+     - post_url dedup check BEFORE .json fetch / BEFORE Claude
+       (is_post_already_signaled()) — a separate, independent safety
+       net from the keyword-level cache above.
+     - reddit_queue / twitter_queue separate, never mixed.
+     - Persistent batch state (flintel_pending_batch), persistent
+       dedup for Twitter (flintel_seen_ids), persistent raw-queue
+       (flintel_queue_messages), persistent batch-timeout clock
+       (flintel_batch_seconds). REDDIT_BATCH_GAP_SECONDS /
+       REDDIT_BATCH_TIMEOUT_SECONDS unchanged — this governs the
+       Claude-scoring batch pacing, completely separate from the
+       keyword discovery cache above.
+     - Claude streaming transport + partial-JSON truncation recovery.
+     - Claude-failure items saved with status="pending", automatically
+       retried by run_rescore_processor() (reuses stored enrichment,
+       never re-fetches from Reddit/.json or DataForSEO).
+     - Platform enable/disable flags (REDDIT_ENABLED, TWITTER_ENABLED).
+     - API-key-protected FastAPI read endpoints (+ new /keywords status
+       endpoint to inspect the TTL cache).
+     - Claude input/output schema UNCHANGED.
 """
 
 import asyncio
@@ -76,24 +70,13 @@ import json
 import time
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-import html
-import re
-import feedparser
 import anthropic
 import httpx
 import tweepy
 import requests
-from telethon import TelegramClient, events
-from telethon.errors import (
-    UserAlreadyParticipantError,
-    InviteHashExpiredError,
-    ChannelPrivateError,
-    FloodWaitError,
-)
-from telethon.tl.functions.channels import JoinChannelRequest
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 from fastapi import FastAPI, HTTPException, Security, Depends
@@ -118,16 +101,9 @@ log = logging.getLogger("flintel")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
-
 TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
-
-TELEGRAM_API_ID      = int(os.getenv("TELEGRAM_API_ID", "0"))
-TELEGRAM_API_HASH    = os.getenv("TELEGRAM_API_HASH", "")
-TELEGRAM_PHONE       = os.getenv("TELEGRAM_PHONE", "")
-TELEGRAM_SESSION     = os.getenv("TELEGRAM_SESSION", "flintel_telegram")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
@@ -135,39 +111,93 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "settla")
 
-# The single keyword/topic this deployment tracks. This is the ONLY
-# "context" Claude ever receives about what niche/product this is for.
+# Optional generic label/context — used ONLY as a fallback google_rank
+# lookup for Twitter items (Twitter has no per-post SERP discovery in
+# this design, so there is no "real" per-post rank for a tweet). If left
+# empty, Twitter items simply get google_rank=None / search_volume=None.
 SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
 
-# Google rank via SerpApi; search volume via DataForSEO Labs. Both real,
-# functional integrations below — just need the account/keys set in .env.
-SERPAPI_KEY          = os.getenv("SERPAPI_KEY", "")
-DATAFORSEO_LOGIN     = os.getenv("DATAFORSEO_LOGIN", "")
-DATAFORSEO_PASSWORD  = os.getenv("DATAFORSEO_PASSWORD", "")
+# ── DataForSEO — SOLE provider for both Google rank AND search volume.
+DATAFORSEO_LOGIN    = os.getenv("DATAFORSEO_LOGIN", "")
+DATAFORSEO_PASSWORD = os.getenv("DATAFORSEO_PASSWORD", "")
+
+# ── DataForSEO call timeouts — configurable so a slow keyword doesn't
+# get killed early. These are LIVE endpoint calls (api.dataforseo.com/.../live/...)
+# — real-time, no polling/task-based async needed.
+DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
+DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
+REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))
 
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
-TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
 RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
 
-REDDIT_BATCH_GAP_SECONDS       = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",       "30"))
-REDDIT_BATCH_TIMEOUT_SECONDS   = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",   "120"))
+REDDIT_BATCH_GAP_SECONDS      = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",      "30"))
+REDDIT_BATCH_TIMEOUT_SECONDS  = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",  "120"))
 
-TWITTER_BATCH_GAP_SECONDS      = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",      "30"))
-TWITTER_BATCH_TIMEOUT_SECONDS  = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS",  "120"))
-
-TELEGRAM_BATCH_GAP_SECONDS     = int(os.getenv("TELEGRAM_BATCH_GAP_SECONDS",     "30"))
-TELEGRAM_BATCH_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))
+TWITTER_BATCH_GAP_SECONDS     = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",     "30"))
+TWITTER_BATCH_TIMEOUT_SECONDS = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", "120"))
 
 RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
 RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
-TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "300"))
-TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
 
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
-CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
+
+# ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
+# Keywords now live DIRECTLY in this Python list — no .env / os.getenv
+# involved. To add a new keyword, just add a new string to this list and
+# restart (or, if hot-reload is set up, it gets picked up on the next
+# sync pass). Everything downstream is unchanged:
+#   - sync_keywords_to_db() inserts any keyword NOT already in
+#     flintel_keywords with fetched=False.
+#   - get_due_keywords() picks up only fetched=False keywords.
+#   - mark_keyword_fetched() flips a keyword to fetched=True PERMANENTLY
+#     right after it finishes processing — it will never be re-fetched.
+REDDIT_SEARCH_KEYWORDS = [
+    "Wise blocked my account",
+    "bank blocked my transfer",
+    "Wise Business restricted",
+    "Payoneer account blocked",
+    "cross border payment problem",
+    "CRM is a nightmare",
+    "our CRM is a mess",
+    "recommend a CRM for small business",
+    "we got hacked",
+    "ransomware attack",
+    "need incident response",
+    "Salesforce alternative",
+    "switching from HubSpot",
+]
+
+# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
+# A keyword is fetched from DataForSEO exactly ONE time, ever. Once marked
+# fetched=True, it is PERMANENTLY skipped — no 12h/24h/whatever re-fetch,
+# no TTL expiry, nothing. This guarantees Claude/signals data is never
+# disturbed by the same keyword being re-searched and re-processed later.
+# The ONLY way a keyword gets processed again is if it is removed from
+# flintel_keywords manually (or the collection is reset).
+#
+# KEYWORD_CHECK_INTERVAL_SECONDS -> how often the loop wakes up to ask
+#                        "are there any NEW (never-fetched) keywords?"
+#                        This is a cheap DB query, NOT a DataForSEO call.
+KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
+
+SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
+SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
+SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
+
+# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, can differ ──
+TWITTER_SEARCH_KEYWORDS = [
+    kw.strip() for kw in os.getenv(
+        "TWITTER_SEARCH_KEYWORDS",
+        "Wise blocked,bank blocked my transfer,Payoneer blocked,"
+        "cross border payment,CRM is a nightmare,recommend a CRM,"
+        "we got hacked,ransomware attack,need incident response,"
+        "Salesforce alternative,switching from HubSpot"
+    ).split(",") if kw.strip()
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH (unchanged)
@@ -190,16 +220,15 @@ async def verify_api_key(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLATFORM ENABLE / DISABLE FLAGS (unchanged; FIX D indicators)
+# PLATFORM ENABLE / DISABLE FLAGS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
-TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
-TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
+REDDIT_ENABLED  = _bool_env("REDDIT_ENABLED",  True)
+TWITTER_ENABLED = _bool_env("TWITTER_ENABLED", False)
 
 
 def _working(flag: bool) -> str:
@@ -207,680 +236,36 @@ def _working(flag: bool) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TARGET SUBREDDITS — 100% AS-IS, verbatim from v7.4.5
+# SHARED QUEUES — platform-isolated, NEVER mixed.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TARGET_SUBREDDITS = [
-    "Nigeria", "lagos", "Nigerians", "NigeriansAbroad",
-    "AfricanDiaspora", "pakistan", "Pakistani", "PakistaniDiaspora",
-    "PersonalFinanceCanada", "PersonalFinanceUK", "personalfinance",
-    "entrepreneur", "smallbusiness", "digitalnomad", "africatech",
-    "UKPersonalFinance", "Remittance", "moneytransfer",
-    "CanadianInvestor", "ExpatFinance", "cybersecurity",
-    "netsec", "AskNetsec", "sysadmin", "msp",
-    "blueteamsec", "Scams", "personalfinance", "computerforensics",
-    "GRC", "ThreatIntel", "Malware", "ThreatIntel", "hacking", "privacy",
-    "Stripe", "Banking", "SecurityCareerAdvice", "sales", "salestechniques", "SaaS", "CRM", "freelance",
-    "salesforce", "Sales_Tech", "smallbusiness", "startups_marketing", "digital_marketing", "RevOps", "ProductManagement", "consulting",
-    "startups", "Entrepreneur", "EntrepreneurRideAlong",
-    "growmybusiness", "b2b_marketing", "marketing",
-        "nocode", "automation", "productivity",
-    "software", "SoftwareEngineering", "webdev", "smallbusinessowner", "solopreneur", "indiehackers",
-    "microsaas", "SideProject", "Business_Ideas", "software", "SoftwareEngineering", "webdev",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TARGET TELEGRAM GROUPS — 100% AS-IS, verbatim from v7.4.5
-# ─────────────────────────────────────────────────────────────────────────────
-
-TARGET_TELEGRAM_GROUPS = [
-    "nigeriansincanada", "nigeriansinuk", "nigeriansinusa",
-    "nigeriansinaustralia", "nigeriandiaspora", "nigerianentrepreneurs",
-    "lagosBusinessNetwork", "nigeriafinance", "pakistanisincanada",
-    "pakistanisinuk", "pakistanisinusa", "pakistanidiaspora",
-    "pakistanibusiness", "karachi_business", "remittancetalk",
-    "moneytransfertips", "fxtraders_ng", "diaspora_finance",
-    "crossborderpayments", "africabusiness", "africaentrepreneurs",
-    "africatrade", "africafintech", "expatfinance", "diasporamoney",
-    "internationaltransfer", "wisealternatives",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — platform-isolated, never mixed (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-reddit_queue:   queue.Queue = queue.Queue()
-twitter_queue:  queue.Queue = queue.Queue()
-telegram_queue: queue.Queue = queue.Queue()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER — 100% AS-IS, verbatim from v7.4.5
-# ─────────────────────────────────────────────────────────────────────────────
-
-KEYWORDS = [
-    # ── SENDING MONEY ────────────────────────────────────────────────────────
-    "send money to", "sending money to", "transfer money to",
-    "transferring money to", "wire money to", "wiring money to",
-    "move money to", "moving money to", "remit money to",
-    "remitting money to", "pay my supplier", "paying my supplier",
-    "pay a supplier", "paying a supplier", "pay my vendor",
-    "paying my vendor", "pay my manufacturer", "pay my factory",
-    "pay my partner", "pay my contractor", "pay an invoice",
-    "paying an invoice", "settle an invoice", "settling an invoice",
-    "pay a business", "business payment to", "supplier payment to",
-    "vendor payment to", "invoice payment to", "international payment to",
-    "overseas payment to", "cross border payment", "cross-border payment",
-    "cross border transfer", "cross-border transfer",
-    "international transfer", "international wire",
-    "international wire transfer", "foreign wire transfer",
-    "overseas wire transfer", "overseas transfer", "global payment",
-    "global transfer", "b2b payment", "b2b transfer",
-    "business to business payment",
-
-    # ── BANK BLOCKING ────────────────────────────────────────────────────────
-    "bank blocked my", "bank blocked my transfer", "bank blocked my payment",
-    "bank blocked my wire", "bank blocked my transaction",
-    "bank flagged my", "bank flagged my transfer", "bank flagged my payment",
-    "bank rejected my", "bank rejected my transfer", "bank rejected my payment",
-    "bank declined my", "bank declined my transfer",
-    "bank won't let me transfer", "bank won't let me send",
-    "bank refuses to", "bank holding my", "bank holding my funds",
-    "bank holding my money", "bank froze my", "account frozen",
-    "funds frozen", "money frozen", "transfer frozen", "payment frozen",
-    "transfer blocked", "payment blocked", "wire blocked",
-    "transaction blocked", "transfer rejected", "payment rejected",
-    "wire rejected", "transfer declined", "payment declined",
-    "transfer failed", "payment failed", "wire failed",
-    "transfer stuck", "payment stuck", "money stuck", "funds stuck",
-    "money held", "funds held", "money hostage", "holding my money",
-    "holding my funds", "won't release my funds", "won't release my money",
-    "compliance hold", "compliance review", "compliance check",
-    "AML hold", "AML review", "AML flag", "flagged for review",
-    "flagged as suspicious", "suspicious activity", "suspicious transaction",
-    "frozen for review", "under review", "transfer delayed",
-    "payment delayed", "wire delayed", "transfer pending",
-    "stuck in pending", "days to process", "weeks to process",
-    "10-14 days", "10 to 14 days", "two weeks to transfer",
-    "transfer taking forever", "payment taking forever",
-    "money hasn't arrived", "money still hasn't arrived",
-    "payment hasn't arrived", "where is my transfer",
-    "where is my payment", "where is my money", "where did my money go",
-    "money disappeared", "payment disappeared", "transfer disappeared",
-    "no tracking", "can't track my transfer", "can't track my payment",
-    "no update on my transfer", "no update on my payment",
-
-    # ── FEE FRUSTRATION ──────────────────────────────────────────────────────
-    "SWIFT fees", "SWIFT charges", "wire transfer fees",
-    "wire transfer charges", "international transfer fees",
-    "international wire fees", "transfer fees too high",
-    "transfer fees killing", "fees killing my margins",
-    "fees eating my margins", "fees eating my profit",
-    "exchange rate terrible", "exchange rate awful", "exchange rate bad",
-    "terrible exchange rate", "awful exchange rate", "bad exchange rate",
-    "worst exchange rate", "exchange rate ripoff", "exchange rate rip off",
-    "hidden fees", "hidden charges", "unexpected fees",
-    "unexpected charges", "FX fees", "FX charges", "FX markup",
-    "FX spread", "currency conversion fee", "currency conversion charge",
-    "conversion fee too high", "conversion markup",
-    "losing money on transfer", "losing money on fees",
-    "losing money to fees", "losing money exchanging",
-    "percentage on transfer", "percentage on payment",
-    "ripping me off", "highway robbery", "daylight robbery",
-    "absolute ripoff", "total ripoff", "complete ripoff",
-    "charging too much", "too expensive to send", "too expensive to transfer",
-    "cheapest way to send", "cheapest way to transfer",
-    "cheapest international transfer", "cheapest cross border",
-    "better rate than", "better rates than", "cheaper than SWIFT",
-    "cheaper than wire", "SWIFT alternative", "alternative to SWIFT",
-    "avoid SWIFT fees", "avoid wire fees", "correspondent bank fees",
-    "intermediary bank fees", "intermediary fees",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "Wise Business", "Wise business account", "Wise transfer",
-    "Wise payment", "Wise blocked", "Wise restricted", "Wise suspended",
-    "Wise account restricted", "Wise account suspended",
-    "Wise account blocked", "Wise account closed", "Wise limit",
-    "Wise holding", "leaving Wise", "left Wise", "moving off Wise",
-    "moved off Wise", "switching from Wise", "switched from Wise",
-    "never using Wise", "done with Wise", "Wise is terrible",
-    "Wise is awful", "Wise is a joke", "hate Wise", "Wise disappointed",
-    "TransferWise",
-    "Remitly blocked", "Remitly restricted", "Remitly limit",
-    "Remitly failed", "leaving Remitly", "switching from Remitly",
-    "Remitly alternative",
-    "Payoneer blocked", "Payoneer restricted", "Payoneer suspended",
-    "Payoneer account blocked", "Payoneer account restricted",
-    "Payoneer account suspended", "Payoneer limit", "Payoneer holding",
-    "leaving Payoneer", "switching from Payoneer", "Payoneer alternative",
-    "alternative to Payoneer",
-    "WorldRemit failed", "WorldRemit blocked", "WorldRemit problem",
-    "WorldRemit issue", "WorldRemit terrible",
-    "Western Union failed", "Western Union blocked",
-    "Western Union delayed", "Western Union problem",
-    "leaving Western Union", "WU failed", "WU blocked",
-    "OFX failed", "OFX blocked", "OFX problem", "OFX issue",
-    "Revolut blocked", "Revolut restricted", "Revolut suspended",
-    "Revolut Business blocked", "Revolut Business restricted",
-    "Revolut account blocked", "Revolut account restricted",
-    "Revolut holding", "leaving Revolut", "switching from Revolut",
-    "Stripe blocked", "Stripe restricted", "Stripe account blocked",
-    "Stripe account restricted",
-    "Mercury blocked", "Mercury restricted", "Mercury bank blocked",
-    "LemFi failed", "LemFi blocked", "LemFi problem",
-    "Grey Finance failed", "Grey Finance blocked", "Grey Finance problem",
-    "NALA failed", "NALA blocked", "NALA problem",
-    "Chipper Cash failed", "Chipper Cash blocked", "Chipper Cash problem",
-    "alternative to Wise", "alternative to Remitly",
-    "alternative to Payoneer", "alternative to WorldRemit",
-    "alternative to Western Union", "alternative to Revolut",
-    "better than Wise", "better than Remitly", "better than Payoneer",
-    "better than WorldRemit", "better than Western Union",
-    "competitors to Wise", "Wise competitors", "Payoneer competitors",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a payment", "recommend a transfer", "recommend a service",
-    "recommend a platform", "recommend an app", "recommend a provider",
-    "recommend a solution", "anyone recommend", "can anyone recommend",
-    "does anyone recommend", "what payment service", "what transfer service",
-    "what payment platform", "what transfer platform", "what payment app",
-    "what transfer app", "which payment service", "which transfer service",
-    "which payment platform", "which transfer platform",
-    "which payment app", "which transfer app", "which payment provider",
-    "which service is best", "which platform is best", "which app is best",
-    "best payment service", "best transfer service", "best payment platform",
-    "best transfer platform", "best payment app", "best transfer app",
-    "best way to send", "best way to transfer", "best way to pay",
-    "fastest way to send", "fastest way to transfer",
-    "cheapest way to send", "cheapest way to transfer",
-    "how do I send", "how do I transfer", "how do I pay",
-    "how can I send", "how can I transfer", "how can I pay",
-    "looking for a payment", "looking for a transfer",
-    "looking for a platform", "looking for a service",
-    "looking for a solution", "searching for a payment",
-    "need a payment solution", "need a transfer solution",
-    "need a payment platform", "need a transfer platform",
-    "anyone using", "does anyone use", "has anyone used",
-    "who uses", "who do you use", "what do you use", "what are you using",
-    "tried everything", "tried so many", "tried multiple", "tried several",
-    "nothing works", "none of them work", "still haven't found",
-    "still looking for", "still searching for",
-
-    # ── BUSINESS CONTEXT ─────────────────────────────────────────────────────
-    "my supplier", "my suppliers", "our supplier", "our suppliers",
-    "my vendor", "my vendors", "our vendor", "our vendors",
-    "my manufacturer", "my manufacturers", "our manufacturer",
-    "my factory", "our factory", "my business partner",
-    "our business partner", "my contractor", "our contractor",
-    "my client overseas", "our client overseas",
-    "import business", "importing business", "export business",
-    "exporting business", "import export", "import/export",
-    "importing goods", "exporting goods", "importing products",
-    "exporting products", "buying from overseas", "buying from abroad",
-    "sourcing from", "sourcing overseas", "sourcing abroad",
-    "purchase order", "business invoice", "supplier invoice",
-    "vendor invoice", "trade finance", "trade payment",
-    "trade financing", "supply chain payment", "supply chain finance",
-    "diaspora business", "diaspora entrepreneur",
-    "running a business", "my business needs", "for my business",
-    "business account", "business transfer", "business wire",
-    "corporate payment", "corporate transfer", "corporate wire",
-    "company payment", "company transfer", "B2B payment", "B2B transfer",
-    "B2B transaction", "business to business",
-
-    # ── CORRIDOR KEYWORDS ────────────────────────────────────────────────────
-    "to Nigeria", "to Lagos", "to Abuja", "from Nigeria",
-    "Nigeria payment", "Nigeria transfer", "Nigeria wire",
-    "Nigerian supplier", "Nigerian vendor", "Nigerian manufacturer",
-    "Nigeria business", "CAD to NGN", "GBP to NGN", "USD to NGN",
-    "EUR to NGN", "AUD to NGN", "naira payment", "naira transfer",
-    "send naira", "receive naira",
-    "to Pakistan", "to Karachi", "to Lahore", "to Islamabad",
-    "from Pakistan", "Pakistan payment", "Pakistan transfer",
-    "Pakistan wire", "Pakistani supplier", "Pakistani vendor",
-    "Pakistani manufacturer", "CAD to PKR", "GBP to PKR", "USD to PKR",
-    "rupee payment", "rupee transfer",
-    "to India", "to Mumbai", "to Delhi", "to Bangalore", "from India",
-    "India payment", "India transfer", "India wire",
-    "Indian supplier", "Indian vendor", "Indian manufacturer",
-    "CAD to INR", "GBP to INR", "USD to INR",
-    "to Ghana", "to Accra", "from Ghana", "Ghana payment",
-    "Ghana transfer", "Ghanaian supplier", "GHS payment", "cedi payment",
-    "to Kenya", "to Nairobi", "from Kenya", "Kenya payment",
-    "Kenya transfer", "Kenyan supplier", "KES payment",
-    "M-Pesa business", "Mpesa business",
-    "to Ethiopia", "to Senegal", "to Ivory Coast", "to Cameroon",
-    "to Tanzania", "to Uganda", "to Zimbabwe", "to South Africa",
-    "to Johannesburg", "African supplier", "African vendor",
-    "African manufacturer", "Africa payment", "Africa transfer",
-    "from Canada", "from Toronto", "from Vancouver", "from Calgary",
-    "from Ottawa", "from Montreal", "from UK", "from London",
-    "from Manchester", "from Birmingham", "from Glasgow",
-    "from USA", "from New York", "from Houston", "from Atlanta",
-    "from Washington", "from Australia", "from Sydney", "from Melbourne",
-    "from Perth", "from UAE", "from Dubai", "from Abu Dhabi",
-
-    # ── AMOUNT SIGNALS ───────────────────────────────────────────────────────
-    "$10,000", "$10k", "10 thousand", "$15,000", "$15k", "15 thousand",
-    "$20,000", "$20k", "20 thousand", "$25,000", "$25k", "25 thousand",
-    "$30,000", "$30k", "30 thousand", "$40,000", "$40k", "40 thousand",
-    "$45,000", "$45k", "45 thousand", "$50,000", "$50k", "50 thousand",
-    "$60,000", "$60k", "60 thousand", "$75,000", "$75k", "75 thousand",
-    "$80,000", "$80k", "80 thousand", "$100,000", "$100k", "100 thousand",
-    "$150,000", "$150k", "150 thousand", "$200,000", "$200k", "200 thousand",
-    "$250,000", "$250k", "250 thousand", "$500,000", "$500k", "500 thousand",
-    "$750,000", "$750k", "750 thousand",
-    "$1 million", "$1m", "one million",
-    "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
-    "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
-    "£100,000", "£100k", "£200,000", "£200k",
-    "large transfer", "large amount", "large payment", "large wire",
-    "large sum", "significant amount", "substantial amount",
-    "big transfer", "big payment", "six figures", "seven figures",
-    "six-figure", "seven-figure", "monthly volume", "weekly volume",
-
-    # ── COMPLIANCE PAIN ──────────────────────────────────────────────────────
-    "KYC rejected", "KYC failed", "KYC verification failed",
-    "KYC problem", "KYC issue", "KYC nightmare",
-    "AML rejected", "AML flagged", "AML hold", "AML review",
-    "documentation rejected", "documents rejected",
-    "proof of funds", "source of funds", "source of wealth",
-    "proof of business", "business verification failed",
-    "verification rejected", "verification failed",
-    "compliance rejected", "compliance hold", "compliance review",
-    "compliance nightmare", "compliance problem", "compliance issue",
-    "Form M", "CBN compliance", "regulatory hold", "regulatory review",
-    "regulatory problem", "regulatory issue",
-    "submitted documents again", "sent documents again",
-    "asking for documents again", "same documents again",
-    "keep asking for documents", "keep rejecting documents",
-    "third time submitting", "fourth time submitting",
-    "rejected again", "blocked again", "failed again",
-    "happening again", "third time", "fourth time",
-    "keep blocking", "keeps blocking", "keeps rejecting", "keeps failing",
-    "always blocks", "always rejects", "always fails",
-
-    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
-    "urgently", "urgent", "desperately", "desperate",
-    "ASAP", "as soon as possible", "right now", "today",
-    "this week", "by Friday", "by Monday", "by end of week",
-    "by end of month", "deadline", "time sensitive",
-    "need it done", "need it now", "need it today", "need it urgently",
-    "waiting on payment", "supplier is waiting", "supplier waiting",
-    "vendor is waiting", "vendor waiting", "manufacturer waiting",
-    "partner waiting", "been waiting", "already delayed", "already late",
-    "overdue", "past due", "losing the contract", "losing my supplier",
-    "losing my vendor", "threatening to cancel", "might cancel",
-    "going to cancel", "cancelling the order", "losing the deal",
-    "deal at risk", "relationship at risk",
-    "can't wait any longer", "running out of time", "no more time",
-
-    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
-    "just signed a supplier", "signed a new supplier", "found a supplier",
-    "new supplier in", "signed a contract with", "new contract with",
-    "starting to import", "starting an import", "starting to export",
-    "starting an export", "launching in", "expanding to",
-    "entering the market", "new market", "setting up payments",
-    "need to set up payments", "need to transfer money",
-    "will need to send", "will need to transfer", "going to need",
-    "starting a business", "new business", "import business",
-    "export business", "trading company", "sourcing products from",
-    "sourcing goods from", "buying products from", "buying goods from",
-    "manufacturing in", "producing in",
-
-    # ── TREASURY & FX ────────────────────────────────────────────────────────
-    "treasury management", "cash management", "liquidity management",
-    "FX management", "FX exposure", "FX risk", "FX hedging",
-    "currency hedging", "currency risk", "currency exposure",
-    "FX solution", "FX platform", "FX tool",
-    "treasury solution", "treasury platform", "cash flow management",
-    "multi currency", "multi-currency", "multicurrency",
-    "currency account", "foreign currency account",
-    "international banking", "international bank account",
-    "global banking", "global bank account", "correspondent banking",
-    "banking relationship", "banking partner",
-    "payment infrastructure", "payment rails", "payment solution",
-    "payment platform", "payment provider", "payment partner",
-    "fintech payment", "embedded payment", "embedded finance",
-    "cross border banking", "international banking solution",
-    "FX banking", "FX banking relationship", "FX liquidity",
-    "cash pooling", "cash concentration",
-    "intercompany payment", "intercompany transfer",
-
-    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
-    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
-    "FX trader", "treasury director", "head of treasury", "VP treasury",
-    "international payments manager", "global payments manager",
-    "cross border payments", "payments operations manager",
-    "payments specialist", "treasury specialist", "FX specialist",
-    "international finance manager", "global finance manager",
-    "head of payments", "director of payments", "VP payments",
-    "chief financial officer", "head of finance", "finance director",
-    "controller international", "global controller",
-
-    # ----------- CYBER SECURITY ---------
-
-    "we got hacked", "we got breached", "company got hacked",
-    "company got breached", "data breach", "we had a breach",
-    "security breach", "breach happened", "just got ransomwared",
-    "ransomware attack", "ransomware hit us", "hit by ransomware",
-    "encrypted our files", "files got encrypted", "systems encrypted",
-    "locked out of our systems", "locked out of our servers",
-    "attacker got in", "attackers got in", "unauthorized access",
-    "someone accessed our", "someone breached our", "network compromised",
-    "systems compromised", "account compromised", "accounts compromised",
-    "email compromised", "credentials leaked", "credentials stolen",
-    "password leaked", "passwords leaked", "data leaked", "data exposed",
-    "customer data exposed", "customer data leaked", "PII exposed",
-    "PII leaked", "source code leaked", "database leaked",
-    "database exposed", "exfiltrated data", "data exfiltration",
-    "phishing attack", "phishing email", "spear phishing",
-    "business email compromise", "BEC attack", "CEO fraud",
-    "invoice fraud", "wire fraud attack", "supply chain attack",
-    "zero day exploit", "zero-day exploit", "actively exploited",
-    "malware infection", "infected with malware", "trojan detected",
-    "backdoor found", "backdoor discovered", "rootkit found",
-    "DDoS attack", "under DDoS", "site went down attack",
-    "insider threat", "insider attack", "third party breach",
-    "vendor breach", "supplier breach", "MSP breach",
-
-    # ── INCIDENT RESPONSE URGENCY ────────────────────────────────────────────
-    "need incident response", "need an IR firm", "need a forensics team",
-    "who do I call after a breach", "who to call after hack",
-    "emergency incident response", "24/7 incident response",
-    "need help now hacked", "actively being attacked",
-    "attack in progress", "attacker still in our network",
-    "containment help", "need containment", "need remediation",
-    "recovering from ransomware", "ransomware recovery",
-    "should we pay the ransom", "pay the ransom or not",
-    "ransom demand", "ransom note", "threat actor demanding",
-    "need to notify customers breach", "breach notification requirements",
-    "legally required to disclose breach", "disclose the breach",
-
-    # ── TOOLING / PLATFORM FRUSTRATION ───────────────────────────────────────
-    "our SIEM missed it", "SIEM didn't catch it", "SIEM false positives",
-    "too many false positives", "alert fatigue", "drowning in alerts",
-    "no visibility into our network", "no visibility into endpoints",
-    "can't see what's happening on our network",
-    "our EDR didn't catch it", "EDR missed", "antivirus didn't catch it",
-    "firewall got bypassed", "firewall wasn't enough",
-    "our current tool isn't working", "outgrown our current tool",
-    "outgrown our security stack", "current vendor isn't cutting it",
-    "switching security vendors", "replacing our SIEM",
-    "replacing our EDR", "need a new MDR", "need a new SOC",
-    "understaffed security team", "no security team",
-    "one person security team", "no dedicated security staff",
-    "can't afford a full SOC", "need outsourced SOC",
-    "need a virtual CISO", "need a fractional CISO", "need vCISO",
-
-    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
-    "security tools too expensive", "cybersecurity budget too small",
-    "can't justify the cost", "pricing is outrageous",
-    "licensing costs killing us", "per-endpoint pricing too high",
-    "hidden costs security vendor", "surprise renewal fees",
-    "renewal price increase", "price hike renewal",
-    "cheaper alternative to CrowdStrike", "cheaper alternative to SentinelOne",
-    "cheaper EDR", "cheaper SIEM", "cheaper MDR",
-    "affordable cybersecurity for small business",
-    "budget-friendly security tools", "best value security platform",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "CrowdStrike outage", "CrowdStrike issue", "CrowdStrike problem",
-    "CrowdStrike blocked", "CrowdStrike alternative",
-    "SentinelOne problem", "SentinelOne issue", "SentinelOne alternative",
-    "switching from CrowdStrike", "switching from SentinelOne",
-    "leaving Microsoft Defender", "Defender missed", "Defender didn't catch",
-    "Palo Alto issue", "Palo Alto problem", "Fortinet vulnerability",
-    "Fortinet issue", "Fortinet exploit", "Cisco vulnerability",
-    "Cisco exploit", "Sophos problem", "Sophos issue",
-    "Trend Micro problem", "McAfee problem", "Norton problem",
-    "Rapid7 issue", "Qualys issue", "Tenable issue", "Splunk too expensive",
-    "Splunk alternative", "Datadog security alternative",
-    "leaving our MSSP", "switching MSSPs", "MSSP isn't responsive",
-    "our MSP dropped the ball", "MSP missed the breach",
-    "alternative to Norton", "alternative to McAfee",
-    "alternative to Splunk", "alternative to Rapid7",
-    "better than CrowdStrike", "better than SentinelOne",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a SIEM", "recommend an EDR", "recommend an MDR",
-    "recommend a firewall", "recommend a security vendor",
-    "recommend a pentest firm", "recommend a security consultant",
-    "anyone used", "has anyone used", "does anyone recommend",
-    "what EDR do you use", "what SIEM do you use",
-    "which security tool is best", "best EDR for small business",
-    "best SIEM for startups", "best MDR provider",
-    "best pentest company", "looking for a security vendor",
-    "looking for a pentest firm", "looking for an MSSP",
-    "need a security assessment", "need a vulnerability assessment",
-    "need a penetration test", "need a pen test", "need a red team",
-    "who should we hire for security", "who do you use for security",
-
-    # ── COMPLIANCE PAIN ───────────────────────────────────────────────────────
-    "SOC 2 audit failed", "failed SOC 2", "SOC 2 readiness",
-    "need SOC 2 compliance", "preparing for SOC 2",
-    "ISO 27001 certification", "need ISO 27001", "ISO 27001 audit",
-    "PCI DSS compliance", "failed PCI audit", "PCI compliance issue",
-    "HIPAA violation", "HIPAA compliance issue", "HIPAA audit",
-    "GDPR fine", "GDPR violation", "GDPR compliance issue",
-    "CMMC compliance", "CMMC certification", "NIST compliance",
-    "NIST framework", "failed audit", "audit findings",
-    "compliance deadline", "compliance gap", "compliance nightmare",
-    "regulators are asking", "auditor flagged", "auditors flagged",
-
-    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
-    "urgently need", "critical vulnerability", "emergency patch",
-    "patch immediately", "exploit in the wild", "actively exploited",
-    "ASAP security", "need help immediately", "time sensitive breach",
-    "board is asking questions", "customers are asking questions",
-    "losing customers over breach", "losing the contract over security",
-    "insurance requires", "cyber insurance requirement",
-    "cyber insurance denied claim", "can't get cyber insurance",
-    "insurance premium went up after breach",
-
-    # ── BUSINESS EXPANSION / GROWTH ──────────────────────────────────────────
-    "building our security program", "starting a security program",
-    "hiring our first security hire", "hiring a CISO",
-    "scaling our security team", "growing security team",
-    "new compliance requirement", "new client requires SOC 2",
-    "client requiring security review", "vendor security questionnaire",
-    "security questionnaire from client", "need to pass security review",
-
-    # ── JOB SIGNALS ───────────────────────────────────────────────────────────
-    "CISO", "chief information security officer", "security engineer",
-    "security analyst", "SOC analyst", "SOC manager",
-    "head of security", "director of security", "VP security",
-    "security operations manager", "threat intel analyst",
-    "incident response manager", "GRC manager", "GRC analyst",
-    "penetration tester", "red team lead", "blue team lead",
-    "application security engineer", "cloud security engineer",
-    "detection engineer", "security architect",
-
-    # ----- CRM ----------
-
-    # ── CRM PAIN POINTS ───────────────────────────────────────────────────────
-    "our CRM is a mess", "CRM is too complicated", "CRM too complex",
-    "CRM is clunky", "clunky CRM", "outdated CRM", "CRM feels outdated",
-    "hate our CRM", "CRM is a nightmare", "CRM nightmare",
-    "CRM isn't working for us", "CRM not working for our team",
-    "outgrown our CRM", "outgrown our current CRM",
-    "CRM doesn't scale", "CRM can't handle our volume",
-    "CRM is too slow", "CRM keeps crashing", "CRM keeps freezing",
-    "CRM data is a mess", "messy CRM data", "duplicate contacts CRM",
-    "duplicate leads CRM", "CRM data quality issues",
-    "no one updates the CRM", "reps don't update the CRM",
-    "sales team hates the CRM", "sales team won't use the CRM",
-    "low CRM adoption", "poor CRM adoption", "CRM adoption problem",
-    "manual data entry CRM", "too much manual data entry",
-    "spreadsheets instead of CRM", "still using spreadsheets for sales",
-    "tracking leads in spreadsheets", "tracking deals in spreadsheets",
-    "no visibility into pipeline", "no pipeline visibility",
-    "can't see our pipeline", "pipeline is a black box",
-    "forecasting is a guess", "sales forecasting is inaccurate",
-    "inaccurate sales forecast", "forecast doesn't match reality",
-    "reports take forever", "building reports manually",
-    "CRM reporting is limited", "CRM reporting is weak",
-
-    # ── SETUP / IMPLEMENTATION FRUSTRATION ───────────────────────────────────
-    "CRM implementation nightmare", "CRM implementation failed",
-    "CRM setup took months", "CRM migration nightmare",
-    "migrating off our CRM", "migrating from our CRM",
-    "CRM onboarding took forever", "took too long to set up CRM",
-    "CRM customization is hard", "hard to customize our CRM",
-    "need a developer to change anything", "too technical for our team",
-    "CRM requires an admin", "need a dedicated CRM admin",
-    "consultants to set up CRM", "paying consultants for CRM",
-
-    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
-    "CRM is too expensive", "CRM pricing too high",
-    "CRM cost too much", "per seat pricing CRM", "per user pricing CRM",
-    "CRM licensing costs", "CRM renewal price increase",
-    "CRM price hike", "surprise CRM fees", "hidden fees CRM",
-    "add-ons cost extra CRM", "everything is an add-on",
-    "paying for features we don't use", "paying for unused seats",
-    "cheaper alternative to Salesforce", "cheaper than Salesforce",
-    "cheaper CRM", "affordable CRM for small business",
-    "budget-friendly CRM", "CRM on a budget", "best value CRM",
-    "CRM ROI", "not seeing ROI from our CRM",
-
-    # ── COMPETITOR / SALESFORCE MENTIONS ─────────────────────────────────────
-    "Salesforce is too complex", "Salesforce too complicated",
-    "Salesforce is overkill", "Salesforce overkill for small business",
-    "Salesforce too expensive", "Salesforce pricing",
-    "Salesforce alternative", "alternative to Salesforce",
-    "leaving Salesforce", "switching from Salesforce",
-    "migrating from Salesforce", "migrating off Salesforce",
-    "moving away from Salesforce", "Salesforce is a pain",
-    "Salesforce admin nightmare", "need a Salesforce admin",
-    "HubSpot alternative", "alternative to HubSpot",
-    "switching from HubSpot", "leaving HubSpot", "HubSpot too expensive",
-    "HubSpot pricing", "HubSpot limitations",
-    "Zoho CRM problem", "Zoho CRM issue", "switching from Zoho",
-    "Pipedrive limitations", "Pipedrive alternative", "switching from Pipedrive",
-    "Monday CRM problem", "Monday sales CRM issue",
-    "Copper CRM problem", "Close CRM alternative",
-    "Freshsales problem", "Freshsales alternative",
-    "Insightly problem", "Insightly alternative",
-    "Nimble CRM problem", "SugarCRM problem",
-    "Microsoft Dynamics alternative", "Dynamics 365 too complex",
-    "alternative to HubSpot", "alternative to Pipedrive",
-    "alternative to Zoho", "alternative to Monday CRM",
-    "better than Salesforce", "better than HubSpot",
-    "better than Pipedrive", "competitors to Salesforce",
-    "Salesforce competitors", "HubSpot competitors",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a CRM", "recommend a sales tool", "recommend a pipeline tool",
-    "recommend a sales platform", "anyone recommend a CRM",
-    "can anyone recommend a CRM", "does anyone recommend a CRM",
-    "what CRM do you use", "what CRM should I use",
-    "which CRM is best", "which CRM should we use",
-    "best CRM for small business", "best CRM for startups",
-    "best CRM for sales teams", "best CRM for agencies",
-    "best CRM for real estate", "best CRM for solo founders",
-    "best sales pipeline tool", "best pipeline management tool",
-    "best sales tracking tool", "best lead tracking tool",
-    "looking for a CRM", "looking for a sales tool",
-    "looking for a pipeline tool", "searching for a CRM",
-    "need a CRM", "need a sales tool", "need a pipeline tool",
-    "need a better CRM", "need a simple CRM", "need an easy CRM",
-    "anyone using a CRM", "does anyone use", "has anyone used",
-    "who uses", "what do you use for sales", "what are you using for CRM",
-    "tried several CRMs", "tried multiple CRMs", "tried everything CRM",
-    "still looking for a CRM", "still haven't found a CRM",
-
-    # ── SALES TOOLS / PIPELINE ────────────────────────────────────────────────
-    "sales pipeline management", "pipeline management tool",
-    "sales pipeline tracking", "deal tracking tool",
-    "lead tracking software", "lead management tool",
-    "lead scoring tool", "sales automation tool",
-    "sales engagement platform", "sales enablement tool",
-    "outbound sales tool", "cold outreach tool", "cold email tool",
-    "sales prospecting tool", "prospecting software",
-    "sales sequence tool", "email sequencing tool",
-    "sales dialer", "auto dialer sales", "call tracking sales",
-    "quote to cash", "proposal software sales", "contract management sales",
-    "sales forecasting tool", "revenue operations tool",
-    "RevOps tool", "sales analytics tool", "sales dashboard tool",
-    "deal desk tool", "sales stack", "sales tech stack",
-    "building our sales stack", "sales tools we use",
-
-    # ── BUSINESS CONTEXT ──────────────────────────────────────────────────────
-    "my sales team", "our sales team", "small sales team",
-    "growing sales team", "scaling our sales team", "sales reps need",
-    "sales manager needs", "head of sales needs",
-    "startup sales process", "our sales process", "no sales process",
-    "informal sales process", "need a sales process",
-    "founder-led sales", "solo founder sales", "one-person sales team",
-    "agency CRM needs", "real estate CRM needs",
-    "B2B sales pipeline", "B2B sales tool", "B2B sales software",
-    "SaaS sales tool", "SaaS CRM", "startup CRM",
-
-    # ── COMPLIANCE / DATA ─────────────────────────────────────────────────────
-    "CRM data security", "CRM GDPR compliance", "CRM data privacy",
-    "CRM permissions issue", "CRM access control",
-    "data silos sales marketing", "sales and marketing not aligned",
-    "CRM integration issue", "CRM doesn't integrate with",
-    "CRM integration with email", "CRM integration with marketing",
-    "CRM API limitations", "CRM lacks integrations",
-
-    # ── URGENCY / EXPANSION SIGNALS ───────────────────────────────────────────
-    "urgently need a CRM", "need a CRM ASAP", "need this set up quickly",
-    "launching soon need CRM", "onboarding new sales hires",
-    "just hired our first salesperson", "scaling our sales operations",
-    "new sales hire needs a CRM", "board wants better reporting",
-    "investors asking about pipeline", "need better reporting for investors",
-
-    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
-    "VP of sales", "head of sales", "sales operations manager",
-    "RevOps manager", "revenue operations manager", "CRM administrator",
-    "Salesforce administrator", "Salesforce admin", "Salesforce developer",
-    "sales enablement manager", "director of sales operations",
-    "chief revenue officer", "CRO", "sales operations analyst",
-]
+reddit_queue:  queue.Queue = queue.Queue()
+twitter_queue: queue.Queue = queue.Queue()
 
 
-def passes_keyword_filter(text: str) -> bool:
+def passes_keyword_filter(text: str, keywords: list) -> bool:
+    """Generic keyword gate — takes an explicit keyword list so Reddit
+    and Twitter can be filtered against their own independent lists."""
     t = text.lower()
-    for kw in KEYWORDS:
+    for kw in keywords:
         if kw.lower() in t:
             return True
     return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY (unchanged mechanism — FIX 1)
+# TWITTER SEARCH QUERY — built directly from TWITTER_SEARCH_KEYWORDS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
-    short_kws = [
-        kw for kw in KEYWORDS
-        if len(kw) <= 30 and " " not in kw or (" " in kw and len(kw) <= 25)
-    ]
-    seen, unique_kws = set(), []
-    for kw in short_kws:
-        kl = kw.lower()
-        if kl not in seen:
-            seen.add(kl)
-            unique_kws.append(kw)
-
-    max_query_len = 480
-    parts, current_len = [], 0
-    for kw in unique_kws:
-        term = f'"{kw}"' if " " in kw else kw
-        addition = len(term) + (4 if parts else 0)
-        if current_len + addition > max_query_len:
-            break
-        parts.append(term)
-        current_len += addition
-
-    if not parts:
+    if not TWITTER_SEARCH_KEYWORDS:
         return (
-            "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
-            " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
+            "(\"international transfer\" OR \"bank blocked\" OR \"we got hacked\""
+            " OR \"CRM is a nightmare\") -is:retweet lang:en"
         )
-
+    parts = [f'"{kw}"' if " " in kw else kw for kw in TWITTER_SEARCH_KEYWORDS]
     query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-    log.info(f"Twitter search query built from KEYWORDS | terms:{len(parts)} | len:{len(query)}")
+    log.info(f"Twitter search query built | terms:{len(parts)} | len:{len(query)}")
     return query
 
 
@@ -888,14 +273,14 @@ TWITTER_SEARCH_QUERY = _build_twitter_search_query()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW GENERIC CLAUDE PROMPT — niche-agnostic, one prompt for all platforms
+# CLAUDE PROMPT — generic, niche-agnostic (unchanged schema)
 # ─────────────────────────────────────────────────────────────────────────────
 
 CLAUDE_SYSTEM_PROMPT = """
 You are Flintel's signal intelligence analyst.
 
-Your only job is to read one social media post (Reddit, X, or Telegram)
-together with its metadata, and produce two things:
+Your only job is to read one social media post (Reddit or X) together
+with its metadata, and produce two things:
 
 1. An intent_score from 1 to 100, built from three weighted components
 2. A short, human-written-style reply draft the end user can personalize
@@ -966,8 +351,8 @@ omit an item. Never add commentary outside the JSON array.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — same connection, same `signals` collection; new indexes for
-# the new schema; persistent batch-state collections kept as-is.
+# MONGODB — signals collection + persistent batch-state collections +
+# per-keyword TTL cache collection (flintel_keywords).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
@@ -977,14 +362,13 @@ def get_database():
         db = client[MONGODB_DB]
 
         db.signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
+        db.signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
         for field in ["intent_score", "created_at", "client_id", "platform", "is_relevant", "status"]:
             db.signals.create_index([(field, ASCENDING)])
 
-        # FIX A: persistent batch state (unchanged)
+        # persistent batch state — survives restarts, no in-flight batch lost
         db.flintel_pending_batch.create_index([("platform", ASCENDING)], unique=True, name="platform_unique")
         db.flintel_seen_ids.create_index([("platform", ASCENDING)], unique=True, name="seen_platform_unique")
-
-        # v7.4.5 additive fixes — kept as-is
         db.flintel_queue_messages.create_index(
             [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
             unique=True, name="queue_platform_message_unique",
@@ -992,6 +376,13 @@ def get_database():
         db.flintel_batch_seconds.create_index(
             [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
         )
+
+        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. Restart-safe: this
+        # collection is the single source of truth for "has this keyword
+        # ever been fetched?" It survives process restarts, so a keyword
+        # already marked fetched=True is NEVER re-fetched, ever.
+        db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
+        db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
 
         log.info("MongoDB connected.")
         return db
@@ -1003,7 +394,7 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — FIX C: streaming (unchanged)
+# ANTHROPIC CLIENT — streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
 anthropic_client = anthropic.Anthropic(
@@ -1030,9 +421,6 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
-    """Slack removed — operator visibility is now log-only. Same call
-    sites as before (Claude down, MongoDB write failure, truncation), just
-    logging instead of posting to a webhook."""
     log.log(
         logging.CRITICAL if level == "CRITICAL" else logging.ERROR,
         f"[OPERATOR ALERT] {title} — {detail}",
@@ -1040,7 +428,8 @@ def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged)
+# PERSISTENT BATCH STATE HELPERS — survives process restarts, so a
+# half-filled batch never disappears.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -1106,10 +495,6 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
     except Exception as exc:
         log.error(f"[{platform.upper()}] save_seen_ids error: {exc}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# v7.4.5 fixes kept as-is — persistent raw-queue + persistent batch clock
-# ─────────────────────────────────────────────────────────────────────────────
 
 def save_queue_message(platform: str, item: dict):
     try:
@@ -1177,61 +562,100 @@ def clear_batch_seconds(platform: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT — REAL implementations (no PRAW/OAuth needed for Reddit,
-# same "no credentials required" philosophy as the RSS poller).
+# KEYWORD CACHE — flintel_keywords collection. FETCH-ONCE-FOREVER design:
+# each keyword gets fetched from DataForSEO exactly ONE time, ever. Once
+# fetched=True, it is PERMANENTLY skipped by get_due_keywords() — no TTL,
+# no re-due date, no 12h/24h re-fetch. This REPLACES the old "sleep 12h
+# then refetch everything from scratch" design AND the TTL-based re-fetch
+# design that came after it:
+#
+#   - New keyword added to REDDIT_SEARCH_KEYWORDS -> sync_keywords_to_db()
+#     inserts it with fetched=False (due immediately) -> picked up on the
+#     very next poll pass (within KEYWORD_CHECK_INTERVAL_SECONDS).
+#
+#   - Keyword already fetched (fetched=True) -> get_due_keywords() will
+#     NEVER return it again, period. Zero DataForSEO calls for it, ever
+#     again, even after restarts, even after any amount of time passes.
+#     This guarantees Claude/signals data is never disturbed by the same
+#     keyword search being repeated later.
+#
+#   - Process restart -> sync_keywords_to_db() uses $setOnInsert, so it
+#     NEVER overwrites an existing keyword's fetched/timestamp. Nothing
+#     resets to zero. Only genuinely brand-new keywords get inserted.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_reddit_stats(post_url: str) -> dict:
+def sync_keywords_to_db(keywords: list):
     """
-    Reddit exposes upvotes + comment count publicly by appending .json to
-    any post URL — no OAuth/PRAW client_id/secret needed. Example:
-    https://www.reddit.com/r/X/comments/abc123/title/.json
+    Ensures every keyword currently in REDDIT_SEARCH_KEYWORDS exists in
+    flintel_keywords. Brand-new keywords are inserted with fetched=False
+    (due immediately, real-time). Keywords that already exist are left
+    completely untouched — $setOnInsert only writes on first-ever insert.
+    Safe to call every loop pass and on every restart.
     """
-    if not post_url:
-        return {"upvotes": None, "comments": None}
+    now = datetime.now(timezone.utc)
+    for kw in keywords:
+        try:
+            db.flintel_keywords.update_one(
+                {"keyword": kw},
+                {"$setOnInsert": {
+                    "keyword":         kw,
+                    "fetched":         False,
+                    "last_fetched_at": None,
+                    "created_at":      now,
+                }},
+                upsert=True,
+            )
+        except Exception as exc:
+            log.error(f"[KEYWORD-CACHE] sync error for {kw!r}: {exc}")
+
+
+def get_due_keywords() -> list:
+    """
+    Returns keyword docs that have NEVER been fetched yet (fetched=False).
+    Once a keyword is marked fetched=True, it is PERMANENTLY excluded from
+    this query — there is no TTL, no re-due date, nothing. A keyword is
+    processed exactly once, ever. This guarantees Claude never re-scores
+    the same keyword's world twice and signals data is never disturbed
+    by repeat fetches.
+    """
     try:
-        url = post_url.rstrip("/") + ".json"
-        r = requests.get(url, headers={"User-Agent": "flintel-enrichment/1.0"}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        post_data = data[0]["data"]["children"][0]["data"]
-        return {"upvotes": post_data.get("ups"), "comments": post_data.get("num_comments")}
+        cursor = db.flintel_keywords.find({
+            "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
+            "fetched": False,
+        })
+        return list(cursor)
     except Exception as exc:
-        log.error(f"fetch_reddit_stats error for {post_url}: {exc}")
-        return {"upvotes": None, "comments": None}
+        log.error(f"[KEYWORD-CACHE] get_due_keywords error: {exc}")
+        return []
 
 
-def fetch_google_rank(search_keyword: str) -> int | None:
+def mark_keyword_fetched(keyword: str):
     """
-    Google Search Console is NOT the right tool for this — GSC only shows
-    performance for a property YOU verify/own, it cannot report where an
-    arbitrary Reddit/X post or a generic keyword ranks in results you
-    don't own. A SERP-tracking API is what actually answers this.
-    Real implementation via SerpApi (requires SERPAPI_KEY in .env).
+    Flips a keyword to fetched=True — PERMANENTLY. There is no TTL and no
+    next_due_at anymore: once true, this keyword will never be picked up
+    by get_due_keywords() again, even after restarts, even after 12h,
+    24h, or any amount of time. The only way to re-process a keyword is
+    to manually reset/delete its document in flintel_keywords.
     """
-    if not SERPAPI_KEY or not search_keyword:
-        return None
+    now = datetime.now(timezone.utc)
     try:
-        r = requests.get(
-            "https://serpapi.com/search",
-            params={"engine": "google", "q": search_keyword, "api_key": SERPAPI_KEY},
-            timeout=15,
+        db.flintel_keywords.update_one(
+            {"keyword": keyword},
+            {"$set": {
+                "fetched":         True,
+                "last_fetched_at": now,
+            }},
         )
-        r.raise_for_status()
-        organic = r.json().get("organic_results", [])
-        return organic[0].get("position") if organic else None
     except Exception as exc:
-        log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
-        return None
+        log.error(f"[KEYWORD-CACHE] mark_keyword_fetched error for {keyword!r}: {exc}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENRICHMENT — DataForSEO is the SOLE provider for Google rank + volume.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_search_volume(search_keyword: str) -> int | None:
-    """
-    Monthly search volume via DataForSEO Labs (requires DATAFORSEO_LOGIN /
-    DATAFORSEO_PASSWORD in .env — HTTP Basic Auth). SerpApi's core /search
-    endpoint does not return volume directly; DataForSEO Labs' keyword
-    endpoints do.
-    """
+    """Monthly search volume via DataForSEO Labs (HTTP Basic Auth)."""
     if not (DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD) or not search_keyword:
         return None
     try:
@@ -1239,13 +663,39 @@ def fetch_search_volume(search_keyword: str) -> int | None:
             "https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
             auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
             json=[{"keywords": [search_keyword], "language_code": "en", "location_code": 2840}],
-            timeout=20,
+            timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS,
         )
         r.raise_for_status()
         result = r.json().get("tasks", [{}])[0].get("result", [])
         return result[0].get("search_volume") if result else None
     except Exception as exc:
         log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
+        return None
+
+
+def fetch_google_rank(search_keyword: str) -> int | None:
+    """
+    GENERIC (non-post-specific) Google rank fallback — used ONLY for
+    Twitter items, which have no per-post SERP discovery in this design.
+    Reflects the #1 organic result for the fixed SEARCH_KEYWORD.
+    """
+    if not (DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD) or not search_keyword:
+        return None
+    try:
+        r = requests.post(
+            "https://api.dataforseo.com/v3/serp/google/organic/live/regular",
+            auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+            json=[{"keyword": search_keyword, "location_code": 2840, "language_code": "en", "depth": 10}],
+            timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS,
+        )
+        r.raise_for_status()
+        result_data = r.json().get("tasks", [{}])[0].get("result", [])
+        if not result_data:
+            return None
+        items = result_data[0].get("items", []) or []
+        return items[0].get("rank_absolute") if items else None
+    except Exception as exc:
+        log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
         return None
 
 
@@ -1257,8 +707,227 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — same streaming transport + partial-JSON recovery
-# mechanism (FIX B/C), new generic prompt + new input/output schema.
+# REDDIT — SOLE discovery mechanism: DataForSEO SERP search
+# (site:reddit.com) -> real per-post rank + URL -> Reddit public .json
+# -> full post data (text, username, subreddit, upvotes, comments,
+# posted_at). Each keyword is only fetched when get_due_keywords() says
+# it's due (per its own TTL) — see the KEYWORD CACHE section above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
+    """
+    DataForSEO SERP API — Google search restricted to site:reddit.com,
+    rolling last-N-months date window. Returns real per-result rank + URL.
+    Only called for keywords that get_due_keywords() has flagged as due.
+    """
+    if not (DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD):
+        log.warning("[SERP] DataForSEO credentials not set — skipping SERP search.")
+        return []
+
+    today = datetime.now(timezone.utc)
+    date_from = today - timedelta(days=months_back * 30)
+    cd_min = date_from.strftime("%m/%d/%Y")
+    cd_max = today.strftime("%m/%d/%Y")
+    date_filter = f"tbs=cdr:1,cd_min:{cd_min},cd_max:{cd_max}&filter=0"
+
+    query = f'site:reddit.com "{keyword}"'
+    try:
+        r = requests.post(
+            "https://api.dataforseo.com/v3/serp/google/organic/live/regular",
+            auth=(DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD),
+            json=[{
+                "keyword": query,
+                "location_code": 2840,
+                "language_code": "en",
+                "depth": SERP_RESULTS_PER_KEYWORD,
+                "search_param": date_filter,
+            }],
+            timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS,
+        )
+        r.raise_for_status()
+        result_data = r.json().get("tasks", [{}])[0].get("result", [])
+        if not result_data:
+            return []
+
+        items = result_data[0].get("items", []) or []
+        results = []
+        for item in items:
+            url = item.get("url", "")
+            if "reddit.com" not in url:
+                continue
+            results.append({
+                "url":   url,
+                "rank":  item.get("rank_absolute"),
+                "title": item.get("title", ""),
+            })
+
+        log.info(
+            f"[SERP] '{keyword}' → {len(results)} Reddit result(s) "
+            f"(last {months_back} months: {cd_min} to {cd_max})"
+        )
+        return results
+
+    except Exception as exc:
+        log.error(f"[SERP] DataForSEO search error for {keyword!r}: {exc}")
+        return []
+
+
+def is_post_already_signaled(post_url: str) -> bool:
+    """
+    Checks the `signals` collection DIRECTLY by post_url — BEFORE any
+    Reddit .json fetch or Claude scoring happens. If this URL was
+    already discovered and saved in a previous cycle (confirmed OR
+    pending), we skip it entirely here — no wasted .json fetch, no
+    wasted Claude call.
+
+    This is a separate, independent safety net from the keyword-level
+    TTL cache above: the keyword cache stops a keyword's SEARCH from
+    re-running too often; this dedup stops the SAME POST from being
+    re-scored even if its keyword search does run again.
+    """
+    if not post_url:
+        return False
+    try:
+        existing = db.signals.find_one({"post_url": post_url}, {"_id": 1})
+        return existing is not None
+    except Exception as exc:
+        log.error(f"[DEDUP] is_post_already_signaled error for {post_url}: {exc}")
+        return False   # fail-open: if the check itself fails, don't block discovery
+
+
+def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
+    """
+    Reddit's public .json endpoint (no OAuth/credentials needed) — fetches
+    the FULL post: text, username, subreddit, upvotes, comments, posted_at.
+    This is the ONLY way Reddit data enters this system now.
+    """
+    if not post_url:
+        return None
+    try:
+        url = post_url.rstrip("/") + ".json"
+        r = requests.get(url, headers={"User-Agent": "flintel-serp/1.0"}, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
+        r.raise_for_status()
+        data = r.json()
+        post_data = data[0]["data"]["children"][0]["data"]
+
+        posted_at = None
+        if post_data.get("created_utc"):
+            posted_at = datetime.fromtimestamp(
+                post_data["created_utc"], tz=timezone.utc
+            ).isoformat()
+
+        return {
+            "message_id":           f"reddit_serp_{post_data.get('id')}",
+            "platform":             "reddit",
+            "text":                 f"{post_data.get('title','')}\n\n{post_data.get('selftext','')}",
+            "username":             post_data.get("author", "unknown"),
+            "subreddit_or_channel": post_data.get("subreddit", ""),
+            "post_url":             post_url,
+            "posted_at":            posted_at,
+            "search_keyword":       keyword,
+            "upvotes":              post_data.get("ups"),
+            "comments":             post_data.get("num_comments"),
+            "google_rank":          rank,   # real per-post rank, already set here
+            "search_volume":        None,   # filled in by process_one_keyword() below
+        }
+    except Exception as exc:
+        log.error(f"[SERP] fetch_reddit_post_by_url error for {post_url}: {exc}")
+        return None
+
+
+def process_one_keyword(keyword: str) -> tuple:
+    """
+    Full discovery work for ONE keyword that get_due_keywords() has
+    flagged as due right now:
+      1. DataForSEO SERP search (site:reddit.com, last N months)
+      2. DataForSEO search-volume for the same keyword
+      3. Per-result post_url dedup check -> skip already-known posts
+         (no .json fetch, no Claude call for those)
+      4. Reddit .json fetch for genuinely new posts -> queue for
+         Claude scoring
+    Returns (new_items_count, skipped_dupes_count) for logging.
+    """
+    new_items, skipped_dupes = 0, 0
+
+    results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
+    volume = fetch_search_volume(keyword)
+
+    for result in results:
+        if is_post_already_signaled(result["url"]):
+            skipped_dupes += 1
+            log.debug(f"[SERP] Skipping already-known post_url: {result['url']}")
+            continue
+
+        item = fetch_reddit_post_by_url(result["url"], keyword, result["rank"])
+        if not item:
+            continue
+        item["search_volume"] = volume   # same value for every post from this keyword
+        reddit_queue.put(item)
+        save_queue_message("reddit", item)
+        new_items += 1
+        time.sleep(SERP_FETCH_SLEEP_SECONDS)
+
+    return new_items, skipped_dupes
+
+
+def run_serp_discovery_loop():
+    """
+    Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
+    for keywords that have NEVER been fetched (fetched=False).
+
+    There is NO TTL, NO re-due date, NO fixed "sleep N hours then redo
+    everything" step. Each keyword is processed exactly ONCE, ever:
+      - a newly-added keyword is picked up on the very next pass
+        (within KEYWORD_CHECK_INTERVAL_SECONDS), processed one at a
+        time (sequential), then marked fetched=True permanently.
+      - an already-fetched keyword is skipped forever, even immediately
+        after a full server restart — its state lives in MongoDB, not
+        in memory, so nothing resets to zero and nothing gets re-fetched.
+    """
+    sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
+    log.info(
+        f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) | "
+        f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
+        f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
+        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever"
+    )
+
+    while True:
+        try:
+            # Pick up any newly-added keywords immediately (idempotent —
+            # never touches keywords that already exist).
+            sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
+
+            due = get_due_keywords()
+            if not due:
+                time.sleep(KEYWORD_CHECK_INTERVAL_SECONDS)
+                continue
+
+            total_new, total_dupes = 0, 0
+            for doc in due:
+                keyword = doc["keyword"]
+                new_items, dupes = process_one_keyword(keyword)
+                mark_keyword_fetched(keyword)
+                total_new += new_items
+                total_dupes += dupes
+                log.info(
+                    f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
+                    f"marked fetched=True PERMANENTLY — will never be re-fetched"
+                )
+                time.sleep(SERP_FETCH_SLEEP_SECONDS)
+
+            log.info(
+                f"[SERP] Pass complete | keywords_processed:{len(due)} | "
+                f"new_items:{total_new} | skipped_dupes:{total_dupes}"
+            )
+
+        except Exception as exc:
+            log.error(f"[SERP] discovery loop error: {exc}")
+            time.sleep(10)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -1278,7 +947,14 @@ def _build_batch_prompt(batch: list) -> str:
 
 
 def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
-    return {"index": index, "intent_score": 1, "is_relevant": False, "reply_draft": None}
+    return {
+        "index": index,
+        "intent_score": 1,
+        "is_relevant": False,
+        "reply_draft": None,
+        "_is_fallback": True,
+        "_fallback_reason": reason,
+    }
 
 
 def _strip_code_fences(raw: str) -> str:
@@ -1290,7 +966,7 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _salvage_partial_json_array(raw: str) -> list:
-    """Brace-depth-tracking salvage of a truncated JSON array — unchanged (FIX B)."""
+    """Brace-depth-tracking salvage of a truncated JSON array."""
     start = raw.find("[")
     if start == -1:
         return []
@@ -1341,7 +1017,6 @@ def _parse_claude_json(raw: str) -> tuple:
 
 
 def _call_claude_batch(batch: list) -> list:
-    """FIX C: streaming context manager — unchanged transport."""
     prompt = _build_batch_prompt(batch)
     with anthropic_client.messages.stream(
         model="claude-sonnet-4-6",
@@ -1372,6 +1047,7 @@ def _call_claude_batch(batch: list) -> list:
     for r in results:
         r.setdefault("is_relevant", False)
         r.setdefault("reply_draft", None)
+        r.setdefault("_is_fallback", False)
         if r.get("intent_score", 1) < 1:
             r["intent_score"] = 1
         if r.get("intent_score", 1) > 100:
@@ -1388,16 +1064,27 @@ def score_batch_with_claude(batch: list) -> list:
             detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
             level="CRITICAL",
         )
-        return [_fallback_score(i + 1) for i in range(len(batch))]
+        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE — new schema only.
+# MONGODB STORAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_new_signal(item: dict, score_result: dict) -> bool:
-    """Brand-new LIVE items — stored already status='confirmed'."""
+def save_new_signal(item: dict, score_result: dict, force_pending: bool = False) -> bool:
+    """
+    Brand-new LIVE items (from Reddit SERP-discovery or Twitter).
+
+    status logic:
+      - force_pending=True  -> status="pending"   (Claude failed for this
+        item; run_rescore_processor() will automatically pick it up on
+        its next poll cycle and retry scoring, reusing the enrichment
+        fields already stored below — NO re-fetch from Reddit/.json or
+        DataForSEO happens on rescore.)
+      - force_pending=False -> status="confirmed" (Claude scored it
+        successfully — final).
+    """
     doc = {
         "message_id":            item["message_id"],
         "platform":               item.get("platform", "unknown"),
@@ -1416,19 +1103,22 @@ def save_new_signal(item: dict, score_result: dict) -> bool:
         "is_relevant":            score_result.get("is_relevant", False),
         "reply_draft":            score_result.get("reply_draft"),
         "client_id":              CLIENT_ID,
-        "status":                 "confirmed",
+        "status":                 "pending" if force_pending else "confirmed",
         "created_at":             datetime.now(timezone.utc),
     }
     try:
         db.signals.insert_one(doc)
         log.info(
-            f"SAVED [{doc['platform'].upper()}] score:{doc['intent_score']} "
+            f"SAVED [{doc['platform'].upper()}] status:{doc['status']} score:{doc['intent_score']} "
             f"relevant:{doc['is_relevant']} | u/{doc['username']} | "
             f"upvotes:{doc['upvotes']} comments:{doc['comments']} "
             f"rank:{doc['google_rank']} volume:{doc['search_volume']}"
         )
         return True
     except DuplicateKeyError:
+        # Post already exists in signals (message_id unique) — the last
+        # safety net. Claude may have just re-scored a re-discovered post
+        # (cost incurred), but it will not be stored twice.
         return False
     except Exception as exc:
         log.error(f"MongoDB save error: {exc}")
@@ -1438,10 +1128,11 @@ def save_new_signal(item: dict, score_result: dict) -> bool:
 
 def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: dict) -> bool:
     """
-    Called by the rescore processor once Claude has scored a pending
-    (previously-migrated) document. Fully REPLACES the document body —
-    this is where old-schema leftovers get permanently wiped, since
-    replace_one() overwrites the whole document.
+    Called by the rescore processor once Claude has (re-)scored a
+    pending document. Reuses the enrichment fields (google_rank,
+    search_volume, upvotes, comments) that are ALREADY stored on the
+    existing document — NO new fetch to Reddit/.json or DataForSEO
+    happens here, only a re-call to Claude for scoring.
     """
     existing = db.signals.find_one({"message_id": message_id})
     if not existing:
@@ -1452,9 +1143,9 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
         "message_id":            message_id,
         "platform":               existing.get("platform", "unknown"),
         "post_url":               existing.get("post_url", ""),
-        "text":                   existing.get("text") or existing.get("message_text", ""),
+        "text":                   existing.get("text", ""),
         "username":               existing.get("username", "unknown"),
-        "subreddit_or_channel":   existing.get("subreddit_or_channel") or existing.get("subreddit") or existing.get("telegram_group", ""),
+        "subreddit_or_channel":   existing.get("subreddit_or_channel", ""),
         "posted_at":              existing.get("posted_at") or existing.get("created_at"),
         "fetched_at":             existing.get("fetched_at", datetime.now(timezone.utc)),
         "google_rank":            enrichment.get("google_rank"),
@@ -1475,9 +1166,7 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — same batching/timing mechanism (v7.4.4/v7.4.5),
-# now enriches (Reddit upvotes/comments + Google rank/volume) right before
-# scoring, using the new prompt/schema, and Slack/HubSpot delivery removed.
+# GENERIC BATCH PROCESSOR — one instance per platform queue.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -1486,6 +1175,7 @@ def run_batch_processor(
     platform_label: str,
     gap_seconds: int,
     timeout_seconds: int,
+    keyword_filter_list: list,
 ):
     platform_key = platform_label.lower()
 
@@ -1523,7 +1213,7 @@ def run_batch_processor(
                     q.task_done()
                     continue
 
-                if not passes_keyword_filter(text):
+                if not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
                     q.task_done()
                     continue
@@ -1562,18 +1252,19 @@ def run_batch_processor(
                     clear_batch_seconds(platform_key)
 
                 # ── ENRICHMENT — real numbers, right before scoring ──────
-                # Reddit: refetch fresh upvotes/comments via public .json.
-                # Twitter/Telegram: upvotes/comments already populated at
-                # poll time from public_metrics / msg.views/forwards.
-                google_stats = fetch_google_stats(SEARCH_KEYWORD)
+                google_stats = None
                 for it in batch_to_send:
-                    if it.get("platform") == "reddit":
-                        it.update(fetch_reddit_stats(it.get("post_url", "")))
+                    already_enriched = it.get("google_rank") is not None
+
                     it.setdefault("upvotes", None)
                     it.setdefault("comments", None)
-                    it["google_rank"] = google_stats.get("google_rank")
-                    it["search_volume"] = google_stats.get("search_volume")
-                    it["search_keyword"] = SEARCH_KEYWORD
+
+                    if not already_enriched and SEARCH_KEYWORD:
+                        if google_stats is None:
+                            google_stats = fetch_google_stats(SEARCH_KEYWORD)
+                        it["google_rank"] = google_stats.get("google_rank")
+                        it["search_volume"] = google_stats.get("search_volume")
+                        it["search_keyword"] = SEARCH_KEYWORD
 
                 log.info(
                     f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | reason:{fire_reason} | "
@@ -1587,7 +1278,8 @@ def run_batch_processor(
                 for i, it in enumerate(batch_to_send):
                     pos = i + 1
                     sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch."))
-                    save_new_signal(it, sr)
+                    is_fallback = bool(sr.get("_is_fallback", False))
+                    save_new_signal(it, sr, force_pending=is_fallback)
 
                 log.info(f"[{platform_label}] BATCH {total_batches} COMPLETE — "
                          f"{len(batch_to_send)} item(s) | waiting {gap_seconds}s...")
@@ -1599,11 +1291,8 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — same batch/poll/gap timing shape as v7.4.5, but now
-# polls the `signals` collection DIRECTLY for {"status": "pending"}
-# documents (written by rescore.py after re-enrichment). Confirmed
-# documents are never re-touched; live documents never carry a pending
-# status in the first place.
+# RESCORE PROCESSOR — polls the `signals` collection DIRECTLY for
+# {"status": "pending"} documents (Claude-failure items).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_rescore_processor():
@@ -1647,6 +1336,9 @@ def run_rescore_processor():
                     "comments":       item.get("comments"),
                     "search_keyword": item.get("search_keyword"),
                 }
+                # NOTE: even if this rescore attempt ALSO fails (still a
+                # fallback score), replace_confirmed_signal marks it
+                # "confirmed" — this prevents an infinite pending loop.
                 replace_confirmed_signal(item["message_id"], enrichment, sr)
 
             log.info(f"[RESCORE] BATCH {total_batches} DONE — waiting {RESCORE_BATCH_GAP_SECONDS}s...")
@@ -1658,95 +1350,7 @@ def run_rescore_processor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — feedparser RSS poller (unchanged mechanism)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_reddit_seen_ids: set = load_seen_ids("reddit")
-_reddit_seen_lock = threading.Lock()
-_reddit_seen_dirty_count = 0
-
-
-def _reddit_rss_is_seen(entry_id: str) -> bool:
-    global _reddit_seen_ids, _reddit_seen_dirty_count
-    with _reddit_seen_lock:
-        if entry_id in _reddit_seen_ids:
-            return True
-        _reddit_seen_ids.add(entry_id)
-        if len(_reddit_seen_ids) > 200_000:
-            _reddit_seen_ids.clear()
-        _reddit_seen_dirty_count += 1
-        if _reddit_seen_dirty_count >= 10:
-            save_seen_ids("reddit", _reddit_seen_ids)
-            _reddit_seen_dirty_count = 0
-        return False
-
-
-def _get_reddit_rss(subreddit: str) -> list:
-    url = f"https://www.reddit.com/r/{subreddit}/new.rss"
-    items = []
-    try:
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            log.warning(f"[REDDIT-RSS] Feed parse issue for r/{subreddit}: {feed.bozo_exception}")
-            return items
-
-        for entry in feed.entries:
-            entry_id = entry.get("id", "") or entry.get("link", "")
-            if not entry_id or _reddit_rss_is_seen(entry_id):
-                continue
-
-            title = entry.get("title", "").strip()
-            summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(entry.get("summary", ""))).strip()
-            text = f"{title}\n\n{summary_plain}" if summary_plain and summary_plain.lower() != title.lower() else title
-
-            items.append({
-                "message_id":           f"reddit_rss_{entry_id.split('/')[-1] or entry_id}",
-                "platform":             "reddit",
-                "text":                 text,
-                "username":             entry.get("author", "unknown").lstrip("u/").strip() or "unknown",
-                "subreddit_or_channel": subreddit,
-                "post_url":             entry.get("link", ""),
-                "posted_at":            entry.get("published", None),
-                "search_keyword":       SEARCH_KEYWORD,
-                "upvotes":              None,   # enriched at batch time
-                "comments":             None,   # enriched at batch time
-            })
-    except Exception as exc:
-        log.error(f"[REDDIT-RSS] Error fetching r/{subreddit}: {exc}")
-    return items
-
-
-def poll_reddit_rss():
-    log.info(f"[REDDIT-RSS] Poller started | {len(TARGET_SUBREDDITS)} subreddits | "
-             f"poll interval:{REDDIT_POLL_INTERVAL}s | dedup resumed with {len(_reddit_seen_ids)} ID(s)")
-
-    while True:
-        cycle_start, total_new, total_errors = time.time(), 0, 0
-
-        for subreddit in TARGET_SUBREDDITS:
-            try:
-                items = _get_reddit_rss(subreddit)
-                for item in items:
-                    reddit_queue.put(item)
-                    save_queue_message("reddit", item)
-                    total_new += 1
-                if items:
-                    log.info(f"[REDDIT-RSS] r/{subreddit} → {len(items)} new items queued "
-                              f"(queue size: {reddit_queue.qsize()})")
-                time.sleep(2)
-            except Exception as exc:
-                log.error(f"[REDDIT-RSS] Unhandled error for r/{subreddit}: {exc}")
-                total_errors += 1
-
-        save_seen_ids("reddit", _reddit_seen_ids)
-        log.info(f"[REDDIT-RSS] Cycle complete | new:{total_new} errors:{total_errors} | "
-                 f"elapsed:{time.time()-cycle_start:.1f}s | sleeping {REDDIT_POLL_INTERVAL}s...")
-        time.sleep(REDDIT_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER — unchanged mechanism, now also pulls public_metrics
-# (like_count/reply_count) at poll time so no extra enrichment call needed.
+# TWITTER / X POLLER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -1813,6 +1417,8 @@ def poll_twitter(client: tweepy.Client):
                     "search_keyword":       SEARCH_KEYWORD,
                     "upvotes":              metrics.get("like_count"),
                     "comments":             metrics.get("reply_count"),
+                    "google_rank":          None,
+                    "search_volume":        None,
                 }
                 twitter_queue.put(_tw_item)
                 save_queue_message("twitter", _tw_item)
@@ -1834,181 +1440,21 @@ def poll_twitter(client: tweepy.Client):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM LISTENER — unchanged mechanism, now also captures msg.views /
-# msg.forwards at listen/poll time (already on the Telethon message object,
-# no extra call needed).
-# ─────────────────────────────────────────────────────────────────────────────
-
-_telegram_seen_ids: set = load_seen_ids("telegram")
-_telegram_seen_lock = threading.Lock()
-_telegram_seen_dirty_count = 0
-
-
-def _telegram_is_seen(chat_id: int, msg_id: int) -> bool:
-    global _telegram_seen_ids, _telegram_seen_dirty_count
-    key = f"{chat_id}_{msg_id}"
-    with _telegram_seen_lock:
-        if key in _telegram_seen_ids:
-            return True
-        _telegram_seen_ids.add(key)
-        if len(_telegram_seen_ids) > 100_000:
-            _telegram_seen_ids.clear()
-        _telegram_seen_dirty_count += 1
-        if _telegram_seen_dirty_count >= 10:
-            save_seen_ids("telegram", _telegram_seen_ids)
-            _telegram_seen_dirty_count = 0
-        return False
-
-
-def _join_telegram_groups_sync(client: TelegramClient):
-    log.info(f"Telegram: starting auto-join for {len(TARGET_TELEGRAM_GROUPS)} groups | "
-             f"gap:{TELEGRAM_JOIN_GAP_SECONDS}s")
-    joined, skipped, failed = 0, 0, 0
-
-    for group in TARGET_TELEGRAM_GROUPS:
-        try:
-            target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
-            client.loop.run_until_complete(client(JoinChannelRequest(target)))
-            joined += 1
-            time.sleep(TELEGRAM_JOIN_GAP_SECONDS)
-        except UserAlreadyParticipantError:
-            skipped += 1
-        except FloodWaitError as e:
-            time.sleep(e.seconds + 5)
-            failed += 1
-        except (ChannelPrivateError, InviteHashExpiredError):
-            failed += 1
-        except Exception as exc:
-            log.error(f"Telegram: join error for {group} — {exc}")
-            failed += 1
-
-    log.info(f"Telegram auto-join complete | joined:{joined} already_in:{skipped} failed:{failed}")
-
-
-async def _poll_telegram_groups(client: TelegramClient):
-    if TELEGRAM_POLL_INTERVAL == 0:
-        log.info("[TELEGRAM-POLL] Disabled — listener-only mode.")
-        return
-
-    log.info(f"[TELEGRAM-POLL] Poller started | {len(TARGET_TELEGRAM_GROUPS)} groups | "
-             f"interval:{TELEGRAM_POLL_INTERVAL}s")
-
-    while True:
-        cycle_start, total_new, total_errors = time.time(), 0, 0
-
-        for group in TARGET_TELEGRAM_GROUPS:
-            try:
-                target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
-                messages = await client.get_messages(target, limit=20)
-
-                for msg in messages:
-                    if not msg or not msg.text or len(msg.text) < 5:
-                        continue
-                    chat_id, msg_id = (msg.chat_id or 0), msg.id
-                    if _telegram_is_seen(chat_id, msg_id):
-                        continue
-
-                    sender = await msg.get_sender()
-                    tg_user = getattr(sender, "username", None) or f"user_{getattr(sender, 'id', 0)}"
-
-                    _tg_item = {
-                        "message_id":           f"telegram_{chat_id}_{msg_id}",
-                        "platform":             "telegram",
-                        "text":                 msg.text,
-                        "username":             tg_user,
-                        "subreddit_or_channel": group,
-                        "post_url":             "",
-                        "posted_at":            str(msg.date) if msg.date else None,
-                        "search_keyword":       SEARCH_KEYWORD,
-                        "upvotes":              getattr(msg, "views", None),
-                        "comments":             getattr(msg, "forwards", None),
-                    }
-                    telegram_queue.put(_tg_item)
-                    save_queue_message("telegram", _tg_item)
-                    total_new += 1
-
-                await asyncio.sleep(2)
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 5)
-                total_errors += 1
-            except Exception as exc:
-                log.error(f"[TELEGRAM-POLL] Error for {group}: {exc}")
-                total_errors += 1
-
-        save_seen_ids("telegram", _telegram_seen_ids)
-        log.info(f"[TELEGRAM-POLL] Cycle complete | new:{total_new} errors:{total_errors} | "
-                 f"elapsed:{time.time()-cycle_start:.1f}s | sleeping {TELEGRAM_POLL_INTERVAL}s...")
-        await asyncio.sleep(TELEGRAM_POLL_INTERVAL)
-
-
-async def _run_telegram_listener(client: TelegramClient):
-    target_set = {g.lstrip("@").lower() for g in TARGET_TELEGRAM_GROUPS}
-
-    @client.on(events.NewMessage)
-    async def _on_message(event):
-        try:
-            chat = await event.get_chat()
-            username_attr = getattr(chat, "username", None)
-            chat_title = getattr(chat, "title", "") or ""
-            group_key = (username_attr or chat_title).lower().replace(" ", "").replace("-", "").replace("_", "")
-
-            if group_key not in target_set and (username_attr or "").lower() not in target_set:
-                return
-
-            sender = await event.get_sender()
-            text = event.raw_text or ""
-            sender_id = getattr(sender, "id", 0)
-            tg_user = getattr(sender, "username", None) or f"user_{sender_id}"
-            msg_id, chat_id = event.id, event.chat_id
-
-            if not text or len(text) < 5 or _telegram_is_seen(chat_id, msg_id):
-                return
-
-            _tg_item = {
-                "message_id":           f"telegram_{chat_id}_{msg_id}",
-                "platform":             "telegram",
-                "text":                 text,
-                "username":             tg_user,
-                "subreddit_or_channel": username_attr or chat_title,
-                "post_url":             "",
-                "posted_at":            str(event.date) if getattr(event, "date", None) else None,
-                "search_keyword":       SEARCH_KEYWORD,
-                "upvotes":              getattr(event.message, "views", None),
-                "comments":             getattr(event.message, "forwards", None),
-            }
-            telegram_queue.put(_tg_item)
-            save_queue_message("telegram", _tg_item)
-        except Exception as exc:
-            log.error(f"Telegram message handler error: {exc}")
-
-    log.info("Telegram listener active — read-only, no interactions.")
-    await asyncio.gather(client.run_until_disconnected(), _poll_telegram_groups(client))
-
-
-def run_telegram_listener_thread():
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning("Telegram disabled — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE")
-        return
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        client = TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=loop)
-        loop.run_until_complete(client.start(phone=TELEGRAM_PHONE))
-        me = loop.run_until_complete(client.get_me())
-        log.info(f"Telegram authenticated as {me.first_name} (@{me.username or me.id})")
-        _join_telegram_groups_sync(client)
-        loop.run_until_complete(_run_telegram_listener(client))
-    except Exception as exc:
-        log.error(f"Telegram listener thread error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ASYNC LISTENERS — thread management + auto-restart (unchanged shape)
+# ASYNC LISTENERS — thread management + auto-restart
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
+    """
+    Reddit's ONLY mechanism now: SERP discovery thread (per-keyword TTL
+    cache -> Google search -> .json fetch) + its dedicated batch
+    processor thread. Governed entirely by REDDIT_ENABLED + DataForSEO
+    credentials.
+    """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
+        return
+    if not (DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD):
+        log.warning("Reddit not started — DATAFORSEO_LOGIN/PASSWORD not set (required for SERP discovery).")
         return
 
     resumed = load_queue_messages("reddit")
@@ -2017,28 +1463,30 @@ async def start_reddit_listener():
     if resumed:
         log.info(f"[REDDIT] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
 
-    rss_thread = threading.Thread(target=poll_reddit_rss, daemon=True, name="Reddit-RSS")
+    serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
+        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
+              REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
         daemon=True, name="Reddit-Batch",
     )
-    rss_thread.start()
+    serp_thread.start()
     btch_thread.start()
-    log.info(f"Reddit threads running: RSS-Poller ✅ | Batch ✅ | "
+    log.info(f"Reddit threads running: SERP-Discovery ✅ | Batch ✅ | "
              f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s")
 
     while True:
         await asyncio.sleep(60)
-        if not rss_thread.is_alive():
-            log.error("Reddit RSS thread died — restarting...")
-            rss_thread = threading.Thread(target=poll_reddit_rss, daemon=True, name="Reddit-RSS")
-            rss_thread.start()
+        if not serp_thread.is_alive():
+            log.error("Reddit SERP thread died — restarting...")
+            serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
+            serp_thread.start()
         if not btch_thread.is_alive():
             log.error("Reddit batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
+                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
+                      REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
                 daemon=True, name="Reddit-Batch",
             )
             btch_thread.start()
@@ -2061,7 +1509,8 @@ async def start_twitter_listener():
     poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
+        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
+              TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
         daemon=True, name="Twitter-Batch",
     )
     poll_thread.start()
@@ -2079,49 +1528,9 @@ async def start_twitter_listener():
             log.error("Twitter batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
+                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
+                      TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
                 daemon=True, name="Twitter-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_telegram_listener():
-    if not TELEGRAM_ENABLED:
-        log.warning("Telegram platform DISABLED — skipping.")
-        return
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning("Telegram listener not started — set TELEGRAM_API_ID/HASH/PHONE.")
-        return
-
-    resumed = load_queue_messages("telegram")
-    for it in resumed:
-        telegram_queue.put(it)
-    if resumed:
-        log.info(f"[TELEGRAM] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
-
-    tg_thread = threading.Thread(target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener")
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM", TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
-        daemon=True, name="Telegram-Batch",
-    )
-    tg_thread.start()
-    btch_thread.start()
-    log.info(f"Telegram threads running: Listener ✅ | Batch ✅ | "
-             f"gap:{TELEGRAM_BATCH_GAP_SECONDS}s | timeout:{TELEGRAM_BATCH_TIMEOUT_SECONDS}s")
-
-    while True:
-        await asyncio.sleep(60)
-        if not tg_thread.is_alive():
-            log.error("Telegram listener thread died — restarting...")
-            tg_thread = threading.Thread(target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener")
-            tg_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Telegram batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM", TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
-                daemon=True, name="Telegram-Batch",
             )
             btch_thread.start()
 
@@ -2140,19 +1549,26 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — read-only endpoints (Slack/HubSpot diagnostics removed)
+# FASTAPI — read-only endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v8.0 — Generic Signal Scorer (Slack + HubSpot removed)",
+    title="Flintel v9.4 — Reddit (SERP + fetch-once-forever keyword cache) + Twitter Signal Scorer",
     description=(
-        "Reddit (RSS) + Twitter + Telegram signals: monitor, score (generic "
-        "1-100 relevance/visibility/engagement model), store. Persistent "
-        "batch state + queue + dedup (v7.3-v7.4.5 fixes kept as-is). "
-        "Streaming Claude with partial-JSON recovery. Rescore reads "
-        "pending status directly from `signals`. No Slack. No HubSpot."
+        "Reddit (DataForSEO SERP discovery, fetch-once-forever keyword cache — "
+        "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
+        "score (generic 1-100 relevance/visibility/engagement model), store. "
+        "Persistent batch state + queue + dedup — no in-flight item is ever "
+        "lost on restart. Each keyword is tracked in flintel_keywords and, "
+        "once fetched, is PERMANENTLY marked done — restarts never reset "
+        "progress and never trigger a re-fetch of an already-done keyword. "
+        "Newly added keywords are picked up automatically, one at a time. "
+        "Streaming Claude with partial-JSON recovery. Claude failures route "
+        "to status='pending' for automatic rescore (re-uses stored "
+        "enrichment, never re-fetches from Reddit/.json or DataForSEO) "
+        "instead of a permanent low score."
     ),
-    version="8.0.0",
+    version="9.4.0",
 )
 
 
@@ -2167,38 +1583,47 @@ def _serialise(signals: list) -> list:
 
 @app.get("/")
 def root():
+    now = datetime.now(timezone.utc)
+    total_keywords_tracked = db.flintel_keywords.count_documents({})
+    due_now_count = db.flintel_keywords.count_documents({
+        "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
+        "fetched": False,
+    })
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v8.0 (generic, Slack+HubSpot removed)",
+        "system":                  "FLINTEL v9.4 (Reddit SERP + fetch-once-forever keyword cache + Twitter)",
         "client":                  CLIENT_ID,
-        "search_keyword":          SEARCH_KEYWORD,
-        "platforms":               ["reddit", "twitter", "telegram"],
+        "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
-        "reddit_status":           _working(REDDIT_ENABLED),
+        "reddit_status":           _working(REDDIT_ENABLED and bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)),
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "telegram_enabled":        TELEGRAM_ENABLED,
-        "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
+        "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
+        "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
+        "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
+        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
+        "keywords_tracked":               total_keywords_tracked,
+        "keywords_due_now":               due_now_count,
+        "serp_months_back":        SERP_MONTHS_BACK,
+        "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
         "twitter_batch_size":      TWITTER_BATCH_SIZE,
-        "telegram_batch_size":     TELEGRAM_BATCH_SIZE,
         "rescore_batch_size":      RESCORE_BATCH_SIZE,
         "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
         "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
-        "telegram_batch_gap_s":    TELEGRAM_BATCH_GAP_SECONDS,
-        "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
         "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
-        "serpapi_configured":     bool(SERPAPI_KEY),
         "dataforseo_configured":  bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
-        "telegram_queue_size":     telegram_queue.qsize(),
         "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "auth_required":           bool(API_KEY),
-        "slack_removed":           True,
-        "hubspot_removed":         True,
+        "telegram_removed":        True,
+        "reddit_rss_removed":      True,
+        "fixed_full_cycle_sleep_removed": True,
+        "post_url_dedup_before_scoring": True,
+        "claude_failure_routes_to_pending": True,
         "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
     }
 
@@ -2214,19 +1639,39 @@ def health():
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
-        "reddit_working":          REDDIT_ENABLED,
-        "reddit_indicator":        _working(REDDIT_ENABLED),
+        "reddit_working":          REDDIT_ENABLED and bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD),
+        "reddit_indicator":        _working(REDDIT_ENABLED and bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)),
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "telegram_working":        TELEGRAM_ENABLED and bool(TELEGRAM_API_ID),
-        "telegram_indicator":      _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
-        "telegram_queue_size":     telegram_queue.qsize(),
         "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/keywords", dependencies=[Depends(verify_api_key)])
+def get_keywords_status():
+    """
+    Inspect the fetch-once-forever keyword cache directly — for every
+    keyword shows whether it's been fetched (true = permanently done,
+    never re-fetched; false = still pending, due on the next pass) and
+    when it was last fetched.
+    """
+    raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
+    due_count = 0
+    docs = []
+    for d in raw_docs:
+        is_due = not d.get("fetched")
+        if is_due:
+            due_count += 1
+        for f in ["last_fetched_at", "created_at"]:
+            if d.get(f):
+                d[f] = d[f].isoformat()
+        d["due_now"] = is_due
+        docs.append(d)
+    return {"total": len(docs), "due_now": due_count, "keywords": docs}
 
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
@@ -2278,36 +1723,33 @@ async def main():
     await asyncio.gather(
         start_reddit_listener(),
         start_twitter_listener(),
-        start_telegram_listener(),
         start_rescore_listener(),
     )
 
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v8.0 — GENERIC SIGNAL SCORER (Slack + HubSpot removed)")
+    log.info("  FLINTEL v9.4 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
-    log.info(f"  Client             : {CLIENT_ID}")
-    log.info(f"  Search keyword     : {SEARCH_KEYWORD!r}")
-    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
-    log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
-    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
-    log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
-    log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
-    log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
-    log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {TELEGRAM_BATCH_TIMEOUT_SECONDS}s | gap {TELEGRAM_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore source     : signals collection, status='pending' (no separate collection)")
-    log.info(f"  Claude streaming   : True (FIX C) | prompt: generic 1-100 relevance/visibility/engagement")
-    log.info(f"  SerpApi configured : {bool(SERPAPI_KEY)}  (google_rank)")
-    log.info(f"  DataForSEO config  : {bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)}  (search_volume)")
-    log.info(f"  Slack              : REMOVED")
-    log.info(f"  HubSpot            : REMOVED")
-    log.info(f"  MongoDB DB         : {MONGODB_DB}")
-    log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored (unchanged)")
-    log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured (unchanged)")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (unchanged)")
-    log.info(f"  API auth           : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
+    log.info(f"  Client               : {CLIENT_ID}")
+    log.info(f"  Platforms            : Reddit (SERP discovery, per-keyword TTL) + Twitter/X")
+    log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD))}")
+    log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
+    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery)")
+    log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
+    log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
+             f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD}")
+    log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
+    log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore source       : signals collection, status='pending' — never re-fetches, only re-scores")
+    log.info(f"  Claude streaming     : True | prompt: generic 1-100 relevance/visibility/engagement")
+    log.info(f"  DataForSEO config    : {bool(DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD)} (SOLE provider — google_rank + search_volume)")
+    log.info(f"  Telegram             : REMOVED")
+    log.info(f"  Reddit RSS           : REMOVED")
+    log.info(f"  Fixed full-cycle sleep: REMOVED (each keyword has its own independent TTL clock)")
+    log.info(f"  MongoDB DB           : {MONGODB_DB}")
+    log.info(f"  API auth             : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
 
     asyncio.run(main())
