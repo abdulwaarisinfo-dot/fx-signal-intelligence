@@ -339,7 +339,6 @@ import re
 import feedparser
 import anthropic
 import httpx
-import tweepy
 from telethon import TelegramClient, events
 from telethon.errors import (
     UserAlreadyParticipantError,
@@ -379,9 +378,7 @@ log = logging.getLogger("flintel")
 
 REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
 
-TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+RAPID_API_KEY        = os.getenv("RAPID_API_KEY")
 
 TELEGRAM_API_ID      = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH    = os.getenv("TELEGRAM_API_HASH", "")
@@ -3220,17 +3217,15 @@ def poll_reddit_rss():
 # TWITTER / X POLLER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_twitter_client() -> tweepy.Client | None:
-    if not TWITTER_BEARER_TOKEN:
-        log.warning("TWITTER_BEARER_TOKEN not set — Twitter platform disabled.")
+def build_twitter_client() -> dict | None:
+    if not RAPID_API_KEY:
+        log.warning("RAPID_API_KEY not set — Twitter platform disabled.")
         return None
     try:
-        client = tweepy.Client(
-            bearer_token       = TWITTER_BEARER_TOKEN,
-            consumer_key       = TWITTER_API_KEY,
-            consumer_secret    = TWITTER_API_SECRET,
-            wait_on_rate_limit = True,
-        )
+        client = {
+            "x-rapidapi-key":  RAPID_API_KEY,
+            "x-rapidapi-host": "x66.p.rapidapi.com",
+        }
         log.info("Twitter/X client initialised.")
         return client
     except Exception as exc:
@@ -3238,7 +3233,7 @@ def build_twitter_client() -> tweepy.Client | None:
         return None
 
 
-def poll_twitter(client: tweepy.Client):
+def poll_twitter(client: dict):
     seen_ids: set = load_seen_ids("twitter")
     dirty = 0
     log.info(
@@ -3248,37 +3243,28 @@ def poll_twitter(client: tweepy.Client):
 
     while True:
         try:
-            response = client.search_recent_tweets(
-                query        = TWITTER_SEARCH_QUERY,
-                max_results  = 50,
-                tweet_fields = ["author_id", "created_at", "text", "conversation_id"],
-                expansions   = ["author_id"],
-                user_fields  = ["username", "name"],
-            )
+            url = "https://x66.p.rapidapi.com/tweet/1668868113725550592"
+            headers = client
+            response = requests.get(url, headers=headers)
+            data = response.json()
 
-            if not response or not response.data:
+            if not data:
                 log.debug("Twitter: no results this cycle.")
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
-            user_map: dict = {}
-            if response.includes and "users" in response.includes:
-                for u in response.includes["users"]:
-                    user_map[u.id] = u.username
-
             new_count = 0
-            for tweet in response.data:
-                tweet_id = str(tweet.id)
-                if tweet_id in seen_ids:
-                    continue
+            tweet_id = str(data.get("id") or data.get("id_str") or "")
+            if tweet_id and tweet_id not in seen_ids:
                 seen_ids.add(tweet_id)
                 dirty += 1
 
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
-                text     = tweet.text or ""
-                username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
+                text     = data.get("text", "") or ""
+                author   = data.get("author") if isinstance(data.get("author"), dict) else {}
+                username = author.get("username", f"user_{tweet_id}")
 
                 _tw_item = {
                     "message_id":     f"twitter_{tweet_id}",
@@ -3304,8 +3290,6 @@ def poll_twitter(client: tweepy.Client):
                     f"queue_size:{twitter_queue.qsize()}"
                 )
 
-        except tweepy.errors.TweepyException as exc:
-            log.error(f"Twitter poll error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
         except Exception as exc:
             log.error(f"Twitter unexpected error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
 
@@ -3964,7 +3948,7 @@ def root():
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED),
         "twitter_enabled":         TWITTER_ENABLED,
-        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
+        "twitter_status":          _working(TWITTER_ENABLED and bool(RAPID_API_KEY)),
         "telegram_enabled":        TELEGRAM_ENABLED,
         "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
         "reddit_mode":             "feedparser RSS (no credentials required)",
@@ -4019,7 +4003,7 @@ def health():
         mongo = "disconnected"
 
     reddit_working   = REDDIT_ENABLED
-    twitter_working  = TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)
+    twitter_working  = TWITTER_ENABLED and bool(RAPID_API_KEY)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
 
     pending_rescore = 0
@@ -4442,7 +4426,7 @@ if __name__ == "__main__":
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
     log.info(f"  Reddit mode        : feedparser RSS — no credentials required")
     log.info(f"  Reddit poll gap    : {REDDIT_POLL_INTERVAL}s between full subreddit cycles")
-    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
+    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(RAPID_API_KEY))}")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
     log.info(f"  Telegram polling   : {'every ' + str(TELEGRAM_POLL_INTERVAL) + 's' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled (TELEGRAM_POLL_INTERVAL=0)'}")
     log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {REDDIT_BATCH_GAP_SECONDS}s")
