@@ -3224,13 +3224,47 @@ def build_twitter_client() -> dict | None:
     try:
         client = {
             "x-rapidapi-key":  RAPID_API_KEY,
-            "x-rapidapi-host": "x66.p.rapidapi.com",
+            "x-rapidapi-host": "twitter241.p.rapidapi.com",
         }
         log.info("Twitter/X client initialised.")
         return client
     except Exception as exc:
         log.error(f"Twitter client error: {exc}")
         return None
+
+
+def _extract_tweets_from_twitter241(data: dict) -> list:
+    """Best-effort walk of twitter241's nested GraphQL-style search response
+    into a flat list of {id, text, username} dicts."""
+    tweets = []
+    try:
+        instructions = (
+            data.get("result", {})
+                .get("timeline", {})
+                .get("instructions", [])
+        )
+        for instr in instructions:
+            for entry in instr.get("entries", []):
+                content = entry.get("content", {})
+                item = content.get("itemContent", {})
+                tweet_result = item.get("tweet_results", {}).get("result", {})
+                legacy = tweet_result.get("legacy", {})
+                if not legacy:
+                    continue
+                tweet_id = str(tweet_result.get("rest_id") or legacy.get("id_str") or "")
+                text = legacy.get("full_text") or legacy.get("text") or ""
+                user_legacy = (
+                    tweet_result.get("core", {})
+                    .get("user_results", {})
+                    .get("result", {})
+                    .get("legacy", {})
+                )
+                username = user_legacy.get("screen_name", f"user_{tweet_id}")
+                if tweet_id:
+                    tweets.append({"id": tweet_id, "text": text, "username": username})
+    except Exception as exc:
+        log.error(f"Twitter response parse error: {exc}")
+    return tweets
 
 
 def poll_twitter(client: dict):
@@ -3243,28 +3277,37 @@ def poll_twitter(client: dict):
 
     while True:
         try:
-            url = "https://x66.p.rapidapi.com/tweet/1668868113725550592"
+            url = "https://twitter241.p.rapidapi.com/search"
+            params = {
+                "type":  "Top",
+                "count": "20",
+                "query": TWITTER_SEARCH_QUERY,
+            }
             headers = client
-            response = requests.get(url, headers=headers)
+            response = requests.get(url=url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
             data = response.json()
 
-            if not data:
+            tweets = _extract_tweets_from_twitter241(data)
+
+            if not tweets:
                 log.debug("Twitter: no results this cycle.")
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
             new_count = 0
-            tweet_id = str(data.get("id") or data.get("id_str") or "")
-            if tweet_id and tweet_id not in seen_ids:
+            for t in tweets:
+                tweet_id = t["id"]
+                if tweet_id in seen_ids:
+                    continue
                 seen_ids.add(tweet_id)
                 dirty += 1
 
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
-                text     = data.get("text", "") or ""
-                author   = data.get("author") if isinstance(data.get("author"), dict) else {}
-                username = author.get("username", f"user_{tweet_id}")
+                text     = t["text"]
+                username = t["username"]
 
                 _tw_item = {
                     "message_id":     f"twitter_{tweet_id}",
