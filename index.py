@@ -3281,7 +3281,7 @@ def poll_twitter(client: dict):
             params = {
                 "type":  "Latest",
                 "count": "100",
-                "query": KEYWORDS,
+                "query": TWITTER_SEARCH_QUERY,
             }
             headers = client
             response = requests.get(url=url, headers=headers, params=params, timeout=30)
