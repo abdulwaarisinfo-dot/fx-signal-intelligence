@@ -469,7 +469,7 @@ def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  True)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 
@@ -3277,11 +3277,11 @@ def poll_twitter(client: dict):
 
     while True:
         try:
-            url = "https://twitter241.p.rapidapi.com/search"
+            url = "https://twitter241.p.rapidapi.com/search-v3"
             params = {
-                "type":  "Top",
-                "count": "20",
-                "query": TWITTER_SEARCH_QUERY,
+                "type":  "Latest",
+                "count": "100",
+                "query": KEYWORDS,
             }
             headers = client
             response = requests.get(url=url, headers=headers, params=params, timeout=30)
