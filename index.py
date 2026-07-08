@@ -526,7 +526,7 @@ def _bool_env(key: str, default: bool = True) -> bool:
 REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
-FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", False)
+FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", True)
 
 
 def _working(flag: bool) -> str:
