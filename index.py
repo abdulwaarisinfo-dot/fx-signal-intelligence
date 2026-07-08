@@ -469,7 +469,7 @@ def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 
@@ -3214,7 +3214,7 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER (unchanged)
+# TWITTER / X POLLER — testing twitter-api45.p.rapidapi.com/search.php
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> dict | None:
@@ -3224,13 +3224,47 @@ def build_twitter_client() -> dict | None:
     try:
         client = {
             "x-rapidapi-key":  RAPID_API_KEY,
-            "x-rapidapi-host": "x66.p.rapidapi.com",
+            "x-rapidapi-host": "twitter-api45.p.rapidapi.com",
         }
-        log.info("Twitter/X client initialised.")
+        log.info("Twitter/X client initialised (twitter-api45).")
         return client
     except Exception as exc:
         log.error(f"Twitter client error: {exc}")
         return None
+
+
+def _extract_tweets_from_twitter_api45(data: dict) -> list:
+    """Best-effort walk of twitter-api45's flat search.php response into a
+    list of {id, text, username} dicts.
+
+    twitter-api45 returns tweets as a flat list (not GraphQL-nested like
+    twitter241) — confirmed field names for this vendor's endpoints include
+    tweet_id, text, created_at, favorites, bookmarks, views, quotes. The
+    per-tweet author field hasn't been confirmed against a live search.php
+    response yet, so this checks the common variants defensively instead of
+    assuming one and silently dropping every tweet.
+    """
+    tweets = []
+    try:
+        results = data.get("timeline") or data.get("results") or data.get("tweets") or []
+        for t in results:
+            if not isinstance(t, dict):
+                continue
+            tweet_id = str(t.get("tweet_id") or t.get("id") or "")
+            if not tweet_id:
+                continue
+            text = t.get("text") or t.get("full_text") or ""
+            author = t.get("author") or t.get("user") or {}
+            username = (
+                t.get("screen_name")
+                or author.get("screen_name")
+                or author.get("username")
+                or f"user_{tweet_id}"
+            )
+            tweets.append({"id": tweet_id, "text": text, "username": username})
+    except Exception as exc:
+        log.error(f"Twitter response parse error: {exc}")
+    return tweets
 
 
 def poll_twitter(client: dict):
@@ -3243,28 +3277,36 @@ def poll_twitter(client: dict):
 
     while True:
         try:
-            url = "https://x66.p.rapidapi.com/tweet/1668868113725550592"
+            url = "https://twitter-api45.p.rapidapi.com/search.php"
+            params = {
+                "query":       TWITTER_SEARCH_QUERY,
+                "search_type": "Top",
+            }
             headers = client
-            response = requests.get(url, headers=headers)
+            response = requests.get(url=url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
             data = response.json()
 
-            if not data:
+            tweets = _extract_tweets_from_twitter_api45(data)
+
+            if not tweets:
                 log.debug("Twitter: no results this cycle.")
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
             new_count = 0
-            tweet_id = str(data.get("id") or data.get("id_str") or "")
-            if tweet_id and tweet_id not in seen_ids:
+            for t in tweets:
+                tweet_id = t["id"]
+                if tweet_id in seen_ids:
+                    continue
                 seen_ids.add(tweet_id)
                 dirty += 1
 
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
-                text     = data.get("text", "") or ""
-                author   = data.get("author") if isinstance(data.get("author"), dict) else {}
-                username = author.get("username", f"user_{tweet_id}")
+                text     = t["text"]
+                username = t["username"]
 
                 _tw_item = {
                     "message_id":     f"twitter_{tweet_id}",
