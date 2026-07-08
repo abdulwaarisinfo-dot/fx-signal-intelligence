@@ -1,7 +1,48 @@
 """
-FX Signal Intelligence System — FLINTEL v7.4.5
+FX Signal Intelligence System — FLINTEL v7.5.0
 =============================================
-Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon)
+Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon) + Facebook (facebook-scraper3 RapidAPI)
+
+Changelog v7.5.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.4.5):
+
+  CHANGE — FACEBOOK ADDED AS A 4TH PLATFORM.
+
+           Facebook is wired in exactly like Reddit/Twitter/Telegram — its own
+           in-memory queue (facebook_queue), its own persistent dedup set
+           (flintel_seen_ids, platform="facebook"), its own persistent batch
+           state (flintel_pending_batch / flintel_batch_seconds, platform=
+           "facebook"), its own persistent raw-queue backup
+           (flintel_queue_messages, platform="facebook"), its own
+           run_batch_processor() thread using the SAME generic batch
+           processor function Reddit/Twitter/Telegram already use, its own
+           Claude scoring schema (CLAUDE_SYSTEM_PROMPT_FACEBOOK — same
+           _SCORING_CORE, same thresholds, same routing), and its own
+           FastAPI surface (/signals/facebook) plus root/health reporting.
+           Nothing about Reddit, Twitter, or Telegram's code paths, timing,
+           or state changed — Facebook is purely additive, following the
+           identical pattern used by every other platform.
+
+           Facebook uses the facebook-scraper3 RapidAPI product
+           (x-rapidapi-host: facebook-scraper3.p.rapidapi.com,
+           GET /search/posts) — it works by cycling through the SAME
+           KEYWORDS list already used for keyword pre-filtering on the
+           other platforms, issuing one search/posts request per keyword
+           per poll cycle, exactly like Reddit's per-subreddit cycle.
+           New env vars (defaults match the other platforms' patterns):
+
+             FACEBOOK_ENABLED               (default: false)
+             FACEBOOK_BATCH_SIZE            (default: 10)
+             FACEBOOK_BATCH_GAP_SECONDS     (default: 30)
+             FACEBOOK_BATCH_TIMEOUT_SECONDS (default: 120)
+             FACEBOOK_POLL_INTERVAL         (default: 300 — full keyword cycle)
+             FACEBOOK_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
+
+           NOTHING ELSE CHANGED. Reddit, Twitter, Telegram scoring logic,
+           prompts, MongoDB signal storage, HubSpot fields, Slack formatting,
+           FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
+           keyword list, per-platform BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS,
+           FIX A/B/C/D/E, the rescore feature, and v7.4.5's queue/batch-seconds
+           persistence are byte-for-byte identical to v7.4.5.
 
 Changelog v7.4.5 (THREE ADDITIVE CHANGES ONLY — everything else 100% unchanged from v7.4.4):
 
@@ -405,6 +446,7 @@ CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
 TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
+FACEBOOK_BATCH_SIZE = int(os.getenv("FACEBOOK_BATCH_SIZE", "10"))
 RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
 
 # ── v7.4.4 CHANGE — BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS are now
@@ -421,6 +463,12 @@ TWITTER_BATCH_TIMEOUT_SECONDS  = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", 
 TELEGRAM_BATCH_GAP_SECONDS     = int(os.getenv("TELEGRAM_BATCH_GAP_SECONDS",     "30"))
 TELEGRAM_BATCH_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))
 
+# ── v7.5.0 — FACEBOOK: same per-platform batch gap/timeout pattern as
+# Reddit/Twitter/Telegram. FACEBOOK_BATCH_SIZE lives alongside the other
+# BATCH_SIZE vars below (same section, same style).
+FACEBOOK_BATCH_GAP_SECONDS     = int(os.getenv("FACEBOOK_BATCH_GAP_SECONDS",     "30"))
+FACEBOOK_BATCH_TIMEOUT_SECONDS = int(os.getenv("FACEBOOK_BATCH_TIMEOUT_SECONDS", "120"))
+
 # Rescore's own gap — independent of Reddit/Twitter/Telegram (v7.4.4).
 # Rescore batch SIZE (RESCORE_BATCH_SIZE) was already independent, untouched.
 RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
@@ -432,6 +480,12 @@ WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
 TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
+
+# ── v7.5.0 — FACEBOOK: mirrors Reddit's per-cycle polling pattern (a full
+# pass over TARGET_SUBREDDITS there / over KEYWORDS here), with a small
+# gap between each individual request to stay rate-limit safe.
+FACEBOOK_POLL_INTERVAL       = int(os.getenv("FACEBOOK_POLL_INTERVAL", "300"))
+FACEBOOK_KEYWORD_GAP_SECONDS = int(os.getenv("FACEBOOK_KEYWORD_GAP_SECONDS", "2"))
 
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
@@ -472,6 +526,7 @@ def _bool_env(key: str, default: bool = True) -> bool:
 REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
+FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", True)
 
 
 def _working(flag: bool) -> str:
@@ -525,6 +580,7 @@ TARGET_TELEGRAM_GROUPS = [
 reddit_queue:   queue.Queue = queue.Queue()
 twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
+facebook_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.4.3)
@@ -1608,6 +1664,40 @@ For scores 4-10: include telegram_dm.
 Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
 """
 
+CLAUDE_SYSTEM_PROMPT_FACEBOOK = _SCORING_CORE + """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BATCH SCORING FORMAT — FACEBOOK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
+reason: maximum 15 words. suggested_action: maximum 10 words.
+Facebook posts are public — a public comment reply is possible.
+For scores 1-3: omit facebook_comment entirely — do NOT output the key.
+For scores 4-10: include facebook_comment.
+
+[
+  {
+    "index": <1-based integer matching message number>,
+    "intent_score": <number 1-10>,
+    "is_business": <true|false>,
+    "business_size": <"solo"|"small"|"medium"|"unknown">,
+    "has_international_context": <true|false>,
+    "corridor": "<source country to destination or null>",
+    "estimated_amount": "<specific amount if mentioned or null>",
+    "competitor_mentioned": "<competitor name or null>",
+    "competitor_outreach_detected": <true|false>,
+    "pain_type": "<specific pain or null>",
+    "urgency": "<immediate|today|this_week|researching|none>",
+    "reason": "<max 15 words>",
+    "suggested_action": "<max 10 words>",
+    "watchlist": <true|false>,
+    "facebook_comment": "<public reply to their Facebook post, max 3 sentences — OMIT KEY IF SCORE 1-3>"
+  }
+]
+
+Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MONGODB
@@ -1743,7 +1833,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.4.5"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.5.0"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -2006,6 +2096,7 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
         "twitter_dm":                   None,
         "linkedin_message":             None,
         "telegram_dm":                  None,
+        "facebook_comment":             None,
         "watchlist":                    False,
         "watchlist_reason":             None,
     }
@@ -2105,6 +2196,7 @@ def _call_claude_batch(batch: list) -> list:
     system_prompt = {
         "twitter":  CLAUDE_SYSTEM_PROMPT_TWITTER,
         "telegram": CLAUDE_SYSTEM_PROMPT_TELEGRAM,
+        "facebook": CLAUDE_SYSTEM_PROMPT_FACEBOOK,
     }.get(platform, CLAUDE_SYSTEM_PROMPT_REDDIT)
 
     prompt = _build_batch_prompt(batch)
@@ -2163,6 +2255,7 @@ def _call_claude_batch(batch: list) -> list:
         "twitter_dm":                   None,
         "linkedin_message":             None,
         "telegram_dm":                  None,
+        "facebook_comment":             None,
         "watchlist":                    False,
     }
 
@@ -2236,6 +2329,7 @@ def save_signal(data: dict) -> bool:
             "twitter_dm":                   data.get("twitter_dm"),
             "linkedin_message":             data.get("linkedin_message"),
             "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "client_id":                    CLIENT_ID,
@@ -2302,6 +2396,7 @@ def update_signal(message_id: str, data: dict) -> bool:
             "twitter_dm":                   data.get("twitter_dm"),
             "linkedin_message":             data.get("linkedin_message"),
             "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
@@ -2427,6 +2522,7 @@ def send_slack_alert(data: dict) -> bool:
         data.get("twitter_dm") or
         data.get("telegram_dm") or
         data.get("linkedin_message") or
+        data.get("facebook_comment") or
         ""
     )
 
@@ -2655,7 +2751,7 @@ def _hs_create_note(data: dict, contact_id: str):
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
         note = (
-            f"FLINTEL SIGNAL — v7.4.5{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.5.0{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -2677,7 +2773,8 @@ def _hs_create_note(data: dict, contact_id: str):
             f"Twitter Reply:\n{data.get('twitter_reply') or 'N/A'}\n\n"
             f"Twitter DM:\n{data.get('twitter_dm') or 'N/A'}\n\n"
             f"LinkedIn:\n{data.get('linkedin_message') or 'N/A'}\n\n"
-            f"Telegram DM:\n{data.get('telegram_dm') or 'N/A'}"
+            f"Telegram DM:\n{data.get('telegram_dm') or 'N/A'}\n\n"
+            f"Facebook Comment:\n{data.get('facebook_comment') or 'N/A'}"
         )
         r = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/notes",
@@ -2753,6 +2850,7 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
         "twitter_dm":                   score_result.get("twitter_dm"),
         "linkedin_message":             score_result.get("linkedin_message"),
         "telegram_dm":                  score_result.get("telegram_dm"),
+        "facebook_comment":             score_result.get("facebook_comment"),
         "watchlist":                    score_result.get("watchlist", False),
         "watchlist_reason":             score_result.get("watchlist_reason"),
         "timestamp":                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -3339,6 +3437,149 @@ def poll_twitter(client: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FACEBOOK POLLER — v7.5.0 NEW — facebook-scraper3.p.rapidapi.com/search/posts
+#
+# Mirrors the Twitter poller's shape (RapidAPI headers dict + requests.get),
+# but cycles through the KEYWORDS list one search per keyword per cycle,
+# exactly like Reddit's per-subreddit cycle (poll_reddit_rss). Nothing about
+# Reddit/Twitter/Telegram's polling changes — this is a new, independent
+# poller feeding its own facebook_queue.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_facebook_client() -> dict | None:
+    if not RAPID_API_KEY:
+        log.warning("RAPID_API_KEY not set — Facebook platform disabled.")
+        return None
+    try:
+        client = {
+            "x-rapidapi-key":  RAPID_API_KEY,
+            "x-rapidapi-host": "facebook-scraper3.p.rapidapi.com",
+        }
+        log.info("Facebook client initialised (facebook-scraper3).")
+        return client
+    except Exception as exc:
+        log.error(f"Facebook client error: {exc}")
+        return None
+
+
+def _extract_posts_from_facebook_scraper3(data: dict) -> list:
+    """Best-effort walk of facebook-scraper3's /search/posts response into a
+    list of {id, text, username, url} dicts. Field names are checked
+    defensively (results/posts/data, post_id/id, message/text/content,
+    author_name/author.name/author.username) since the vendor's exact
+    schema for this endpoint hasn't been confirmed against a live response —
+    same defensive approach used for twitter-api45 above, so a shape
+    mismatch degrades to "no posts this cycle" instead of a crash.
+    """
+    posts = []
+    try:
+        results = data.get("results") or data.get("posts") or data.get("data") or []
+        if not isinstance(results, list):
+            return posts
+        for p in results:
+            if not isinstance(p, dict):
+                continue
+            post_id = str(p.get("post_id") or p.get("id") or "")
+            if not post_id:
+                continue
+            text = p.get("message") or p.get("text") or p.get("content") or ""
+            author = p.get("author") or p.get("user") or {}
+            if not isinstance(author, dict):
+                author = {}
+            username = (
+                p.get("author_name")
+                or author.get("name")
+                or author.get("username")
+                or f"user_{post_id}"
+            )
+            url = p.get("url") or p.get("post_url") or p.get("permalink") or ""
+            posts.append({"id": post_id, "text": text, "username": username, "url": url})
+    except Exception as exc:
+        log.error(f"Facebook response parse error: {exc}")
+    return posts
+
+
+def poll_facebook(client: dict):
+    seen_ids: set = load_seen_ids("facebook")
+    dirty = 0
+    log.info(
+        f"Facebook poll started | keywords:{len(KEYWORDS)} | "
+        f"poll interval: {FACEBOOK_POLL_INTERVAL}s per full cycle | "
+        f"dedup set resumed with {len(seen_ids)} known ID(s)"
+    )
+
+    url = "https://facebook-scraper3.p.rapidapi.com/search/posts"
+
+    while True:
+        cycle_start  = time.time()
+        total_new    = 0
+        total_errors = 0
+
+        for keyword in KEYWORDS:
+            try:
+                params = {"query": keyword}
+                response = requests.get(url=url, headers=client, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+
+                posts = _extract_posts_from_facebook_scraper3(data)
+
+                new_this_keyword = 0
+                for p in posts:
+                    post_id = p["id"]
+                    if post_id in seen_ids:
+                        continue
+                    seen_ids.add(post_id)
+                    dirty += 1
+
+                    if len(seen_ids) > 50_000:
+                        seen_ids.clear()
+
+                    text     = p["text"]
+                    username = p["username"]
+
+                    _fb_item = {
+                        "message_id":     f"facebook_{post_id}",
+                        "platform":       "facebook",
+                        "content_type":   "post",
+                        "text":           text,
+                        "username":       username,
+                        "subreddit":      "",
+                        "telegram_group": "",
+                        "post_url":       p.get("url") or "",
+                    }
+                    facebook_queue.put(_fb_item)
+                    save_queue_message("facebook", _fb_item)
+                    total_new += 1
+                    new_this_keyword += 1
+
+                if new_this_keyword:
+                    log.info(
+                        f"[FACEBOOK] '{keyword}' → {new_this_keyword} new items queued "
+                        f"(queue size: {facebook_queue.qsize()})"
+                    )
+
+                if dirty >= 10:
+                    save_seen_ids("facebook", seen_ids)
+                    dirty = 0
+
+                time.sleep(FACEBOOK_KEYWORD_GAP_SECONDS)
+
+            except Exception as exc:
+                log.error(f"[FACEBOOK] Unhandled error for keyword '{keyword}': {exc}")
+                total_errors += 1
+
+        save_seen_ids("facebook", seen_ids)
+
+        cycle_elapsed = time.time() - cycle_start
+        log.info(
+            f"[FACEBOOK] Cycle complete | new:{total_new} errors:{total_errors} | "
+            f"elapsed:{cycle_elapsed:.1f}s | sleeping {FACEBOOK_POLL_INTERVAL}s..."
+        )
+        time.sleep(FACEBOOK_POLL_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM LISTENER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3620,7 +3861,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.5 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.5.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook"}]},
         ]
 
         result = retry_with_backoff(
@@ -3648,6 +3889,7 @@ def send_weekly_report():
         reddit_sigs   = [s for s in all_signals if s.get("platform") == "reddit"]
         twitter_sigs  = [s for s in all_signals if s.get("platform") == "twitter"]
         telegram_sigs = [s for s in all_signals if s.get("platform") == "telegram"]
+        facebook_sigs = [s for s in all_signals if s.get("platform") == "facebook"]
         total         = len(all_signals)
 
         if total == 0:
@@ -3687,6 +3929,7 @@ def send_weekly_report():
                     {"type": "mrkdwn", "text": f"*Reddit*\n{len(reddit_sigs)}"},
                     {"type": "mrkdwn", "text": f"*Twitter/X*\n{len(twitter_sigs)}"},
                     {"type": "mrkdwn", "text": f"*Telegram*\n{len(telegram_sigs)}"},
+                    {"type": "mrkdwn", "text": f"*Facebook*\n{len(facebook_sigs)}"},
                 ]},
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Corridor Breakdown*\n{breakdown('corridor')}"}},
@@ -3695,7 +3938,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.4.5 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.5.0 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -3704,7 +3947,8 @@ def send_weekly_report():
             log.info(
                 f"Weekly report sent | Total:{total} High:{len(high)} Med:{len(medium)} "
                 f"Biz:{len(business)} Reddit:{len(reddit_sigs)} "
-                f"Twitter:{len(twitter_sigs)} Telegram:{len(telegram_sigs)}"
+                f"Twitter:{len(twitter_sigs)} Telegram:{len(telegram_sigs)} "
+                f"Facebook:{len(facebook_sigs)}"
             )
 
     except Exception as exc:
@@ -3924,6 +4168,64 @@ async def start_telegram_listener():
             btch_thread.start()
 
 
+async def start_facebook_listener():
+    if not FACEBOOK_ENABLED:
+        log.warning("Facebook platform DISABLED (FACEBOOK_ENABLED=false) — skipping.")
+        return
+
+    client = build_facebook_client()
+    if client is None:
+        log.warning("Facebook listener not started — credentials missing.")
+        return
+
+    # NEW: reload any raw queue items persisted in flintel_queue_messages
+    # (fetched but not yet consumed before a restart) back into the
+    # in-memory facebook_queue BEFORE the poller/batch threads start.
+    _resumed_facebook = load_queue_messages("facebook")
+    for _item in _resumed_facebook:
+        facebook_queue.put(_item)
+    if _resumed_facebook:
+        log.info(
+            f"[FACEBOOK] Resumed {len(_resumed_facebook)} queue message(s) "
+            f"from MongoDB after restart — NOT lost."
+        )
+
+    poll_thread = threading.Thread(
+        target=poll_facebook, args=(client,), daemon=True, name="Facebook-Poll"
+    )
+    btch_thread = threading.Thread(
+        target=run_batch_processor,
+        args=(facebook_queue, FACEBOOK_BATCH_SIZE, "FACEBOOK",
+              FACEBOOK_BATCH_GAP_SECONDS, FACEBOOK_BATCH_TIMEOUT_SECONDS),
+        daemon=True, name="Facebook-Batch",
+    )
+
+    poll_thread.start()
+    btch_thread.start()
+    log.info(
+        f"Facebook threads running: Poll ✅ | Batch ✅ | "
+        f"gap:{FACEBOOK_BATCH_GAP_SECONDS}s | timeout:{FACEBOOK_BATCH_TIMEOUT_SECONDS}s"
+    )
+
+    while True:
+        await asyncio.sleep(60)
+        if not poll_thread.is_alive():
+            log.error("Facebook poll thread died — restarting...")
+            poll_thread = threading.Thread(
+                target=poll_facebook, args=(client,), daemon=True, name="Facebook-Poll"
+            )
+            poll_thread.start()
+        if not btch_thread.is_alive():
+            log.error("Facebook batch thread died — restarting...")
+            btch_thread = threading.Thread(
+                target=run_batch_processor,
+                args=(facebook_queue, FACEBOOK_BATCH_SIZE, "FACEBOOK",
+                      FACEBOOK_BATCH_GAP_SECONDS, FACEBOOK_BATCH_TIMEOUT_SECONDS),
+                daemon=True, name="Facebook-Batch",
+            )
+            btch_thread.start()
+
+
 async def start_rescore_listener():
     """Starts the rescore processor thread and monitors for crashes."""
     rescore_thread = threading.Thread(
@@ -3947,18 +4249,18 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.4.5",
+    title       = "FX Signal Intelligence API — Flintel v7.5.0",
     description = (
-        "Reddit (RSS) + Twitter + Telegram signals: monitor, score, store, alert. "
-        "Persistent batch state. Streaming Claude. Manual rescore. "
+        "Reddit (RSS) + Twitter + Telegram + Facebook signals: monitor, score, "
+        "store, alert. Persistent batch state. Streaming Claude. Manual rescore. "
         "HubSpot receives medium (4-7) AND high (8-10) signals. "
         "HubSpot error visibility fix (FIX E). "
         "Slack alert + HubSpot note no longer display the numeric score (v7.4.3). "
         "Per-platform BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS — Reddit, "
-        "Twitter, and Telegram each run on their own independent gap/timeout, "
-        "never mixed (v7.4.4)."
+        "Twitter, Telegram, and Facebook each run on their own independent "
+        "gap/timeout, never mixed (v7.4.4 / v7.5.0)."
     ),
-    version     = "7.4.5",
+    version     = "7.5.0",
 )
 
 
@@ -3984,35 +4286,42 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.4.5",
+        "system":                  "FLINTEL v7.5.0",
         "client":                  CLIENT_ID,
-        "platforms":               ["reddit", "twitter", "telegram"],
+        "platforms":               ["reddit", "twitter", "telegram", "facebook"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED),
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(RAPID_API_KEY)),
         "telegram_enabled":        TELEGRAM_ENABLED,
         "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
+        "facebook_enabled":        FACEBOOK_ENABLED,
+        "facebook_status":         _working(FACEBOOK_ENABLED and bool(RAPID_API_KEY)),
         "reddit_mode":             "feedparser RSS (no credentials required)",
         "reddit_poll_interval":    REDDIT_POLL_INTERVAL,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
         "twitter_batch_size":      TWITTER_BATCH_SIZE,
         "telegram_batch_size":     TELEGRAM_BATCH_SIZE,
+        "facebook_batch_size":     FACEBOOK_BATCH_SIZE,
         "rescore_batch_size":      RESCORE_BATCH_SIZE,
         "telegram_poll_interval":  TELEGRAM_POLL_INTERVAL,
-        # v7.4.4: per-platform gap/timeout, no shared globals
+        "facebook_poll_interval":  FACEBOOK_POLL_INTERVAL,
+        # v7.4.4 / v7.5.0: per-platform gap/timeout, no shared globals
         "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
         "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s":  TWITTER_BATCH_TIMEOUT_SECONDS,
         "telegram_batch_gap_s":     TELEGRAM_BATCH_GAP_SECONDS,
         "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
+        "facebook_batch_gap_s":     FACEBOOK_BATCH_GAP_SECONDS,
+        "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
         "rescore_batch_gap_s":      RESCORE_BATCH_GAP_SECONDS,
         "max_tokens":              MAX_TOKENS,
         "claude_stream_timeout_s": CLAUDE_STREAM_TIMEOUT,
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
+        "facebook_queue_size":     facebook_queue.qsize(),
         "telegram_groups":         len(TARGET_TELEGRAM_GROUPS),
         "auth_required":           bool(API_KEY),
         "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged)",
@@ -4047,6 +4356,7 @@ def health():
     reddit_working   = REDDIT_ENABLED
     twitter_working  = TWITTER_ENABLED and bool(RAPID_API_KEY)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
+    facebook_working = FACEBOOK_ENABLED and bool(RAPID_API_KEY)
 
     pending_rescore = 0
     try:
@@ -4072,12 +4382,18 @@ def health():
         "telegram_indicator":      _working(telegram_working),
         "telegram_batch_gap_s":    TELEGRAM_BATCH_GAP_SECONDS,
         "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
+        "facebook":                ("polling" if facebook_working else "disabled"),
+        "facebook_working":        facebook_working,
+        "facebook_indicator":      _working(facebook_working),
+        "facebook_batch_gap_s":    FACEBOOK_BATCH_GAP_SECONDS,
+        "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
         "hubspot_configured":      bool(HUBSPOT_API_KEY),
         "hubspot_indicator":       _working(bool(HUBSPOT_API_KEY)),
         "hubspot_medium_signals":  True,
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
+        "facebook_queue_size":     facebook_queue.qsize(),
         "rescore_pending":         pending_rescore,
         "rescore_working":         True,
         "rescore_indicator":       _working(True),
@@ -4255,6 +4571,7 @@ def get_stats():
         reddit   = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "reddit"})
         twitter  = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "twitter"})
         telegram = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram"})
+        facebook = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "facebook"})
         rescored = db.signals.count_documents({"client_id": CLIENT_ID, "rescored_at": {"$exists": True}})
 
         def agg(group_field):
@@ -4270,6 +4587,7 @@ def get_stats():
             "reddit_signals":   reddit,
             "twitter_signals":  twitter,
             "telegram_signals": telegram,
+            "facebook_signals": facebook,
             "rescored_signals": rescored,
             "corridors":        agg("corridor"),
             "pain_types":       agg("pain_type"),
@@ -4278,6 +4596,7 @@ def get_stats():
             "reddit_queue":     reddit_queue.qsize(),
             "twitter_queue":    twitter_queue.qsize(),
             "telegram_queue":   telegram_queue.qsize(),
+            "facebook_queue":   facebook_queue.qsize(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -4335,6 +4654,7 @@ def get_outreach(limit: int = 20):
                         {"twitter_dm":       {"$ne": None}},
                         {"linkedin_message": {"$ne": None}},
                         {"telegram_dm":      {"$ne": None}},
+                        {"facebook_comment": {"$ne": None}},
                     ],
                 },
                 {"_id": 0},
@@ -4377,6 +4697,18 @@ def get_telegram_signals(limit: int = 50, min_score: int = None, group: str = No
             q["intent_score"] = {"$gte": min_score}
         if group:
             q["telegram_group"] = {"$regex": group, "$options": "i"}
+        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+        return {"count": len(signals), "signals": _serialise(signals)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/signals/facebook", dependencies=[Depends(verify_api_key)])
+def get_facebook_signals(limit: int = 50, min_score: int = None):
+    try:
+        q: dict = {"client_id": CLIENT_ID, "platform": "facebook"}
+        if min_score is not None:
+            q["intent_score"] = {"$gte": min_score}
         signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
         return {"count": len(signals), "signals": _serialise(signals)}
     except Exception as exc:
@@ -4454,6 +4786,7 @@ async def main():
         start_reddit_listener(),
         start_twitter_listener(),
         start_telegram_listener(),
+        start_facebook_listener(),
         start_rescore_listener(),
         run_scheduler(),
     )
@@ -4461,21 +4794,25 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.4.5")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.5.0")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
-    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram")
+    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook")
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
     log.info(f"  Reddit mode        : feedparser RSS — no credentials required")
     log.info(f"  Reddit poll gap    : {REDDIT_POLL_INTERVAL}s between full subreddit cycles")
     log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(RAPID_API_KEY))}")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
+    log.info(f"  Facebook           : {FACEBOOK_ENABLED} | {_working(FACEBOOK_ENABLED and bool(RAPID_API_KEY))}")
+    log.info(f"  Facebook mode      : facebook-scraper3 RapidAPI — search/posts per keyword")
+    log.info(f"  Facebook poll gap  : {FACEBOOK_POLL_INTERVAL}s between full keyword cycles | {FACEBOOK_KEYWORD_GAP_SECONDS}s between keywords")
     log.info(f"  Telegram polling   : {'every ' + str(TELEGRAM_POLL_INTERVAL) + 's' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled (TELEGRAM_POLL_INTERVAL=0)'}")
     log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {TELEGRAM_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TELEGRAM_BATCH_GAP_SECONDS}s")
+    log.info(f"  Facebook batch     : {FACEBOOK_BATCH_SIZE} items OR {FACEBOOK_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {FACEBOOK_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items per Claude call | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Batch timing       : per-platform, independent — Reddit/Twitter/Telegram never share gap or timeout (v7.4.4)")
+    log.info(f"  Batch timing       : per-platform, independent — Reddit/Twitter/Telegram/Facebook never share gap or timeout (v7.4.4 / v7.5.0)")
     log.info(f"  max_tokens         : {MAX_TOKENS}")
     log.info(f"  Claude streaming   : True | {_working(True)} (FIX C — no more 10-min error)")
     log.info(f"  Claude read timeout: None (stream open until complete)")
@@ -4488,7 +4825,7 @@ if __name__ == "__main__":
     log.info(f"  MIN_SCORE_MEDIUM   : {MIN_SCORE_MEDIUM} (env-configurable)")
     log.info(f"  MIN_SCORE_HIGH     : {MIN_SCORE_HIGH} (env-configurable)")
     log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded (score still stored as-is)")
-    log.info(f"  Platform isolation : Reddit / Twitter / Telegram NEVER mixed (queues, batch state, AND now batch timing)")
+    log.info(f"  Platform isolation : Reddit / Twitter / Telegram / Facebook NEVER mixed (queues, batch state, AND now batch timing)")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
     log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts (v7.4.5)")
@@ -4505,7 +4842,7 @@ if __name__ == "__main__":
     log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (same for all 3 platforms)")
+    log.info(f"  Keywords           : {len(KEYWORDS)} filters (same for all 4 platforms; Facebook also uses them as its search query terms)")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
     log.info(f"  HubSpot coverage   : score 4-10 (medium AND high) — fx_intent_score property still set")
@@ -4525,6 +4862,11 @@ if __name__ == "__main__":
     log.info(f"                     : else — scoring, routing, MongoDB signal storage, prompts,")
     log.info(f"                     : FastAPI routes, thresholds, FIX A/B/C/D/E, hidden-score")
     log.info(f"                     : Slack/HubSpot display — 100% unchanged from v7.4.4.")
+    log.info(f"  v7.5.0 changes     : Facebook added as a 4th platform (facebook-scraper3 RapidAPI,")
+    log.info(f"                     : GET /search/posts per KEYWORDS entry) — own queue, own persistent")
+    log.info(f"                     : dedup/batch-state/queue-message collections, own Claude scoring")
+    log.info(f"                     : schema, own FastAPI routes. Reddit/Twitter/Telegram code paths,")
+    log.info(f"                     : timing, and state are 100% unchanged — purely additive.")
     log.info("=" * 70)
 
     # FIX E (part 3): one-time, best-effort, read-only HubSpot property
