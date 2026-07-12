@@ -523,10 +523,10 @@ def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
-FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", False)
+FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", True)
 
 
 def _working(flag: bool) -> str:
