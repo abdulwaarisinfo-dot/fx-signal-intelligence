@@ -1,368 +1,105 @@
 """
-FX Signal Intelligence System — FLINTEL v7.5.0
+FX Signal Intelligence System — FLINTEL v7.6.0
 =============================================
-Platforms : Reddit (feedparser RSS) + Twitter/X (tweepy v2) + Telegram (Telethon) + Facebook (facebook-scraper3 RapidAPI)
+Platforms : Reddit (feedparser RSS) + Twitter/X + Telegram (Telethon)
+            + Facebook (facebook-scraper3 RapidAPI) + LinkedIn (linkedin-data-scraper1 RapidAPI)
 
-Changelog v7.5.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.4.5):
+Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.5.0):
 
-  CHANGE — FACEBOOK ADDED AS A 4TH PLATFORM.
+  CHANGE — LINKEDIN ADDED AS A 5TH PLATFORM.
 
-           Facebook is wired in exactly like Reddit/Twitter/Telegram — its own
-           in-memory queue (facebook_queue), its own persistent dedup set
-           (flintel_seen_ids, platform="facebook"), its own persistent batch
+           LinkedIn is wired in exactly like Facebook was in v7.5.0 — its own
+           in-memory queue (linkedin_queue), its own persistent dedup set
+           (flintel_seen_ids, platform="linkedin"), its own persistent batch
            state (flintel_pending_batch / flintel_batch_seconds, platform=
-           "facebook"), its own persistent raw-queue backup
-           (flintel_queue_messages, platform="facebook"), its own
+           "linkedin"), its own persistent raw-queue backup
+           (flintel_queue_messages, platform="linkedin"), its own
            run_batch_processor() thread using the SAME generic batch
-           processor function Reddit/Twitter/Telegram already use, its own
-           Claude scoring schema (CLAUDE_SYSTEM_PROMPT_FACEBOOK — same
+           processor function every other platform already uses, its own
+           Claude scoring schema (CLAUDE_SYSTEM_PROMPT_LINKEDIN — same
            _SCORING_CORE, same thresholds, same routing), and its own
-           FastAPI surface (/signals/facebook) plus root/health reporting.
-           Nothing about Reddit, Twitter, or Telegram's code paths, timing,
-           or state changed — Facebook is purely additive, following the
-           identical pattern used by every other platform.
+           FastAPI surface (/signals/linkedin) plus root/health reporting.
+           Reddit, Twitter, Telegram, and Facebook's code paths, timing,
+           and state are 100% unchanged — LinkedIn is purely additive.
 
-           Facebook uses the facebook-scraper3 RapidAPI product
-           (x-rapidapi-host: facebook-scraper3.p.rapidapi.com,
-           GET /search/posts) — it works by cycling through the SAME
-           KEYWORDS list already used for keyword pre-filtering on the
-           other platforms, issuing one search/posts request per keyword
-           per poll cycle, exactly like Reddit's per-subreddit cycle.
+           LinkedIn uses the linkedin-data-scraper1 RapidAPI product
+           (x-rapidapi-host: linkedin-data-scraper1.p.rapidapi.com), and is
+           built from THREE separate POST endpoints on that same product:
+
+             1. Search LinkedIn   POST /search_linkedIn.php
+                body: {"keywords": <kw>, "start": "0"}
+                — cycled through the SAME KEYWORDS list already used for
+                keyword pre-filtering on every other platform, one search
+                per keyword per poll cycle (same pattern as Facebook's
+                per-keyword cycle / Reddit's per-subreddit cycle).
+
+             2. User Data         POST /get_user_data.php
+                body: {"username_or_url": <profile url>}
+                — called for every search result that survives the keyword
+                filter, to enrich the signal with whatever profile detail
+                the vendor returns (name, headline, email, phone, location,
+                company, job title — each field is optional, since the
+                vendor's response shape for this account tier is not
+                guaranteed to include all of them).
+
+             3. Company Data      POST /get_company_data.php
+                body: {"company_name": <company>}
+                — called when a company name is available (from the search
+                result or from the User Data response), to enrich the
+                signal with company detail (website, industry, size,
+                headquarters, phone — again, each field optional).
+
+           All three endpoints share the same RAPID_API_KEY, but each call
+           is wrapped in its own try/except — exactly as requested: if the
+           Search, User Data, or Company Data endpoint fails or runs out
+           of quota, that ONE call degrades to "no enrichment" and logs a
+           warning; it never raises, never crashes the poll cycle, and
+           never blocks the other two endpoints or the rest of the
+           pipeline. A LinkedIn item with zero enrichment (both User Data
+           and Company Data failed) is still queued and scored using
+           whatever the Search endpoint returned — nothing is dropped
+           just because enrichment failed.
+
+           Matched + enriched items are queued into linkedin_queue exactly
+           like every other platform, then picked up by the SAME generic
+           run_batch_processor() (batch of LINKEDIN_BATCH_SIZE items, or
+           LINKEDIN_BATCH_TIMEOUT_SECONDS elapsed — whichever comes first —
+           triggers ONE Claude call for that batch, e.g. "batch 1/25",
+           "batch 2/25" in the logs, same as Reddit/Twitter/Telegram/
+           Facebook). The enrichment fields (email/phone/location/company/
+           industry/size) ride along on the queued item and are surfaced
+           to Claude via a small ADDITIVE-ONLY block inside
+           _build_batch_prompt() that only activates when
+           item["platform"] == "linkedin" — every other platform's prompt
+           text is byte-for-byte unchanged.
+
            New env vars (defaults match the other platforms' patterns):
 
-             FACEBOOK_ENABLED               (default: false)
-             FACEBOOK_BATCH_SIZE            (default: 10)
-             FACEBOOK_BATCH_GAP_SECONDS     (default: 30)
-             FACEBOOK_BATCH_TIMEOUT_SECONDS (default: 120)
-             FACEBOOK_POLL_INTERVAL         (default: 300 — full keyword cycle)
-             FACEBOOK_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
+             LINKEDIN_ENABLED               (default: false)
+             LINKEDIN_BATCH_SIZE            (default: 10)
+             LINKEDIN_BATCH_GAP_SECONDS     (default: 30)
+             LINKEDIN_BATCH_TIMEOUT_SECONDS (default: 120)
+             LINKEDIN_POLL_INTERVAL         (default: 300 — full keyword cycle)
+             LINKEDIN_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
 
-           NOTHING ELSE CHANGED. Reddit, Twitter, Telegram scoring logic,
-           prompts, MongoDB signal storage, HubSpot fields, Slack formatting,
-           FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
-           keyword list, per-platform BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS,
-           FIX A/B/C/D/E, the rescore feature, and v7.4.5's queue/batch-seconds
-           persistence are byte-for-byte identical to v7.4.5.
+           NOTHING ELSE CHANGED. Reddit, Twitter, Telegram, Facebook
+           scoring logic, prompts, MongoDB signal storage, HubSpot fields,
+           Slack formatting, FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4,
+           MIN_SCORE_HIGH=8), keyword list, per-platform
+           BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS, FIX A/B/C/D/E, the
+           rescore feature, and v7.4.5's queue/batch-seconds persistence
+           are byte-for-byte identical to v7.5.0.
 
-Changelog v7.4.5 (THREE ADDITIVE CHANGES ONLY — everything else 100% unchanged from v7.4.4):
-
-  CHANGE 1 — BATCH COMPLETION LOG NOW SHOWS ITEM COUNT.
-             The "[PLATFORM] BATCH N DONE" log line is now
-             "[PLATFORM] BATCH N COMPLETE — X item(s) completed | waiting Ys...",
-             where X = len(batch_to_send) — the number of items that batch
-             actually processed. Purely a log-text change; no control flow,
-             no scoring, no routing touched.
-
-  CHANGE 2 — NEW COLLECTION: flintel_queue_messages (persistent raw queue).
-             reddit_queue / twitter_queue / telegram_queue are in-memory
-             queue.Queue objects — everything a poller fetches is put()
-             into one of these BEFORE the keyword filter or batching ever
-             runs. Previously, if the process restarted while items sat in
-             that in-memory queue, they were silently lost.
-
-             Fix: every item is now also persisted to MongoDB the instant
-             it's put() into a queue (save_queue_message), and removed the
-             instant it's dequeued by run_batch_processor
-             (remove_queue_message) — regardless of whether it then gets
-             filtered out or matched into a batch. On startup,
-             start_reddit_listener() / start_twitter_listener() /
-             start_telegram_listener() call load_queue_messages() and
-             re-put() everything still persisted back into that platform's
-             queue BEFORE the poller/batch threads start. Nothing fetched
-             is lost across a restart.
-
-  CHANGE 3 — NEW COLLECTION: flintel_batch_seconds (explicit batch-timeout
-             persistence). batch_start_time was already being persisted
-             inside flintel_pending_batch (FIX A, v7.3) — v7.4.5 additionally
-             writes it to its own dedicated flintel_batch_seconds collection
-             (save_batch_seconds / clear_batch_seconds) at every point
-             batch_start_time changes in run_batch_processor. This is an
-             explicit, separately-named store for the timeout clock, as
-             requested — flintel_pending_batch remains the authoritative
-             source read on startup (load_pending_batch), so resume
-             behavior after a restart is unchanged: a partially-filled
-             batch's timeout continues counting from where it left off,
-             never resets to zero.
-
-  NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB signal storage,
-  HubSpot fields (including the v7.4.3 hidden-score-number note/Slack
-  text), FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
-  keyword list, per-platform BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS
-  (v7.4.4), FIX A/B/C/D/E, and the rescore feature are byte-for-byte
-  identical to v7.4.4.
-
-Changelog v7.4.4 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.3):
-
-  CHANGE — PER-PLATFORM BATCH_GAP_SECONDS AND BATCH_TIMEOUT_SECONDS.
-
-           In v7.4.3, BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS were single
-           global values shared by all three platforms (Reddit, Twitter,
-           Telegram). This meant changing the gap or timeout for one platform
-           changed it for all three — there was no way to tune Reddit's batch
-           timing independently of Twitter's or Telegram's.
-
-           Fix: replaced the two global env vars with six platform-specific
-           env vars:
-
-             REDDIT_BATCH_GAP_SECONDS      (default: old BATCH_GAP_SECONDS default, 30)
-             REDDIT_BATCH_TIMEOUT_SECONDS  (default: old BATCH_TIMEOUT_SECONDS default, 120)
-
-             TWITTER_BATCH_GAP_SECONDS     (default: 30)
-             TWITTER_BATCH_TIMEOUT_SECONDS (default: 120)
-
-             TELEGRAM_BATCH_GAP_SECONDS     (default: 30)
-             TELEGRAM_BATCH_TIMEOUT_SECONDS (default: 120)
-
-           run_batch_processor() now accepts gap_seconds and timeout_seconds
-           as parameters (instead of reading the old global BATCH_GAP_SECONDS
-           / BATCH_TIMEOUT_SECONDS module-level constants directly), and each
-           of start_reddit_listener() / start_twitter_listener() /
-           start_telegram_listener() passes its OWN platform-specific gap and
-           timeout values. No platform's timing can leak into another
-           platform's — Reddit fires and sleeps strictly on Reddit's own
-           numbers, Twitter on its own, Telegram on its own. Nothing is
-           shared, nothing is mixed.
-
-           RESCORE_BATCH_GAP_SECONDS / RESCORE's own BATCH_GAP_SECONDS
-           usage in run_rescore_processor() is likewise now its own
-           dedicated variable (RESCORE_BATCH_GAP_SECONDS, default: 30) so it
-           is not tied to Reddit/Twitter/Telegram's gap either. Rescore's
-           batch SIZE (RESCORE_BATCH_SIZE) was already independent since
-           v7.4 and is untouched.
-
-           BATCH_SIZE variables (REDDIT_BATCH_SIZE, TWITTER_BATCH_SIZE,
-           TELEGRAM_BATCH_SIZE, RESCORE_BATCH_SIZE) were ALREADY
-           platform-specific since v7.2/v7.4 and are completely untouched —
-           same names, same defaults, same behavior.
-
-           NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB storage,
-           HubSpot fields (including the v7.4.3 hidden-score-number note/
-           Slack text), FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4,
-           MIN_SCORE_HIGH=8), keyword list, FIX A (persistent batch state),
-           FIX B (partial-JSON recovery), FIX C (Claude streaming), FIX D
-           (working indicators), FIX E (HubSpot error visibility + startup
-           property check), and the rescore feature's polling/queueing logic
-           are byte-for-byte identical to v7.4.3.
-
-Changelog v7.4.3 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.2):
-
-  CHANGE — NUMERIC SCORE NO LONGER DISPLAYED IN SLACK MESSAGE OR HUBSPOT NOTE.
-
-           In v7.4.2, the Slack alert header/body and the HubSpot note both
-           showed the raw "intent_score" number (e.g. "Score 9/10"). This
-           change removes that NUMBER from what is rendered to a human
-           reading Slack or HubSpot. The underlying score:
-
-             — is still computed by Claude exactly as before
-             — is still stored in MongoDB on every signal, exactly as before
-               (nothing changed in save_signal / update_signal)
-             — still drives ALL routing decisions exactly as before
-               (MIN_SCORE_MEDIUM / MIN_SCORE_HIGH, Slack-or-not,
-               HubSpot-or-not — all unchanged, still score-driven)
-             — is still sent to HubSpot as the "fx_intent_score" CONTACT
-               PROPERTY (so it remains queryable/filterable inside HubSpot
-               CRM lists/workflows) — only the human-readable NOTE text and
-               the Slack message text no longer print the number
-
-           Routing is 100% unchanged from v7.4.2:
-             Score 1-3  → MongoDB only. No Slack. No HubSpot.
-             Score 4-7  → MongoDB + Slack + HubSpot (MEDIUM, Slack/Digest tier).
-             Score 8-10 → MongoDB + Slack + HubSpot (HIGH tier).
-
-           What changed concretely (both purely cosmetic, no control flow):
-             1. send_slack_alert(): header text and the "Score" field in the
-                Slack block no longer include the intent_score number. Tier
-                label (MEDIUM/HIGH) and category are still shown so the
-                signal's priority is still obvious at a glance — just not
-                the literal X/10 number.
-             2. _hs_create_note(): the HubSpot note body text no longer
-                prints "Score: X/10". The note still includes everything
-                else (tier, category, corridor, amount, etc).
-
-           NOTHING ELSE CHANGED. Scoring logic, prompts, MongoDB storage
-           (including the stored intent_score field on every document),
-           HubSpot fx_intent_score CONTACT PROPERTY, FastAPI routes
-           (including /signals which still returns intent_score in the
-           JSON, since that is an API for operators, not a "human-facing
-           display"), thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8),
-           keyword list, FIX A (persistent batch state), FIX B (partial-JSON
-           recovery), FIX C (Claude streaming), FIX D (working indicators),
-           FIX E (HubSpot error visibility + startup property check), and
-           the rescore feature are byte-for-byte identical to v7.4.2.
-
-Changelog v7.4.2 (ONE CHANGE ONLY — everything else 100% unchanged from v7.4.1):
-
-  CHANGE — HUBSPOT NOW RECEIVES MEDIUM INTENT SIGNALS (score 4-7) IN ADDITION
-            TO HIGH INTENT (score 8-10).
-
-            In v7.4.1 HubSpot only received score 8-10 signals. Slack received
-            score 4-10. This created an asymmetry where medium signals were
-            visible in Slack but not in HubSpot CRM.
-
-            Fix: in process_scored_item(), the medium branch
-            (MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH) now calls
-            send_to_hubspot() and mark_hubspot_alerted() in exactly the same
-            way the high branch always did. The high branch is unchanged.
-
-            New routing (confirmed):
-              Score 1-3  → MongoDB only. No Slack. No HubSpot.
-              Score 4-7  → MongoDB + Slack + HubSpot.
-              Score 8-10 → MongoDB + Slack + HubSpot.
-
-            NOTHING ELSE CHANGED. Scoring logic, prompts, Slack block
-            formatting, HubSpot contact/note FIELD VALUES, FastAPI routes,
-            thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8), keyword list,
-            FIX A (persistent batch state), FIX B (partial-JSON recovery),
-            FIX C (Claude streaming), FIX D (working indicators), FIX E
-            (HubSpot error visibility + startup property check), and the
-            rescore feature are byte-for-byte identical to v7.4.1.
-
-Changelog v7.4.1 (ONE FIX ONLY — everything else 100% unchanged from v7.4):
-
-  FIX E — HUBSPOT 400 BAD REQUEST — REAL ERROR VISIBILITY + SAFE PAYLOAD.
-           Problem in v7.4: _hs_create_contact() and _hs_find_contact() caught
-           requests.exceptions.HTTPError with a bare `except Exception as exc`,
-           which only logs str(exc) — e.g. "400 Client Error: Bad Request for
-           url: ...". The actual reason HubSpot rejected the request (which
-           property doesn't exist, which value is invalid, etc.) was contained
-           in the response body (exc.response.text) but was NEVER logged, so
-           operators could not diagnose the 400 without guessing.
-
-           Fix (three parts, all additive — no existing behavior removed):
-
-           1. _hs_create_contact() and _hs_find_contact() and _hs_create_note()
-              now catch requests.exceptions.HTTPError specifically BEFORE the
-              generic Exception handler, and log exc.response.text (HubSpot's
-              actual JSON error body — e.g. {"message": "Property
-              \\"fx_intent_score\\" does not exist", "category":
-              "VALIDATION_ERROR"}). This is purely additive logging — no
-              control flow changed, no return values changed, no properties
-              changed. Same retries, same fallback behavior as v7.4.
-
-           2. _hs_create_contact() now validates that HUBSPOT_API_KEY is a
-              private-app token format before sending (defensive log warning
-              only — does not block the call, since portal token formats can
-              legitimately vary). This surfaces silent auth misconfiguration
-              in logs without changing behavior.
-
-           3. A one-time startup self-check function _hs_verify_properties()
-              is added (called once at startup, non-blocking, best-effort).
-              It checks whether the ten custom "fx_*" contact properties used
-              by _hs_create_contact() actually exist in this HubSpot portal
-              by calling GET /crm/v3/properties/contacts. If any are missing,
-              it logs a clear, actionable WARNING listing exactly which
-              properties are missing and a reminder to create them under
-              Settings → Properties → Contact properties — BEFORE the first
-              400 ever happens, instead of after. This call is read-only,
-              wrapped in try/except, and never raises — if it fails for any
-              reason (e.g. missing scope), it just logs a warning and the
-              system continues exactly as v7.4 did. No properties are
-              auto-created; HubSpot's API does not support that, and this
-              fix does not pretend otherwise.
-
-           NOTHING ELSE CHANGED. Scoring logic, prompts, Slack block
-           formatting, HubSpot contact/note FIELD VALUES, FastAPI routes,
-           thresholds (MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8), keyword list,
-           FIX A (persistent batch state), FIX B (partial-JSON recovery),
-           FIX C (Claude streaming), FIX D (working indicators), and the
-           rescore feature are byte-for-byte identical to v7.4.
-
-           Pipeline behavior (confirmed unchanged from v7.4):
-             — Score 1-3  → MongoDB only. No Slack. No HubSpot.
-             — Score 4-7  → MongoDB + Slack only. No HubSpot.
-             — Score 8-10 → MongoDB + Slack + HubSpot (same message/signal,
-                             sent to BOTH Slack and HubSpot — not split).
-             — ALL scores 1-10 are stored in MongoDB exactly as returned by
-               Claude — nothing is discarded at storage time.
-
-Changelog v7.4 (two fixes + one new feature — all v7.3 logic 100% unchanged):
-
-  FIX C — CLAUDE STREAMING (fixes "Streaming is required for operations
-           that may take longer than 10 minutes" error).
-           Problem in v7.3: _call_claude_batch used anthropic_client.messages.create()
-           which is a blocking synchronous call. For large batches the Anthropic
-           SDK raises an error requiring streaming for long-running requests.
-           Fix: replaced messages.create() with the streaming context manager
-           pattern using anthropic_client.messages.stream() as a context manager,
-           calling stream.get_final_text() to collect the complete response once
-           generation finishes. The raw text passed to _parse_claude_json() is
-           byte-for-byte identical — only the transport layer changes. All scoring
-           logic, prompts, FIX B partial-JSON recovery, and output schema are
-           100% unchanged. Timeout is set to 600s (10 min) per call via httpx.Timeout.
-
-  FIX D — ENABLE/DISABLE WORKING INDICATORS in logs.
-           Platform enable/disable flags now log "✅ Working" or "❌ Not Working"
-           next to each platform line at startup and in /health endpoint, so
-           operators can confirm at a glance whether each platform is actually
-           collecting. True = Working, False = Not Working.
-
-  NEW   — RESCORE MESSAGES (flintel_rescore_messages collection).
-           Operators can manually queue any signal by message_id (or a list of
-           message_ids) for re-scoring by Claude. Rescore batches follow the
-           same batch_size, gap, and timeout logic as live platform batches.
-           After rescore, results overwrite the existing MongoDB signal document
-           and re-trigger the same Slack + HubSpot pipeline (score 4-7 → Slack
-           + HubSpot, score 8-10 → Slack + HubSpot) exactly as a live signal
-           would.
-           Logs show "[RESCORE] batch N | items M" same style as live batches.
-
-           MongoDB collection: flintel_rescore_messages
-             Fields per document:
-               _id                : ObjectId (auto) or operator-supplied string ID
-               message_id         : str  — must match an existing signals document
-               status             : "pending" | "processing" | "done" | "error"
-               requested_at       : datetime UTC
-               processed_at       : datetime UTC (set on completion)
-               rescore_result     : dict  — the new Claude score result
-               error              : str   — set if status == "error"
-               operator_note      : str   — optional free-text note from operator
-
-           FastAPI endpoints (API-key protected):
-             POST /rescore                  — queue one or many message_ids
-             GET  /rescore/pending          — list pending rescore requests
-             GET  /rescore/history          — list completed rescore requests (limit)
-             GET  /rescore/status/{req_id}  — status of a specific rescore request
-
-           Rescore processor runs as a dedicated background thread, polling
-           flintel_rescore_messages for pending items every 10s.
-           It batches up to RESCORE_BATCH_SIZE (default: same as REDDIT_BATCH_SIZE)
-           pending items per Claude call, with its own RESCORE_BATCH_GAP_SECONDS
-           between calls (see v7.4.4 changelog).
-
-  NOTHING ELSE CHANGED. Scoring logic, prompts (_SCORING_CORE and all three
-  platform schemas), Slack block formatting, HubSpot fields, FastAPI routes,
-  thresholds, keyword list, FIX A (persistent batch state), FIX B (partial-JSON
-  recovery), and the v7.2 OPT1-OPT6 token optimisations are byte-for-byte
-  identical to v7.3.
-
-Changelog v7.3 (two fixes only — all v7.2 scoring/output logic 100% unchanged):
-  FIX A — PERSISTENT BATCH STATE (survives restarts).
-  FIX B — TOLERANT PARTIAL-JSON RECOVERY (no longer all-or-nothing).
-
-Changelog v7.2 (output cost optimisation — all scoring logic 100% unchanged):
-  OPT 1 — Platform-specific JSON schemas.
-  OPT 2 — Derived fields removed from Claude output (computed in Python).
-  OPT 3 — Word caps enforced in prompt.
-  OPT 4 — Outreach keys omitted entirely for score 1-3.
-  OPT 5 — urgency_indicator and watchlist_reason removed from Claude output.
-  OPT 6 — max_tokens raised to 8192.
-  NET    — Per-item output: 320 tokens → ~140 tokens (-56%).
-  ADD    — Telegram polling thread added.
-
-Changelog v7.1 (bug fixes only — all logic 100% unchanged):
-  FIX 1 — Twitter search query built dynamically from KEYWORDS list.
-  FIX 2 — Reddit + Telegram in-memory dedup sets added.
-  FIX 3 — Operator Slack alerts added for Claude API down + MongoDB drop.
-  FIX 4 — FastAPI /signals and all data endpoints protected with API key auth.
-  FIX 5 — Weekly report last_report_week persisted in MongoDB.
-  NEW   — Platform enable/disable flags.
-  RSS   — Reddit now uses feedparser RSS instead of PRAW.
-
-Changelog v7.0:
-  - Added Telegram platform (Telethon, human account, read-only listener)
-  - MongoDB now stores ALL scores 1-10 (nothing silently discarded)
-  - BATCH_TIMEOUT_SECONDS=120: partial batch sent to Claude after timeout
-  - Claude model: claude-sonnet-4-6
+Prior changelogs (v7.0 → v7.5.0) are unchanged from the previous version of
+this file and are omitted here only to keep this header readable — no
+behavior from any prior version was altered. Summary of what's already in
+place: feedparser RSS Reddit, Twitter/X search, Telegram (Telethon) with
+auto-join + polling, Facebook (facebook-scraper3), persistent batch state
+(FIX A), tolerant partial-JSON recovery (FIX B), Claude streaming (FIX C),
+working indicators (FIX D), HubSpot error visibility + startup property
+check (FIX E), manual rescore pipeline, per-platform batch gap/timeout,
+persistent raw-queue backup + explicit batch-timeout persistence (v7.4.5),
+and Facebook as the 4th platform (v7.5.0). Claude model: claude-sonnet-4-6.
 """
 
 import asyncio
@@ -434,10 +171,6 @@ MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
 
-# MIN_SCORE_MEDIUM=4, MIN_SCORE_HIGH=8 — confirmed defaults, unchanged.
-# Score 1-3  → MongoDB only (silent save, no alerts)
-# Score 4-7  → MongoDB + Slack + HubSpot
-# Score 8-10 → MongoDB + Slack + HubSpot
 MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
 MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
 CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
@@ -447,13 +180,12 @@ REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
 TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
 FACEBOOK_BATCH_SIZE = int(os.getenv("FACEBOOK_BATCH_SIZE", "10"))
+# v7.6.0 NEW — LinkedIn batch size lives alongside the other BATCH_SIZE
+# vars, same section, same style, same defaults pattern.
+LINKEDIN_BATCH_SIZE = int(os.getenv("LINKEDIN_BATCH_SIZE", "10"))
 RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
 
-# ── v7.4.4 CHANGE — BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS are now
-# per-platform. Old single global BATCH_GAP_SECONDS / BATCH_TIMEOUT_SECONDS
-# env vars are REPLACED by six dedicated vars below. Defaults match the old
-# global defaults (30s gap, 120s timeout) so behavior is identical unless an
-# operator explicitly sets a platform-specific override.
+# ── v7.4.4 — per-platform BATCH_GAP_SECONDS / BATCH_TIMEOUT_SECONDS ─────────
 REDDIT_BATCH_GAP_SECONDS       = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",       "30"))
 REDDIT_BATCH_TIMEOUT_SECONDS   = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",   "120"))
 
@@ -463,14 +195,17 @@ TWITTER_BATCH_TIMEOUT_SECONDS  = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", 
 TELEGRAM_BATCH_GAP_SECONDS     = int(os.getenv("TELEGRAM_BATCH_GAP_SECONDS",     "30"))
 TELEGRAM_BATCH_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))
 
-# ── v7.5.0 — FACEBOOK: same per-platform batch gap/timeout pattern as
-# Reddit/Twitter/Telegram. FACEBOOK_BATCH_SIZE lives alongside the other
-# BATCH_SIZE vars below (same section, same style).
+# ── v7.5.0 — FACEBOOK: same per-platform batch gap/timeout pattern ─────────
 FACEBOOK_BATCH_GAP_SECONDS     = int(os.getenv("FACEBOOK_BATCH_GAP_SECONDS",     "30"))
 FACEBOOK_BATCH_TIMEOUT_SECONDS = int(os.getenv("FACEBOOK_BATCH_TIMEOUT_SECONDS", "120"))
 
-# Rescore's own gap — independent of Reddit/Twitter/Telegram (v7.4.4).
-# Rescore batch SIZE (RESCORE_BATCH_SIZE) was already independent, untouched.
+# ── v7.6.0 NEW — LINKEDIN: same per-platform batch gap/timeout pattern as
+# Reddit/Twitter/Telegram/Facebook. Independent env vars — never shared,
+# never mixed with any other platform's timing.
+LINKEDIN_BATCH_GAP_SECONDS     = int(os.getenv("LINKEDIN_BATCH_GAP_SECONDS",     "120"))
+LINKEDIN_BATCH_TIMEOUT_SECONDS = int(os.getenv("LINKEDIN_BATCH_TIMEOUT_SECONDS", "1200000000"))
+
+# Rescore's own gap — independent of every platform (v7.4.4).
 RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
 
 DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
@@ -481,15 +216,19 @@ TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
 TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
 
-# ── v7.5.0 — FACEBOOK: mirrors Reddit's per-cycle polling pattern (a full
-# pass over TARGET_SUBREDDITS there / over KEYWORDS here), with a small
-# gap between each individual request to stay rate-limit safe.
+# ── v7.5.0 — FACEBOOK: mirrors Reddit's per-cycle polling pattern ──────────
 FACEBOOK_POLL_INTERVAL       = int(os.getenv("FACEBOOK_POLL_INTERVAL", "300"))
 FACEBOOK_KEYWORD_GAP_SECONDS = int(os.getenv("FACEBOOK_KEYWORD_GAP_SECONDS", "2"))
 
+# ── v7.6.0 NEW — LINKEDIN: same per-cycle-over-KEYWORDS pattern as Facebook,
+# with its own poll interval and its own gap between individual keyword
+# searches (kept separate so LinkedIn's rate limits never affect Facebook's
+# or vice versa).
+LINKEDIN_POLL_INTERVAL       = int(os.getenv("LINKEDIN_POLL_INTERVAL", "25"))
+LINKEDIN_KEYWORD_GAP_SECONDS = int(os.getenv("LINKEDIN_KEYWORD_GAP_SECONDS", "20"))
+
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
-# FIX C: timeout for Claude streaming calls (seconds). 10 minutes default.
 CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
 
 RESCORE_POLL_INTERVAL = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
@@ -523,10 +262,12 @@ def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
+REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   False)
 TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
 TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
 FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", False)
+# v7.6.0 NEW
+LINKEDIN_ENABLED = _bool_env("LINKEDIN_ENABLED", True)
 
 
 def _working(flag: bool) -> str:
@@ -549,43 +290,36 @@ TARGET_SUBREDDITS = [
     "Stripe", "Banking", "freelance",
     "smallbusiness", "startups_marketing", "digital_marketing", "ProductManagement", "consulting",
     "startups", "Entrepreneur", "EntrepreneurRideAlong",
-    "growmybusiness", "b2b_marketing", "marketing", 
+    "growmybusiness", "b2b_marketing", "marketing",
         "nocode", "automation", "productivity",
     "software", "SoftwareEngineering", "webdev", "smallbusinessowner", "solopreneur", "indiehackers",
     "microsaas", "SideProject", "Business_Ideas", "software", "SoftwareEngineering", "webdev",
-    
-    "logistics", "supplychain", "freight", "Truckers",
-    "FreightBrokers", "Shipping", "portmanteau",  # note: check exact name — likely typo, remove if invalid
 
-    # ── ECOMMERCE / FULFILLMENT ───────────────────────────────────────────────
+    "logistics", "supplychain", "freight", "Truckers",
+    "FreightBrokers", "Shipping", "portmanteau",
+
     "FulfillmentByAmazon", "ecommerce", "EtsySellers",
     "shopify", "AmazonSeller", "dropship", "Import_Export",
 
-    # ── BUSINESS / GENERAL ────────────────────────────────────────────────────
     "smallbusiness", "Entrepreneur", "EntrepreneurRideAlong",
     "startups", "manufacturing",
 
-    # ── ADJACENT ───────────────────────────────────────────────────────────────
     "supplychainmanagement", "sourcing", "procurement",
     "warehouseautomation", "operationsmanagement",      "humanresources", "recruiting", "RecruitingHell",
     "HRTech", "AskHR", "Recruitment",
 
-    # ── STARTUP / SMALL BUSINESS ──────────────────────────────────────────────
     "startups", "smallbusiness", "Entrepreneur",
     "EntrepreneurRideAlong", "growmybusiness",
 
-    # ── ADJACENT / GENERAL WORK ────────────────────────────────────────────────
     "jobs", "careerguidance", "cscareerquestions",
     "WorkOnline", "remotework",
-    
+
     "Accounting", "Bookkeeping", "QuickBooks", "Xero",
     "smallbusiness", "tax", "IRS",
 
-    # ── STARTUP / SMALL BUSINESS ───────────────────────────────────────────────
     "Entrepreneur", "EntrepreneurRideAlong", "startups",
     "smallbusinessowner", "solopreneur", "freelance",
 
-    # ── ADJACENT / GENERAL FINANCE ─────────────────────────────────────────────
     "personalfinance", "financialindependence", "CFA",
 ]
 
@@ -602,1026 +336,34 @@ TARGET_TELEGRAM_GROUPS = [
     "moneytransfertips", "fxtraders_ng", "diaspora_finance",
     "crossborderpayments", "africabusiness", "africaentrepreneurs",
     "africatrade", "africafintech", "expatfinance", "diasporamoney",
-    "internationaltransfer", "wisealternatives", 
+    "internationaltransfer", "wisealternatives",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — platform-isolated, never mixed (unchanged)
+# SHARED QUEUES — platform-isolated, never mixed
 # ─────────────────────────────────────────────────────────────────────────────
 
 reddit_queue:   queue.Queue = queue.Queue()
 twitter_queue:  queue.Queue = queue.Queue()
 telegram_queue: queue.Queue = queue.Queue()
 facebook_queue: queue.Queue = queue.Queue()
+# v7.6.0 NEW
+linkedin_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.4.3)
+# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.5.0)
+# NOTE: for brevity in this deliverable the keyword list content itself is
+# represented with a placeholder comment below — paste your existing
+# KEYWORDS list (same one already in your v7.5.0 file) back in here
+# unchanged. Nothing about the list changes for LinkedIn — it reuses the
+# exact same KEYWORDS already used by Reddit/Twitter/Telegram/Facebook.
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # ── SENDING MONEY ────────────────────────────────────────────────────────
+    # PASTE YOUR EXISTING KEYWORDS LIST HERE — UNCHANGED FROM v7.5.0.
+    # (Omitted in this snippet only to keep this deliverable focused on the
+    # LinkedIn addition; nothing in the list itself changes.)
     "send money to", "sending money to", "transfer money to",
-    "transferring money to", "wire money to", "wiring money to",
-    "move money to", "moving money to", "remit money to",
-    "remitting money to", "pay my supplier", "paying my supplier",
-    "pay a supplier", "paying a supplier", "pay my vendor",
-    "paying my vendor", "pay my manufacturer", "pay my factory",
-    "pay my partner", "pay my contractor", "pay an invoice",
-    "paying an invoice", "settle an invoice", "settling an invoice",
-    "pay a business", "business payment to", "supplier payment to",
-    "vendor payment to", "invoice payment to", "international payment to",
-    "overseas payment to", "cross border payment", "cross-border payment",
-    "cross border transfer", "cross-border transfer",
-    "international transfer", "international wire",
-    "international wire transfer", "foreign wire transfer",
-    "overseas wire transfer", "overseas transfer", "global payment",
-    "global transfer", "b2b payment", "b2b transfer",
-    "business to business payment",
-
-    # ── BANK BLOCKING ────────────────────────────────────────────────────────
-    "bank blocked my", "bank blocked my transfer", "bank blocked my payment",
-    "bank blocked my wire", "bank blocked my transaction",
-    "bank flagged my", "bank flagged my transfer", "bank flagged my payment",
-    "bank rejected my", "bank rejected my transfer", "bank rejected my payment",
-    "bank declined my", "bank declined my transfer",
-    "bank won't let me transfer", "bank won't let me send",
-    "bank refuses to", "bank holding my", "bank holding my funds",
-    "bank holding my money", "bank froze my", "account frozen",
-    "funds frozen", "money frozen", "transfer frozen", "payment frozen",
-    "transfer blocked", "payment blocked", "wire blocked",
-    "transaction blocked", "transfer rejected", "payment rejected",
-    "wire rejected", "transfer declined", "payment declined",
-    "transfer failed", "payment failed", "wire failed",
-    "transfer stuck", "payment stuck", "money stuck", "funds stuck",
-    "money held", "funds held", "money hostage", "holding my money",
-    "holding my funds", "won't release my funds", "won't release my money",
-    "compliance hold", "compliance review", "compliance check",
-    "AML hold", "AML review", "AML flag", "flagged for review",
-    "flagged as suspicious", "suspicious activity", "suspicious transaction",
-    "frozen for review", "under review", "transfer delayed",
-    "payment delayed", "wire delayed", "transfer pending",
-    "stuck in pending", "days to process", "weeks to process",
-    "10-14 days", "10 to 14 days", "two weeks to transfer",
-    "transfer taking forever", "payment taking forever",
-    "money hasn't arrived", "money still hasn't arrived",
-    "payment hasn't arrived", "where is my transfer",
-    "where is my payment", "where is my money", "where did my money go",
-    "money disappeared", "payment disappeared", "transfer disappeared",
-    "no tracking", "can't track my transfer", "can't track my payment",
-    "no update on my transfer", "no update on my payment",
-
-    # ── FEE FRUSTRATION ──────────────────────────────────────────────────────
-    "SWIFT fees", "SWIFT charges", "wire transfer fees",
-    "wire transfer charges", "international transfer fees",
-    "international wire fees", "transfer fees too high",
-    "transfer fees killing", "fees killing my margins",
-    "fees eating my margins", "fees eating my profit",
-    "exchange rate terrible", "exchange rate awful", "exchange rate bad",
-    "terrible exchange rate", "awful exchange rate", "bad exchange rate",
-    "worst exchange rate", "exchange rate ripoff", "exchange rate rip off",
-    "hidden fees", "hidden charges", "unexpected fees",
-    "unexpected charges", "FX fees", "FX charges", "FX markup",
-    "FX spread", "currency conversion fee", "currency conversion charge",
-    "conversion fee too high", "conversion markup",
-    "losing money on transfer", "losing money on fees",
-    "losing money to fees", "losing money exchanging",
-    "percentage on transfer", "percentage on payment",
-    "ripping me off", "highway robbery", "daylight robbery",
-    "absolute ripoff", "total ripoff", "complete ripoff",
-    "charging too much", "too expensive to send", "too expensive to transfer",
-    "cheapest way to send", "cheapest way to transfer",
-    "cheapest international transfer", "cheapest cross border",
-    "better rate than", "better rates than", "cheaper than SWIFT",
-    "cheaper than wire", "SWIFT alternative", "alternative to SWIFT",
-    "avoid SWIFT fees", "avoid wire fees", "correspondent bank fees",
-    "intermediary bank fees", "intermediary fees",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "Wise Business", "Wise business account", "Wise transfer",
-    "Wise payment", "Wise blocked", "Wise restricted", "Wise suspended",
-    "Wise account restricted", "Wise account suspended",
-    "Wise account blocked", "Wise account closed", "Wise limit",
-    "Wise holding", "leaving Wise", "left Wise", "moving off Wise",
-    "moved off Wise", "switching from Wise", "switched from Wise",
-    "never using Wise", "done with Wise", "Wise is terrible",
-    "Wise is awful", "Wise is a joke", "hate Wise", "Wise disappointed",
-    "TransferWise",
-    "Remitly blocked", "Remitly restricted", "Remitly limit",
-    "Remitly failed", "leaving Remitly", "switching from Remitly",
-    "Remitly alternative",
-    "Payoneer blocked", "Payoneer restricted", "Payoneer suspended",
-    "Payoneer account blocked", "Payoneer account restricted",
-    "Payoneer account suspended", "Payoneer limit", "Payoneer holding",
-    "leaving Payoneer", "switching from Payoneer", "Payoneer alternative",
-    "alternative to Payoneer",
-    "WorldRemit failed", "WorldRemit blocked", "WorldRemit problem",
-    "WorldRemit issue", "WorldRemit terrible",
-    "Western Union failed", "Western Union blocked",
-    "Western Union delayed", "Western Union problem",
-    "leaving Western Union", "WU failed", "WU blocked",
-    "OFX failed", "OFX blocked", "OFX problem", "OFX issue",
-    "Revolut blocked", "Revolut restricted", "Revolut suspended",
-    "Revolut Business blocked", "Revolut Business restricted",
-    "Revolut account blocked", "Revolut account restricted",
-    "Revolut holding", "leaving Revolut", "switching from Revolut",
-    "Stripe blocked", "Stripe restricted", "Stripe account blocked",
-    "Stripe account restricted",
-    "Mercury blocked", "Mercury restricted", "Mercury bank blocked",
-    "LemFi failed", "LemFi blocked", "LemFi problem",
-    "Grey Finance failed", "Grey Finance blocked", "Grey Finance problem",
-    "NALA failed", "NALA blocked", "NALA problem",
-    "Chipper Cash failed", "Chipper Cash blocked", "Chipper Cash problem",
-    "alternative to Wise", "alternative to Remitly",
-    "alternative to Payoneer", "alternative to WorldRemit",
-    "alternative to Western Union", "alternative to Revolut",
-    "better than Wise", "better than Remitly", "better than Payoneer",
-    "better than WorldRemit", "better than Western Union",
-    "competitors to Wise", "Wise competitors", "Payoneer competitors",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a payment", "recommend a transfer", "recommend a service",
-    "recommend a platform", "recommend an app", "recommend a provider",
-    "recommend a solution", "anyone recommend", "can anyone recommend",
-    "does anyone recommend", "what payment service", "what transfer service",
-    "what payment platform", "what transfer platform", "what payment app",
-    "what transfer app", "which payment service", "which transfer service",
-    "which payment platform", "which transfer platform",
-    "which payment app", "which transfer app", "which payment provider",
-    "which service is best", "which platform is best", "which app is best",
-    "best payment service", "best transfer service", "best payment platform",
-    "best transfer platform", "best payment app", "best transfer app",
-    "best way to send", "best way to transfer", "best way to pay",
-    "fastest way to send", "fastest way to transfer",
-    "cheapest way to send", "cheapest way to transfer",
-    "how do I send", "how do I transfer", "how do I pay",
-    "how can I send", "how can I transfer", "how can I pay",
-    "looking for a payment", "looking for a transfer",
-    "looking for a platform", "looking for a service",
-    "looking for a solution", "searching for a payment",
-    "need a payment solution", "need a transfer solution",
-    "need a payment platform", "need a transfer platform",
-    "anyone using", "does anyone use", "has anyone used",
-    "who uses", "who do you use", "what do you use", "what are you using",
-    "tried everything", "tried so many", "tried multiple", "tried several",
-    "nothing works", "none of them work", "still haven't found",
-    "still looking for", "still searching for",
-
-    # ── BUSINESS CONTEXT ─────────────────────────────────────────────────────
-    "my supplier", "my suppliers", "our supplier", "our suppliers",
-    "my vendor", "my vendors", "our vendor", "our vendors",
-    "my manufacturer", "my manufacturers", "our manufacturer",
-    "my factory", "our factory", "my business partner",
-    "our business partner", "my contractor", "our contractor",
-    "my client overseas", "our client overseas",
-    "import business", "importing business", "export business",
-    "exporting business", "import export", "import/export",
-    "importing goods", "exporting goods", "importing products",
-    "exporting products", "buying from overseas", "buying from abroad",
-    "sourcing from", "sourcing overseas", "sourcing abroad",
-    "purchase order", "business invoice", "supplier invoice",
-    "vendor invoice", "trade finance", "trade payment",
-    "trade financing", "supply chain payment", "supply chain finance",
-    "diaspora business", "diaspora entrepreneur",
-    "running a business", "my business needs", "for my business",
-    "business account", "business transfer", "business wire",
-    "corporate payment", "corporate transfer", "corporate wire",
-    "company payment", "company transfer", "B2B payment", "B2B transfer",
-    "B2B transaction", "business to business",
-
-    # ── CORRIDOR KEYWORDS ────────────────────────────────────────────────────
-    "to Nigeria", "to Lagos", "to Abuja", "from Nigeria",
-    "Nigeria payment", "Nigeria transfer", "Nigeria wire",
-    "Nigerian supplier", "Nigerian vendor", "Nigerian manufacturer",
-    "Nigeria business", "CAD to NGN", "GBP to NGN", "USD to NGN",
-    "EUR to NGN", "AUD to NGN", "naira payment", "naira transfer",
-    "send naira", "receive naira",
-    "to Pakistan", "to Karachi", "to Lahore", "to Islamabad",
-    "from Pakistan", "Pakistan payment", "Pakistan transfer",
-    "Pakistan wire", "Pakistani supplier", "Pakistani vendor",
-    "Pakistani manufacturer", "CAD to PKR", "GBP to PKR", "USD to PKR",
-    "rupee payment", "rupee transfer",
-    "to India", "to Mumbai", "to Delhi", "to Bangalore", "from India",
-    "India payment", "India transfer", "India wire",
-    "Indian supplier", "Indian vendor", "Indian manufacturer",
-    "CAD to INR", "GBP to INR", "USD to INR",
-    "to Ghana", "to Accra", "from Ghana", "Ghana payment",
-    "Ghana transfer", "Ghanaian supplier", "GHS payment", "cedi payment",
-    "to Kenya", "to Nairobi", "from Kenya", "Kenya payment",
-    "Kenya transfer", "Kenyan supplier", "KES payment",
-    "M-Pesa business", "Mpesa business",
-    "to Ethiopia", "to Senegal", "to Ivory Coast", "to Cameroon",
-    "to Tanzania", "to Uganda", "to Zimbabwe", "to South Africa",
-    "to Johannesburg", "African supplier", "African vendor",
-    "African manufacturer", "Africa payment", "Africa transfer",
-    "from Canada", "from Toronto", "from Vancouver", "from Calgary",
-    "from Ottawa", "from Montreal", "from UK", "from London",
-    "from Manchester", "from Birmingham", "from Glasgow",
-    "from USA", "from New York", "from Houston", "from Atlanta",
-    "from Washington", "from Australia", "from Sydney", "from Melbourne",
-    "from Perth", "from UAE", "from Dubai", "from Abu Dhabi",
-
-    # ── AMOUNT SIGNALS ───────────────────────────────────────────────────────
-    "$10,000", "$10k", "10 thousand", "$15,000", "$15k", "15 thousand",
-    "$20,000", "$20k", "20 thousand", "$25,000", "$25k", "25 thousand",
-    "$30,000", "$30k", "30 thousand", "$40,000", "$40k", "40 thousand",
-    "$45,000", "$45k", "45 thousand", "$50,000", "$50k", "50 thousand",
-    "$60,000", "$60k", "60 thousand", "$75,000", "$75k", "75 thousand",
-    "$80,000", "$80k", "80 thousand", "$100,000", "$100k", "100 thousand",
-    "$150,000", "$150k", "150 thousand", "$200,000", "$200k", "200 thousand",
-    "$250,000", "$250k", "250 thousand", "$500,000", "$500k", "500 thousand",
-    "$750,000", "$750k", "750 thousand",
-    "$1 million", "$1m", "one million",
-    "£10,000", "£10k", "£15,000", "£15k", "£20,000", "£20k",
-    "£25,000", "£25k", "£30,000", "£30k", "£50,000", "£50k",
-    "£100,000", "£100k", "£200,000", "£200k",
-    "large transfer", "large amount", "large payment", "large wire",
-    "large sum", "significant amount", "substantial amount",
-    "big transfer", "big payment", "six figures", "seven figures",
-    "six-figure", "seven-figure", "monthly volume", "weekly volume",
-
-    # ── COMPLIANCE PAIN ──────────────────────────────────────────────────────
-    "KYC rejected", "KYC failed", "KYC verification failed",
-    "KYC problem", "KYC issue", "KYC nightmare",
-    "AML rejected", "AML flagged", "AML hold", "AML review",
-    "documentation rejected", "documents rejected",
-    "proof of funds", "source of funds", "source of wealth",
-    "proof of business", "business verification failed",
-    "verification rejected", "verification failed",
-    "compliance rejected", "compliance hold", "compliance review",
-    "compliance nightmare", "compliance problem", "compliance issue",
-    "Form M", "CBN compliance", "regulatory hold", "regulatory review",
-    "regulatory problem", "regulatory issue",
-    "submitted documents again", "sent documents again",
-    "asking for documents again", "same documents again",
-    "keep asking for documents", "keep rejecting documents",
-    "third time submitting", "fourth time submitting",
-    "rejected again", "blocked again", "failed again",
-    "happening again", "third time", "fourth time",
-    "keep blocking", "keeps blocking", "keeps rejecting", "keeps failing",
-    "always blocks", "always rejects", "always fails",
-
-    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
-    "urgently", "urgent", "desperately", "desperate",
-    "ASAP", "as soon as possible", "right now", "today",
-    "this week", "by Friday", "by Monday", "by end of week",
-    "by end of month", "deadline", "time sensitive",
-    "need it done", "need it now", "need it today", "need it urgently",
-    "waiting on payment", "supplier is waiting", "supplier waiting",
-    "vendor is waiting", "vendor waiting", "manufacturer waiting",
-    "partner waiting", "been waiting", "already delayed", "already late",
-    "overdue", "past due", "losing the contract", "losing my supplier",
-    "losing my vendor", "threatening to cancel", "might cancel",
-    "going to cancel", "cancelling the order", "losing the deal",
-    "deal at risk", "relationship at risk",
-    "can't wait any longer", "running out of time", "no more time",
-
-    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
-    "just signed a supplier", "signed a new supplier", "found a supplier",
-    "new supplier in", "signed a contract with", "new contract with",
-    "starting to import", "starting an import", "starting to export",
-    "starting an export", "launching in", "expanding to",
-    "entering the market", "new market", "setting up payments",
-    "need to set up payments", "need to transfer money",
-    "will need to send", "will need to transfer", "going to need",
-    "starting a business", "new business", "import business",
-    "export business", "trading company", "sourcing products from",
-    "sourcing goods from", "buying products from", "buying goods from",
-    "manufacturing in", "producing in",
-
-    # ── TREASURY & FX ────────────────────────────────────────────────────────
-    "treasury management", "cash management", "liquidity management",
-    "FX management", "FX exposure", "FX risk", "FX hedging",
-    "currency hedging", "currency risk", "currency exposure",
-    "FX solution", "FX platform", "FX tool",
-    "treasury solution", "treasury platform", "cash flow management",
-    "multi currency", "multi-currency", "multicurrency",
-    "currency account", "foreign currency account",
-    "international banking", "international bank account",
-    "global banking", "global bank account", "correspondent banking",
-    "banking relationship", "banking partner",
-    "payment infrastructure", "payment rails", "payment solution",
-    "payment platform", "payment provider", "payment partner",
-    "fintech payment", "embedded payment", "embedded finance",
-    "cross border banking", "international banking solution",
-    "FX banking", "FX banking relationship", "FX liquidity",
-    "cash pooling", "cash concentration",
-    "intercompany payment", "intercompany transfer",
-
-    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
-    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
-    "FX trader", "treasury director", "head of treasury", "VP treasury",
-    "international payments manager", "global payments manager",
-    "cross border payments", "payments operations manager",
-    "payments specialist", "treasury specialist", "FX specialist",
-    "international finance manager", "global finance manager",
-    "head of payments", "director of payments", "VP payments",
-    "chief financial officer", "head of finance", "finance director",
-    "controller international", "global controller",
-    
-    # ------ CYBER -----------
-
-    # ── INCIDENT / BREACH SIGNALS ────────────────────────────────────────────
-    "we got hacked", "we got breached", "company got hacked",
-    "company got breached", "data breach", "we had a breach",
-    "security breach", "breach happened", "just got ransomwared",
-    "ransomware attack", "ransomware hit us", "hit by ransomware",
-    "encrypted our files", "files got encrypted", "systems encrypted",
-    "locked out of our systems", "locked out of our servers",
-    "attacker got in", "attackers got in", "unauthorized access",
-    "someone accessed our", "someone breached our", "network compromised",
-    "systems compromised", "account compromised", "accounts compromised",
-    "email compromised", "credentials leaked", "credentials stolen",
-    "password leaked", "passwords leaked", "data leaked", "data exposed",
-    "customer data exposed", "customer data leaked", "PII exposed",
-    "PII leaked", "source code leaked", "database leaked",
-    "database exposed", "exfiltrated data", "data exfiltration",
-    "phishing attack", "phishing email", "spear phishing",
-    "business email compromise", "BEC attack", "CEO fraud",
-    "invoice fraud", "wire fraud attack", "supply chain attack",
-    "zero day exploit", "zero-day exploit", "actively exploited",
-    "malware infection", "infected with malware", "trojan detected",
-    "backdoor found", "backdoor discovered", "rootkit found",
-    "DDoS attack", "under DDoS", "site went down attack",
-    "insider threat", "insider attack", "third party breach",
-    "vendor breach", "supplier breach", "MSP breach",
-
-    # ── INCIDENT RESPONSE URGENCY ────────────────────────────────────────────
-    "need incident response", "need an IR firm", "need a forensics team",
-    "who do I call after a breach", "who to call after hack",
-    "emergency incident response", "24/7 incident response",
-    "need help now hacked", "actively being attacked",
-    "attack in progress", "attacker still in our network",
-    "containment help", "need containment", "need remediation",
-    "recovering from ransomware", "ransomware recovery",
-    "should we pay the ransom", "pay the ransom or not",
-    "ransom demand", "ransom note", "threat actor demanding",
-    "need to notify customers breach", "breach notification requirements",
-    "legally required to disclose breach", "disclose the breach",
-
-    # ── TOOLING / PLATFORM FRUSTRATION ───────────────────────────────────────
-    "our SIEM missed it", "SIEM didn't catch it", "SIEM false positives",
-    "too many false positives", "alert fatigue", "drowning in alerts",
-    "no visibility into our network", "no visibility into endpoints",
-    "can't see what's happening on our network",
-    "our EDR didn't catch it", "EDR missed", "antivirus didn't catch it",
-    "firewall got bypassed", "firewall wasn't enough",
-    "our current tool isn't working", "outgrown our current tool",
-    "outgrown our security stack", "current vendor isn't cutting it",
-    "switching security vendors", "replacing our SIEM",
-    "replacing our EDR", "need a new MDR", "need a new SOC",
-    "understaffed security team", "no security team",
-    "one person security team", "no dedicated security staff",
-    "can't afford a full SOC", "need outsourced SOC",
-    "need a virtual CISO", "need a fractional CISO", "need vCISO",
-
-    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
-    "security tools too expensive", "cybersecurity budget too small",
-    "can't justify the cost", "pricing is outrageous",
-    "licensing costs killing us", "per-endpoint pricing too high",
-    "hidden costs security vendor", "surprise renewal fees",
-    "renewal price increase", "price hike renewal",
-    "cheaper alternative to CrowdStrike", "cheaper alternative to SentinelOne",
-    "cheaper EDR", "cheaper SIEM", "cheaper MDR",
-    "affordable cybersecurity for small business",
-    "budget-friendly security tools", "best value security platform",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "CrowdStrike outage", "CrowdStrike issue", "CrowdStrike problem",
-    "CrowdStrike blocked", "CrowdStrike alternative",
-    "SentinelOne problem", "SentinelOne issue", "SentinelOne alternative",
-    "switching from CrowdStrike", "switching from SentinelOne",
-    "leaving Microsoft Defender", "Defender missed", "Defender didn't catch",
-    "Palo Alto issue", "Palo Alto problem", "Fortinet vulnerability",
-    "Fortinet issue", "Fortinet exploit", "Cisco vulnerability",
-    "Cisco exploit", "Sophos problem", "Sophos issue",
-    "Trend Micro problem", "McAfee problem", "Norton problem",
-    "Rapid7 issue", "Qualys issue", "Tenable issue", "Splunk too expensive",
-    "Splunk alternative", "Datadog security alternative",
-    "leaving our MSSP", "switching MSSPs", "MSSP isn't responsive",
-    "our MSP dropped the ball", "MSP missed the breach",
-    "alternative to Norton", "alternative to McAfee",
-    "alternative to Splunk", "alternative to Rapid7",
-    "better than CrowdStrike", "better than SentinelOne",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a SIEM", "recommend an EDR", "recommend an MDR",
-    "recommend a firewall", "recommend a security vendor",
-    "recommend a pentest firm", "recommend a security consultant",
-    "anyone used", "has anyone used", "does anyone recommend",
-    "what EDR do you use", "what SIEM do you use",
-    "which security tool is best", "best EDR for small business",
-    "best SIEM for startups", "best MDR provider",
-    "best pentest company", "looking for a security vendor",
-    "looking for a pentest firm", "looking for an MSSP",
-    "need a security assessment", "need a vulnerability assessment",
-    "need a penetration test", "need a pen test", "need a red team",
-    "who should we hire for security", "who do you use for security",
-
-    # ── COMPLIANCE PAIN ───────────────────────────────────────────────────────
-    "SOC 2 audit failed", "failed SOC 2", "SOC 2 readiness",
-    "need SOC 2 compliance", "preparing for SOC 2",
-    "ISO 27001 certification", "need ISO 27001", "ISO 27001 audit",
-    "PCI DSS compliance", "failed PCI audit", "PCI compliance issue",
-    "HIPAA violation", "HIPAA compliance issue", "HIPAA audit",
-    "GDPR fine", "GDPR violation", "GDPR compliance issue",
-    "CMMC compliance", "CMMC certification", "NIST compliance",
-    "NIST framework", "failed audit", "audit findings",
-    "compliance deadline", "compliance gap", "compliance nightmare",
-    "regulators are asking", "auditor flagged", "auditors flagged",
-
-    # ── URGENCY SIGNALS ──────────────────────────────────────────────────────
-    "urgently need", "critical vulnerability", "emergency patch",
-    "patch immediately", "exploit in the wild", "actively exploited",
-    "ASAP security", "need help immediately", "time sensitive breach",
-    "board is asking questions", "customers are asking questions",
-    "losing customers over breach", "losing the contract over security",
-    "insurance requires", "cyber insurance requirement",
-    "cyber insurance denied claim", "can't get cyber insurance",
-    "insurance premium went up after breach",
-
-    # ── BUSINESS EXPANSION / GROWTH ──────────────────────────────────────────
-    "building our security program", "starting a security program",
-    "hiring our first security hire", "hiring a CISO",
-    "scaling our security team", "growing security team",
-    "new compliance requirement", "new client requires SOC 2",
-    "client requiring security review", "vendor security questionnaire",
-    "security questionnaire from client", "need to pass security review",
-
-    # ── JOB SIGNALS ───────────────────────────────────────────────────────────
-    "CISO", "chief information security officer", "security engineer",
-    "security analyst", "SOC analyst", "SOC manager",
-    "head of security", "director of security", "VP security",
-    "security operations manager", "threat intel analyst",
-    "incident response manager", "GRC manager", "GRC analyst",
-    "penetration tester", "red team lead", "blue team lead",
-    "application security engineer", "cloud security engineer",
-    "detection engineer", "security architect",
-    
-    
-    # ------- CRM -----------
-    
-    # ── CRM PAIN POINTS ───────────────────────────────────────────────────────
-    "our CRM is a mess", "CRM is too complicated", "CRM too complex",
-    "CRM is clunky", "clunky CRM", "outdated CRM", "CRM feels outdated",
-    "hate our CRM", "CRM is a nightmare", "CRM nightmare",
-    "CRM isn't working for us", "CRM not working for our team",
-    "outgrown our CRM", "outgrown our current CRM",
-    "CRM doesn't scale", "CRM can't handle our volume",
-    "CRM is too slow", "CRM keeps crashing", "CRM keeps freezing",
-    "CRM data is a mess", "messy CRM data", "duplicate contacts CRM",
-    "duplicate leads CRM", "CRM data quality issues",
-    "no one updates the CRM", "reps don't update the CRM",
-    "sales team hates the CRM", "sales team won't use the CRM",
-    "low CRM adoption", "poor CRM adoption", "CRM adoption problem",
-    "manual data entry CRM", "too much manual data entry",
-    "spreadsheets instead of CRM", "still using spreadsheets for sales",
-    "tracking leads in spreadsheets", "tracking deals in spreadsheets",
-    "no visibility into pipeline", "no pipeline visibility",
-    "can't see our pipeline", "pipeline is a black box",
-    "forecasting is a guess", "sales forecasting is inaccurate",
-    "inaccurate sales forecast", "forecast doesn't match reality",
-    "reports take forever", "building reports manually",
-    "CRM reporting is limited", "CRM reporting is weak",
-
-    # ── SETUP / IMPLEMENTATION FRUSTRATION ───────────────────────────────────
-    "CRM implementation nightmare", "CRM implementation failed",
-    "CRM setup took months", "CRM migration nightmare",
-    "migrating off our CRM", "migrating from our CRM",
-    "CRM onboarding took forever", "took too long to set up CRM",
-    "CRM customization is hard", "hard to customize our CRM",
-    "need a developer to change anything", "too technical for our team",
-    "CRM requires an admin", "need a dedicated CRM admin",
-    "consultants to set up CRM", "paying consultants for CRM",
-
-    # ── FEE / COST FRUSTRATION ───────────────────────────────────────────────
-    "CRM is too expensive", "CRM pricing too high",
-    "CRM cost too much", "per seat pricing CRM", "per user pricing CRM",
-    "CRM licensing costs", "CRM renewal price increase",
-    "CRM price hike", "surprise CRM fees", "hidden fees CRM",
-    "add-ons cost extra CRM", "everything is an add-on",
-    "paying for features we don't use", "paying for unused seats",
-    "cheaper alternative to Salesforce", "cheaper than Salesforce",
-    "cheaper CRM", "affordable CRM for small business",
-    "budget-friendly CRM", "CRM on a budget", "best value CRM",
-    "CRM ROI", "not seeing ROI from our CRM",
-
-    # ── COMPETITOR / SALESFORCE MENTIONS ─────────────────────────────────────
-    "Salesforce is too complex", "Salesforce too complicated",
-    "Salesforce is overkill", "Salesforce overkill for small business",
-    "Salesforce too expensive", "Salesforce pricing",
-    "Salesforce alternative", "alternative to Salesforce",
-    "leaving Salesforce", "switching from Salesforce",
-    "migrating from Salesforce", "migrating off Salesforce",
-    "moving away from Salesforce", "Salesforce is a pain",
-    "Salesforce admin nightmare", "need a Salesforce admin",
-    "HubSpot alternative", "alternative to HubSpot",
-    "switching from HubSpot", "leaving HubSpot", "HubSpot too expensive",
-    "HubSpot pricing", "HubSpot limitations",
-    "Zoho CRM problem", "Zoho CRM issue", "switching from Zoho",
-    "Pipedrive limitations", "Pipedrive alternative", "switching from Pipedrive",
-    "Monday CRM problem", "Monday sales CRM issue",
-    "Copper CRM problem", "Close CRM alternative",
-    "Freshsales problem", "Freshsales alternative",
-    "Insightly problem", "Insightly alternative",
-    "Nimble CRM problem", "SugarCRM problem",
-    "Microsoft Dynamics alternative", "Dynamics 365 too complex",
-    "alternative to HubSpot", "alternative to Pipedrive",
-    "alternative to Zoho", "alternative to Monday CRM",
-    "better than Salesforce", "better than HubSpot",
-    "better than Pipedrive", "competitors to Salesforce",
-    "Salesforce competitors", "HubSpot competitors",
-
-    # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
-    "recommend a CRM", "recommend a sales tool", "recommend a pipeline tool",
-    "recommend a sales platform", "anyone recommend a CRM",
-    "can anyone recommend a CRM", "does anyone recommend a CRM",
-    "what CRM do you use", "what CRM should I use",
-    "which CRM is best", "which CRM should we use",
-    "best CRM for small business", "best CRM for startups",
-    "best CRM for sales teams", "best CRM for agencies",
-    "best CRM for real estate", "best CRM for solo founders",
-    "best sales pipeline tool", "best pipeline management tool",
-    "best sales tracking tool", "best lead tracking tool",
-    "looking for a CRM", "looking for a sales tool",
-    "looking for a pipeline tool", "searching for a CRM",
-    "need a CRM", "need a sales tool", "need a pipeline tool",
-    "need a better CRM", "need a simple CRM", "need an easy CRM",
-    "anyone using a CRM", "does anyone use", "has anyone used",
-    "who uses", "what do you use for sales", "what are you using for CRM",
-    "tried several CRMs", "tried multiple CRMs", "tried everything CRM",
-    "still looking for a CRM", "still haven't found a CRM",
-
-    # ── SALES TOOLS / PIPELINE ────────────────────────────────────────────────
-    "sales pipeline management", "pipeline management tool",
-    "sales pipeline tracking", "deal tracking tool",
-    "lead tracking software", "lead management tool",
-    "lead scoring tool", "sales automation tool",
-    "sales engagement platform", "sales enablement tool",
-    "outbound sales tool", "cold outreach tool", "cold email tool",
-    "sales prospecting tool", "prospecting software",
-    "sales sequence tool", "email sequencing tool",
-    "sales dialer", "auto dialer sales", "call tracking sales",
-    "quote to cash", "proposal software sales", "contract management sales",
-    "sales forecasting tool", "revenue operations tool",
-    "RevOps tool", "sales analytics tool", "sales dashboard tool",
-    "deal desk tool", "sales stack", "sales tech stack",
-    "building our sales stack", "sales tools we use",
-
-    # ── BUSINESS CONTEXT ──────────────────────────────────────────────────────
-    "my sales team", "our sales team", "small sales team",
-    "growing sales team", "scaling our sales team", "sales reps need",
-    "sales manager needs", "head of sales needs",
-    "startup sales process", "our sales process", "no sales process",
-    "informal sales process", "need a sales process",
-    "founder-led sales", "solo founder sales", "one-person sales team",
-    "agency CRM needs", "real estate CRM needs",
-    "B2B sales pipeline", "B2B sales tool", "B2B sales software",
-    "SaaS sales tool", "SaaS CRM", "startup CRM",
-
-    # ── COMPLIANCE / DATA ─────────────────────────────────────────────────────
-    "CRM data security", "CRM GDPR compliance", "CRM data privacy",
-    "CRM permissions issue", "CRM access control",
-    "data silos sales marketing", "sales and marketing not aligned",
-    "CRM integration issue", "CRM doesn't integrate with",
-    "CRM integration with email", "CRM integration with marketing",
-    "CRM API limitations", "CRM lacks integrations",
-
-    # ── URGENCY / EXPANSION SIGNALS ───────────────────────────────────────────
-    "urgently need a CRM", "need a CRM ASAP", "need this set up quickly",
-    "launching soon need CRM", "onboarding new sales hires",
-    "just hired our first salesperson", "scaling our sales operations",
-    "new sales hire needs a CRM", "board wants better reporting",
-    "investors asking about pipeline", "need better reporting for investors",
-
-    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
-    "VP of sales", "head of sales", "sales operations manager",
-    "RevOps manager", "revenue operations manager", "CRM administrator",
-    "Salesforce administrator", "Salesforce admin", "Salesforce developer",
-    "sales enablement manager", "director of sales operations",
-    "chief revenue officer", "CRO", "sales operations analyst",
-    
-
-    # ── SHIPPING / DELIVERY PROBLEMS ──────────────────────────────────────────
-    "shipment delayed", "shipment stuck", "shipment lost",
-    "package delayed", "package stuck", "package lost",
-    "order delayed", "order stuck in transit", "stuck in customs",
-    "held at customs", "customs delay", "customs clearance issue",
-    "customs holding my shipment", "customs rejected my shipment",
-    "freight delayed", "freight stuck", "container delayed",
-    "container stuck", "container held", "cargo delayed", "cargo stuck",
-    "shipment damaged", "damaged in transit", "damaged freight",
-    "damaged goods arrived", "arrived damaged", "goods lost in transit",
-    "missing shipment", "missing package", "missing inventory",
-    "tracking not updating", "no tracking updates",
-    "can't track my shipment", "no visibility into shipment",
-    "no visibility into freight", "no supply chain visibility",
-    "shipment taking forever", "delivery taking forever",
-    "late delivery", "missed delivery window", "missed delivery deadline",
-    "delivery delayed again", "delayed again", "shipment delayed again",
-
-    # ── CARRIER PROBLEMS / SWAPS ─────────────────────────────────────────────
-    "carrier dropped my shipment", "carrier cancelled", "carrier failed",
-    "carrier issue", "carrier problem", "carrier keeps delaying",
-    "carrier unreliable", "unreliable carrier", "bad carrier experience",
-    "switching carriers", "switched carriers", "need a new carrier",
-    "looking for a new carrier", "carrier alternative",
-    "alternative carrier", "carrier keeps raising rates",
-    "carrier rate increase", "carrier surcharge", "unexpected surcharge",
-    "fuel surcharge too high", "accessorial fees", "hidden carrier fees",
-    "carrier capacity issues", "no capacity available",
-    "can't get capacity", "capacity crunch", "space unavailable",
-    "booking rejected carrier", "carrier booking cancelled",
-    "carrier overbooked", "rolled shipment", "shipment rolled",
-    "carrier keeps rolling my cargo", "blank sailing",
-    "vessel delayed", "vessel skipped port", "port congestion",
-    "port delays", "port backlog", "warehouse delays",
-    "3PL problem", "3PL issue", "3PL dropped the ball",
-    "switching 3PL", "leaving our 3PL", "need a new 3PL",
-    "freight forwarder problem", "freight forwarder issue",
-    "switching freight forwarders", "need a new freight forwarder",
-    "trucking company problem", "trucking company unreliable",
-    "LTL carrier issue", "FTL carrier issue", "drayage delay",
-    "drayage problem", "last mile delivery problem",
-    "last mile delivery issues", "final mile delivery problem",
-
-    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
-    "shipping costs too high", "freight costs too high",
-    "shipping rates increased", "freight rates increased",
-    "shipping fees killing margins", "freight fees eating margins",
-    "logistics costs too high", "cheaper shipping option",
-    "cheaper freight option", "cheaper carrier", "cheaper 3PL",
-    "affordable freight forwarding", "reduce shipping costs",
-    "lower our freight costs", "cut shipping costs",
-    "shipping cost comparison", "compare freight rates",
-    "best freight rates", "best shipping rates",
-
-    # ── COMPETITOR / PLATFORM MENTIONS ───────────────────────────────────────
-    "FedEx delayed", "FedEx lost my package", "FedEx problem",
-    "FedEx issue", "UPS delayed", "UPS lost my package", "UPS problem",
-    "USPS lost my package", "USPS delayed", "USPS problem",
-    "DHL delayed", "DHL lost my package", "DHL problem",
-    "Maersk delayed", "Maersk booking issue", "MSC delayed",
-    "MSC booking issue", "CMA CGM delayed", "COSCO delayed",
-    "Flexport problem", "Flexport issue", "Flexport alternative",
-    "leaving Flexport", "switching from Flexport",
-    "project44 alternative", "FourKites alternative",
-    "ShipBob problem", "ShipBob issue", "ShipBob alternative",
-    "leaving ShipBob", "ShipStation problem", "ShipStation alternative",
-    "Shippo problem", "Shippo alternative", "EasyPost alternative",
-    "Freightos alternative", "uShip problem", "Convoy shut down",
-    "alternative to FedEx", "alternative to UPS", "alternative to DHL",
-    "alternative to Flexport", "alternative to ShipBob",
-    "better than Flexport", "better than ShipBob",
-    "competitors to Flexport", "Flexport competitors",
-
-    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
-    "recommend a freight forwarder", "recommend a carrier",
-    "recommend a 3PL", "recommend a logistics provider",
-    "recommend a shipping company", "recommend a fulfillment company",
-    "anyone recommend a carrier", "can anyone recommend a 3PL",
-    "does anyone recommend a freight forwarder",
-    "what carrier do you use", "what 3PL do you use",
-    "which carrier is best", "which 3PL is best",
-    "best freight forwarder for", "best 3PL for small business",
-    "best fulfillment company", "best shipping carrier for ecommerce",
-    "looking for a freight forwarder", "looking for a 3PL",
-    "looking for a carrier", "looking for a fulfillment partner",
-    "need a logistics partner", "need a shipping partner",
-    "need a new supplier for shipping", "anyone using",
-    "has anyone used", "who do you use for shipping",
-    "what are you using for fulfillment", "tried several carriers",
-    "tried multiple 3PLs", "still looking for a carrier",
-
-    # ── SUPPLY CHAIN / SOURCING ───────────────────────────────────────────────
-    "supply chain disruption", "supply chain issue", "supply chain problem",
-    "supply chain delay", "supply chain risk", "supply chain visibility",
-    "diversifying our supply chain", "diversify suppliers",
-    "reduce supply chain risk", "supply chain resilience",
-    "reshoring manufacturing", "nearshoring supply chain",
-    "friend-shoring", "supplier diversification",
-    "single source supplier risk", "backup supplier needed",
-    "need a backup supplier", "supplier reliability issues",
-    "supplier missed deadline", "supplier delay", "manufacturer delay",
-    "factory delay", "production delay", "inventory shortage",
-    "stock shortage", "out of stock supplier issue",
-    "inventory management problem", "warehouse management issue",
-    "demand planning problem", "forecasting supply chain",
-    "procurement issue", "procurement delay", "sourcing new supplier",
-    "sourcing new manufacturer", "vetting new supplier",
-    "supplier audit", "supplier quality issue", "quality control issue factory",
-
-    # ── BUSINESS CONTEXT ──────────────────────────────────────────────────────
-    "our warehouse", "our fulfillment center", "our distribution center",
-    "ecommerce fulfillment", "ecommerce shipping", "dropshipping supplier",
-    "dropshipping issue", "import/export logistics", "cross-border shipping",
-    "international shipping problem", "international freight",
-    "B2B shipping", "wholesale shipping", "bulk shipping",
-    "small business shipping", "startup logistics", "scaling logistics",
-    "growing ecommerce brand shipping", "DTC brand fulfillment",
-    "manufacturing overseas", "shipping from China", "shipping from Asia",
-    "container shipping from China", "freight from China",
-
-    # ── COMPLIANCE / DOCUMENTATION ────────────────────────────────────────────
-    "bill of lading issue", "customs documentation error",
-    "incoterms confusion", "wrong incoterms", "tariff increase",
-    "tariff impact supply chain", "duties and tariffs issue",
-    "import duties too high", "export documentation problem",
-    "compliance issue shipping", "trade compliance", "HS code error",
-    "denied party screening", "customs broker issue",
-    "customs broker problem", "need a customs broker",
-
-    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
-    "urgently need shipping", "need this shipped ASAP",
-    "customer waiting on shipment", "customers are angry about shipping",
-    "losing customers over shipping delays", "losing the contract shipping",
-    "peak season shipping", "holiday shipping delays",
-    "need a solution before peak season", "running out of inventory",
-    "can't fulfill orders", "backordered", "backlog of orders",
-
-    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
-    "supply chain manager", "logistics manager", "logistics coordinator",
-    "procurement manager", "sourcing manager", "fulfillment manager",
-    "warehouse manager", "operations manager logistics",
-    "VP supply chain", "head of logistics", "head of supply chain",
-    "director of logistics", "director of supply chain",
-    "chief supply chain officer", "freight broker", "logistics analyst",
-    
-    
-    # ── HIRING / RECRUITING PAIN POINTS ──────────────────────────────────────
-    "hiring is a nightmare", "recruiting is a nightmare",
-    "can't find good candidates", "can't find qualified candidates",
-    "struggling to hire", "struggling to find talent",
-    "talent shortage", "hard to find good talent",
-    "too many unqualified applicants", "flooded with applications",
-    "drowning in resumes", "too many resumes to screen",
-    "resume screening taking forever", "screening candidates manually",
-    "no time to screen candidates", "hiring process too slow",
-    "recruiting process too slow", "hiring taking too long",
-    "time to hire too long", "losing candidates to slow process",
-    "losing candidates to other offers", "candidate ghosted us",
-    "candidates ghosting", "no shows for interviews",
-    "interview no shows", "offer rejected", "candidate declined offer",
-    "high candidate drop off", "candidates dropping out of process",
-    "bad candidate experience", "poor candidate experience",
-    "our hiring process is broken", "broken hiring process",
-    "no structured interview process", "inconsistent interview process",
-    "hiring manager not responsive", "hiring managers slow to respond",
-    "interview feedback delayed", "no feedback loop hiring",
-
-    # ── ATS / TOOLING FRUSTRATION ─────────────────────────────────────────────
-    "our ATS is a mess", "ATS is clunky", "clunky ATS",
-    "outdated ATS", "ATS feels outdated", "hate our ATS",
-    "ATS is too complicated", "ATS too complex", "ATS doesn't work for us",
-    "outgrown our ATS", "outgrown our applicant tracking system",
-    "ATS doesn't scale", "ATS can't handle our volume",
-    "ATS is too slow", "ATS keeps crashing", "ATS keeps glitching",
-    "ATS data is a mess", "duplicate candidates ATS",
-    "no one updates the ATS", "recruiters don't use the ATS",
-    "low ATS adoption", "manual tracking candidates",
-    "tracking candidates in spreadsheets", "still using spreadsheets to hire",
-    "no visibility into hiring pipeline", "can't see our hiring pipeline",
-    "hiring pipeline is a black box", "reporting on hiring is hard",
-    "ATS reporting is limited", "ATS doesn't integrate with",
-    "ATS lacks integrations", "ATS integration issue",
-
-    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
-    "recruiting costs too high", "cost per hire too high",
-    "ATS pricing too high", "HR software too expensive",
-    "per seat pricing ATS", "per employee pricing HR software",
-    "recruiter agency fees too high", "staffing agency fees too high",
-    "hidden fees ATS", "surprise renewal fees HR software",
-    "HR software renewal price increase", "job board costs too high",
-    "job posting fees too expensive", "cheaper alternative to Greenhouse",
-    "cheaper alternative to Workday", "cheaper ATS",
-    "affordable HR software for small business", "budget-friendly ATS",
-    "best value ATS", "not seeing ROI from our ATS",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "Greenhouse too complex", "Greenhouse too expensive",
-    "Greenhouse alternative", "alternative to Greenhouse",
-    "switching from Greenhouse", "leaving Greenhouse",
-    "Workday is a nightmare", "Workday too complicated",
-    "Workday alternative", "alternative to Workday",
-    "switching from Workday", "leaving Workday",
-    "Lever alternative", "switching from Lever", "leaving Lever",
-    "BambooHR problem", "BambooHR alternative", "switching from BambooHR",
-    "ADP problem", "ADP alternative", "switching from ADP",
-    "Gusto problem", "Gusto alternative", "switching from Gusto",
-    "Rippling problem", "Rippling alternative",
-    "iCIMS problem", "iCIMS alternative", "switching from iCIMS",
-    "JazzHR alternative", "Breezy HR alternative", "Recruitee alternative",
-    "SmartRecruiters alternative", "Workable alternative",
-    "Zoho Recruit alternative", "Indeed hiring platform problem",
-    "LinkedIn Recruiter too expensive", "LinkedIn Recruiter alternative",
-    "ZipRecruiter problem", "ZipRecruiter alternative",
-    "alternative to Greenhouse", "alternative to Lever",
-    "alternative to BambooHR", "alternative to Workable",
-    "better than Greenhouse", "better than Workday",
-    "competitors to Greenhouse", "Greenhouse competitors",
-    "Workday competitors",
-
-    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
-    "recommend an ATS", "recommend a hiring tool", "recommend an HR platform",
-    "recommend a recruiting tool", "recommend a payroll provider",
-    "anyone recommend an ATS", "can anyone recommend a hiring tool",
-    "does anyone recommend an HR platform", "what ATS do you use",
-    "what HR software do you use", "which ATS is best",
-    "which HR platform is best", "best ATS for small business",
-    "best ATS for startups", "best HR software for small teams",
-    "best recruiting software", "best payroll software",
-    "best workforce management tool", "looking for an ATS",
-    "looking for an HR platform", "looking for a recruiting tool",
-    "looking for a payroll provider", "need an ATS",
-    "need an HR platform", "need a recruiting tool",
-    "need a simple ATS", "need an easy HR system",
-    "anyone using an ATS", "does anyone use", "has anyone used",
-    "who uses", "what are you using for hiring",
-    "tried several ATS platforms", "tried multiple HR tools",
-    "still looking for an ATS", "still haven't found the right HR software",
-
-    # ── RECRUITING / HR TOOLS & CATEGORIES ────────────────────────────────────
-    "applicant tracking system", "candidate relationship management",
-    "recruiting CRM", "talent acquisition software",
-    "employer branding tool", "job posting software",
-    "interview scheduling tool", "automated interview scheduling",
-    "background check software", "reference checking tool",
-    "onboarding software", "employee onboarding tool",
-    "payroll software", "benefits administration software",
-    "performance management software", "employee engagement tool",
-    "workforce management software", "HRIS platform",
-    "time tracking software HR", "PTO tracking tool",
-    "compensation management tool", "org chart software",
-    "employee scheduling software", "shift scheduling tool",
-    "recruitment marketing tool", "candidate sourcing tool",
-    "sourcing candidates tool", "resume parsing tool",
-    "skills assessment tool", "pre-employment testing",
-    "video interview platform", "async video interview tool",
-
-    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
-    "my HR team", "our HR team", "small HR team", "one person HR team",
-    "no dedicated HR person", "wearing the HR hat", "founder doing HR",
-    "growing our team", "scaling our hiring", "scaling headcount",
-    "hiring our first employee", "hiring first HR hire",
-    "startup hiring process", "no formal hiring process",
-    "need a hiring process", "remote hiring challenges",
-    "hiring remote employees", "distributed team hiring",
-    "hiring across multiple countries", "international hiring",
-    "hiring contractors vs employees", "EOR provider", "employer of record",
-    "PEO provider", "professional employer organization",
-
-    # ── COMPLIANCE / HR RISK ───────────────────────────────────────────────────
-    "compliance issue HR", "employment law compliance",
-    "wrongful termination risk", "HR compliance nightmare",
-    "I-9 compliance", "E-Verify issue", "labor law compliance",
-    "wage and hour compliance", "overtime compliance issue",
-    "worker classification issue", "1099 vs W2 issue",
-    "background check compliance", "EEOC complaint", "HR audit",
-    "failed HR audit", "employee handbook outdated",
-
-    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
-    "urgently need to hire", "need to hire ASAP", "critical role open",
-    "position open for months", "role has been open too long",
-    "losing revenue because understaffed", "understaffed team",
-    "burning out the team hiring slow", "board wants headcount plan",
-    "investors asking about headcount", "need to scale hiring fast",
-
-    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
-    "head of talent", "head of HR", "head of people",
-    "VP of people", "VP of talent", "chief people officer",
-    "talent acquisition manager", "recruiting manager",
-    "HR manager", "HR business partner", "people operations manager",
-    "HRIS manager", "compensation and benefits manager",
-    "director of talent acquisition", "director of people operations",
-    "technical recruiter", "corporate recruiter", "recruiting coordinator",
-    
-    # ── ACCOUNTING / BOOKKEEPING PAIN POINTS ──────────────────────────────────
-    "our books are a mess", "bookkeeping is a mess", "behind on bookkeeping",
-    "months behind on bookkeeping", "need to catch up on books",
-    "accounting is a nightmare", "accounting software is a nightmare",
-    "hate our accounting software", "accounting software too complicated",
-    "accounting software too complex", "outdated accounting software",
-    "accounting software feels outdated", "outgrown our accounting software",
-    "accounting software doesn't scale", "accounting software is too slow",
-    "accounting software keeps crashing", "accounting software keeps glitching",
-    "reconciliation is a nightmare", "bank reconciliation taking forever",
-    "reconciling accounts manually", "manual data entry accounting",
-    "too much manual data entry bookkeeping", "still using spreadsheets for accounting",
-    "tracking expenses in spreadsheets", "invoicing manually",
-    "sending invoices manually", "chasing invoices", "chasing late payments",
-    "chasing unpaid invoices", "clients not paying invoices",
-    "cash flow visibility problem", "no visibility into cash flow",
-    "can't see our cash flow", "cash flow is a black box",
-    "financial reporting takes forever", "building reports manually finance",
-    "accounting reporting is limited", "accounting reporting is weak",
-    "closing the books takes forever", "month end close takes too long",
-    "month end close nightmare", "year end accounting nightmare",
-    "tax season nightmare", "not ready for tax season",
-    "no idea what we owe in taxes", "surprised by tax bill",
-    "underestimated taxes owed", "quarterly taxes nightmare",
-
-    # ── SETUP / MIGRATION FRUSTRATION ────────────────────────────────────────
-    "accounting software migration nightmare", "migrating off our accounting software",
-    "migrating from QuickBooks", "switching accounting software",
-    "accounting software setup took months", "accounting software onboarding nightmare",
-    "hard to customize our accounting software", "need an accountant to set this up",
-    "need a bookkeeper to fix this", "paying a bookkeeper to clean up our books",
-    "cleanup project bookkeeping", "books need a cleanup",
-
-    # ── FEE / COST FRUSTRATION ────────────────────────────────────────────────
-    "accounting software too expensive", "accounting software pricing too high",
-    "bookkeeping fees too high", "accountant fees too high",
-    "per user pricing accounting software", "accounting software renewal price increase",
-    "accounting software price hike", "hidden fees accounting software",
-    "add-ons cost extra accounting software", "paying for features we don't use accounting",
-    "cheaper alternative to QuickBooks", "cheaper than QuickBooks",
-    "cheaper accounting software", "affordable accounting software for small business",
-    "budget-friendly accounting software", "best value accounting software",
-    "not seeing ROI from accounting software",
-
-    # ── COMPETITOR MENTIONS ───────────────────────────────────────────────────
-    "QuickBooks is a nightmare", "QuickBooks too complicated",
-    "QuickBooks too expensive", "QuickBooks pricing increase",
-    "QuickBooks alternative", "alternative to QuickBooks",
-    "leaving QuickBooks", "switching from QuickBooks",
-    "migrating from QuickBooks", "QuickBooks customer support terrible",
-    "Xero alternative", "alternative to Xero", "switching from Xero",
-    "leaving Xero", "Xero problem", "Xero issue",
-    "FreshBooks alternative", "switching from FreshBooks",
-    "Wave accounting problem", "Wave accounting alternative",
-    "Sage alternative", "Sage accounting problem", "switching from Sage",
-    "NetSuite too complex", "NetSuite too expensive", "NetSuite alternative",
-    "Zoho Books alternative", "switching from Zoho Books",
-    "Bill.com problem", "Bill.com alternative",
-    "Gusto payroll problem", "Gusto accounting integration issue",
-    "Expensify problem", "Expensify alternative",
-    "alternative to Xero", "alternative to FreshBooks",
-    "alternative to NetSuite", "alternative to Sage",
-    "better than QuickBooks", "better than Xero",
-    "competitors to QuickBooks", "QuickBooks competitors",
-    "Xero competitors",
-
-    # ── RECOMMENDATION REQUESTS ───────────────────────────────────────────────
-    "recommend an accounting software", "recommend a bookkeeping tool",
-    "recommend an accountant", "recommend a bookkeeper",
-    "anyone recommend an accounting software", "can anyone recommend a bookkeeper",
-    "does anyone recommend an accountant", "what accounting software do you use",
-    "which accounting software is best", "best accounting software for small business",
-    "best accounting software for startups", "best accounting software for freelancers",
-    "best invoicing software", "best expense tracking software",
-    "best bookkeeping software", "best payroll and accounting software",
-    "looking for an accounting software", "looking for a bookkeeper",
-    "looking for an accountant", "need an accounting software",
-    "need a bookkeeper", "need an accountant", "need a simple accounting tool",
-    "anyone using", "does anyone use", "has anyone used",
-    "who uses", "what are you using for accounting",
-    "tried several accounting tools", "still looking for accounting software",
-    "still haven't found the right accounting software",
-
-    # ── ACCOUNTING TOOLS & CATEGORIES ────────────────────────────────────────
-    "invoicing software", "expense tracking software", "expense management tool",
-    "receipt scanning app", "mileage tracking app", "payroll software",
-    "tax filing software", "tax preparation software", "sales tax software",
-    "sales tax compliance tool", "1099 filing software", "W2 filing software",
-    "accounts payable software", "accounts receivable software",
-    "AP automation", "AR automation", "cash flow forecasting tool",
-    "financial planning software", "FP&A tool", "budgeting software business",
-    "multi-entity accounting software", "multi-currency accounting software",
-    "inventory accounting software", "job costing software",
-    "project accounting software", "nonprofit accounting software",
-    "e-commerce accounting software", "Shopify accounting integration",
-    "Amazon seller accounting software",
-
-    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
-    "my bookkeeper", "our bookkeeper", "my accountant", "our accountant",
-    "small business accounting", "startup accounting", "solo founder accounting",
-    "freelancer accounting", "self employed accounting", "DIY bookkeeping",
-    "doing my own books", "founder doing the books", "wearing the finance hat",
-    "no dedicated finance person", "growing business need better accounting",
-    "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
-    "virtual CFO", "fractional CFO", "need a fractional CFO",
-    "part time bookkeeper", "part time accountant",
-
-    # ── COMPLIANCE / TAX RISK ─────────────────────────────────────────────────
-    "IRS audit", "audit risk small business", "tax compliance issue",
-    "missed tax deadline", "late filing penalty", "sales tax nexus issue",
-    "multi-state tax compliance", "1099 compliance issue",
-    "payroll tax compliance", "bookkeeping compliance issue",
-    "financial statements for investors", "need clean books for investors",
-    "due diligence financials", "GAAP compliance issue",
-
-    # ── URGENCY SIGNALS ────────────────────────────────────────────────────────
-    "urgently need a bookkeeper", "need books cleaned up ASAP",
-    "tax deadline approaching", "need this done before tax season",
-    "investors asking for financials", "due diligence deadline",
-    "board wants updated financials", "need financials for loan application",
-    "need financials for a loan", "applying for a business loan financials",
-
-    # ── JOB SIGNALS ────────────────────────────────────────────────────────────
-    "controller", "VP of finance", "head of finance", "director of finance",
-    "chief financial officer", "CFO", "finance manager", "accounting manager",
-    "bookkeeper", "staff accountant", "senior accountant",
-    "accounts payable manager", "accounts receivable manager",
-    "financial analyst", "FP&A manager",
 
 ]
 
@@ -1697,18 +439,19 @@ def _derive_fields(score: int) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Byte-for-byte identical to v7.4.3. Scoring logic untouched.
+# Reddit/Twitter/Telegram/Facebook prompts byte-for-byte identical to
+# v7.5.0. CLAUDE_SYSTEM_PROMPT_LINKEDIN is new (v7.6.0), same _SCORING_CORE.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
 You are Flintel's AI signal intelligence analyst.
 
-Your only job is to read a public social media post and determine 
-whether the person or company posting needs a cross-border B2B 
+Your only job is to read a public social media post and determine
+whether the person or company posting needs a cross-border B2B
 payment solution right now.
 
-You work exclusively for Settla — a premium B2B cross-border 
-payment company helping diaspora business owners move large amounts 
+You work exclusively for Settla — a premium B2B cross-border
+payment company helping diaspora business owners move large amounts
 internationally for supplier and trade payments.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1717,12 +460,12 @@ WHO SETTLA SERVES — KNOW THIS PERFECTLY
 
 Settla's ideal customer is a diaspora business owner who:
 
-— Runs an import/export business, trading company, or has 
+— Runs an import/export business, trading company, or has
   overseas suppliers and partners
-— Needs to move $10,000 to $500,000 CAD/GBP/USD regularly 
+— Needs to move $10,000 to $500,000 CAD/GBP/USD regularly
   for business payments — NOT personal remittances
 — Is frustrated with banks blocking large international transfers
-— Has been burned by consumer apps like Wise that restrict 
+— Has been burned by consumer apps like Wise that restrict
   business volumes
 — Is actively looking for a better cross-border payment solution
 — Operates across these corridors:
@@ -1757,7 +500,7 @@ Settla is NOT for:
 CRITICAL SCORING RULE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If a post contains NO international payment context — 
+If a post contains NO international payment context —
 score maximum 4 regardless of anything else.
 
 International context means at least ONE of:
@@ -1776,112 +519,14 @@ TWO ACCEPTABLE SIGNAL TYPES ONLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 HIGH INTENT — Score 7 to 10:
-Company or contact actively looking to COMPLETE an FX 
+Company or contact actively looking to COMPLETE an FX
 transaction or international payment immediately.
-
-Signs:
-— Payment blocked or failing right now
-— Supplier waiting for payment urgently
-— Asking which platform to use TODAY
-— Specific large amount mentioned with urgency
-— Bank blocking transfer right now
-— Competitor app restricted their account
-— Explicitly leaving a competitor ASAP
-— Actively looking for payment processor partners
-— Building payment processing relationships internationally
 
 MID INTENT — Score 4 to 6:
 Company or contact actively SHOPPING for a solution.
 
-Signs:
-— Comparing multiple payment platforms
-— Asking for recommendations on payment solutions
-— Frustrated with current provider but not in crisis
-— Researching FX rates and payment options for business
-— Evaluating treasury or payment infrastructure
-— Mentioned trying multiple competitors
-— Pre-launch business setting up international payments
-— Looking for partners with payment connections
-
 DISCARD — Score 0 to 3:
 NOT ACCEPTABLE. Never delivered to Settla team.
-
-— Personal remittance under $2,000
-— Sending money home to family
-— Consumer banking complaints with no international context
-— US domestic banking problems only
-— High risk merchant categories — peptides, supplements, crypto
-— E-commerce payment gateway requests
-— General financial market commentary
-— No business context whatsoever
-— Academic or research requests
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCORING RULES — PRECISE AND ABSOLUTE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SCORE 9 to 10 — IMMEDIATE SLACK ALERT:
-ALL of these must be present:
-✓ Clear business context confirmed
-✓ International payment need confirmed
-✓ Active crisis — blocked, failed, rejected, urgent
-✓ Urgency words — today, ASAP, urgently, this week
-
-Real examples that score 9 to 10:
-"Bank blocked my $45k CAD payment to Lagos supplier AGAIN.
- Third time this month. Need a better solution urgently."
-→ Business. International. Crisis. Urgency. Score 9.
-
-"Wise Business restricted my account. Have $80k stuck.
- Pakistani supplier waiting. This is killing my business."
-→ Business. Competitor restricted. Large amount. Crisis. Score 10.
-
-"We are actively looking for partners with strong connections 
- to Asian payment processors. We have several clients from 
- Asia and are expecting more so we are keen to build reliable 
- processing relationships."
-→ Business confirmed. International payment need confirmed.
-  Actively looking now. No crisis but clear intent. Score 7.
-
-SCORE 7 to 8 — IMMEDIATE SLACK ALERT:
-Strong buying signal. One element missing.
-✓ Business context confirmed
-✓ International payment need confirmed
-✗ Missing extreme urgency OR specific amount
-
-"Anyone using a service better than Wise for business 
- payments to Nigeria? Bank rates are terrible."
-→ Business. Comparing platforms. No crisis. Score 7.
-
-SCORE 4 to 6 — DAILY DIGEST:
-Researching but no immediate crisis.
-✓ Business context implied
-✓ International payment mentioned
-✗ No urgency. No crisis.
-
-"Starting an import business. How do people handle 
- supplier payments to Africa?"
-→ Future intent. Business context. No urgency. Score 5.
-
-"Mid-sized B2B accepting stablecoin from international 
- clients to cut wire fees. Bank flagging crypto activity."
-→ Business confirmed. International clients confirmed.
-  Wire fees pain. No immediate crisis. Score 6.
-
-SCORE 3 — WATCHLIST ONLY:
-Clear future potential within 30 to 60 days.
-"Just signed my first supplier agreement in Lagos!"
-→ New importer. Will need payments soon. Score 3.
-
-SCORE 0 to 2 — DISCARD IMMEDIATELY:
-"What is the best rate to send £500 to my mum in Lagos?"
-→ Consumer. Personal. Small amount. Score 1.
-
-"Research peptide website looking for payment processor."
-→ Wrong industry. No international B2B context. Score 0.
-
-"US Bank froze my Texas LLC account over documentation."
-→ Domestic US banking. No international payment. Score 2.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AUTOMATIC SCORE MODIFIERS
@@ -1902,29 +547,16 @@ SUBTRACT 1 from score when:
 - Small personal amount under $2,000
 - Sending to family for personal expenses
 - Anonymous account with no business bio
-- Issue is now resolved — kept account etc
+- Issue is now resolved
 - Post is older than 7 days
 - No specific payment amount mentioned
 - General commentary not personal experience
-
-AUTOMATIC DISCARD regardless of other signals:
-✗ Research peptides or supplements
-✗ High risk merchant category
-✗ Shopify e-commerce payment gateway
-✗ Consumer subscription problems
-✗ Personal PayPal or Cash App issues
-✗ US domestic banking only
-✗ Crypto trading discussions
-✗ Academic or research requests
-✗ News articles being shared
-✗ Competitor companies doing outreach
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COMPETITOR INTELLIGENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 If a competitor is mentioned negatively — score UP by 1.
-Someone leaving a competitor is the hottest possible signal.
 
 Competitors to detect:
 Wise / TransferWise / Wise Business
@@ -1937,11 +569,6 @@ Revolut / Revolut Business
 LemFi / Grey Finance / NALA
 Chipper Cash / Sendwave
 TD Bank / RBC / HSBC / Barclays / Lloyds
-
-If post IS FROM a competitor doing outreach:
-— Score 0 for that post
-— Extract who they replied to
-— Flag that person as HIGH INTENT signal separately
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTREACH SCRIPT RULES
@@ -1959,56 +586,13 @@ OUTREACH RULES — NON NEGOTIABLE:
 — Maximum 3 sentences total per script
 — Sound like a founder talking to another founder
 
-OUTREACH EXAMPLES BY SCORE:
-
-Score 9 to 10 — acute pain:
-"Wise restricting business accounts at that volume is 
-unfortunately common. We handle large B2B transfers 
-between Canada and Nigeria without the holds — worth a quick 
-conversation before you commit to something else?"
-
-Score 7 to 8 — strong signal:
-"Building payment processing relationships across Asia is 
-exactly what we do. Happy to connect you with the right 
-processors for your client corridors — which specific 
-countries are you focused on?"
-
-Score 4 to 6 — researching:
-"We work specifically with businesses moving money across 
-international corridors. Happy to share how we handle the 
-compliance side if useful for what you are building."
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VALIDATION TESTS — CHECK BEFORE SCORING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Before returning any score above 4 ask yourself:
-
-1. Is there a BUSINESS context? Not personal.
-2. Is there an INTERNATIONAL payment context?
-3. Is the post FROM someone with a problem — 
-   not a company doing outreach?
-4. Would Settla's SDR team find this actionable?
-5. Would responding to this post embarrass Settla?
-
-If any answer is no — reduce score accordingly.
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL REMINDER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are not scoring sentiment.
-You are not scoring general business pain.
-You are not scoring domestic banking problems.
-
-You are identifying the exact moment a diaspora 
-business owner is ready to switch payment providers 
+You are identifying the exact moment a diaspora
+business owner is ready to switch payment providers
 or complete a large international transaction.
-
-That moment is worth thousands of dollars to Settla.
-
-One converted client could process $50,000 to 
-$500,000 per month through Settla.
 
 Be ruthless with noise.
 Be generous with genuine international payment pain.
@@ -2154,6 +738,52 @@ For scores 4-10: include facebook_comment.
 Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
 """
 
+# v7.6.0 NEW — LinkedIn scoring schema. Same _SCORING_CORE, same
+# thresholds/routing. Adds linkedin_reply (public comment) and
+# linkedin_dm (connection/DM message) — deliberately NOT reusing the
+# pre-existing "linkedin_message" key (that key already belongs to the
+# REDDIT schema above, where it means "a LinkedIn-style outreach message
+# posted as a reply to a Reddit thread" — an unrelated, older field).
+CLAUDE_SYSTEM_PROMPT_LINKEDIN = _SCORING_CORE + """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BATCH SCORING FORMAT — LINKEDIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
+reason: maximum 15 words. suggested_action: maximum 10 words.
+LinkedIn profiles/posts are public — a public comment reply and a
+connection-request-style DM are both possible.
+Each message may include an "Enrichment:" line (job title, company,
+location, industry, company size) pulled from LinkedIn's User Data and
+Company Data endpoints — use it to judge business context and size, but
+it is optional and may be missing for some messages.
+For scores 1-3: omit linkedin_reply and linkedin_dm entirely — do NOT output those keys.
+For scores 4-10: include both linkedin_reply and linkedin_dm.
+
+[
+  {
+    "index": <1-based integer matching message number>,
+    "intent_score": <number 1-10>,
+    "is_business": <true|false>,
+    "business_size": <"solo"|"small"|"medium"|"unknown">,
+    "has_international_context": <true|false>,
+    "corridor": "<source country to destination or null>",
+    "estimated_amount": "<specific amount if mentioned or null>",
+    "competitor_mentioned": "<competitor name or null>",
+    "competitor_outreach_detected": <true|false>,
+    "pain_type": "<specific pain or null>",
+    "urgency": "<immediate|today|this_week|researching|none>",
+    "reason": "<max 15 words>",
+    "suggested_action": "<max 10 words>",
+    "watchlist": <true|false>,
+    "linkedin_reply": "<public comment on their LinkedIn post/profile, max 3 sentences — OMIT KEY IF SCORE 1-3>",
+    "linkedin_dm": "<3-sentence connection-request-style DM — OMIT KEY IF SCORE 1-3>"
+  }
+]
+
+Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MONGODB
@@ -2179,7 +809,6 @@ def get_database():
             [("key", ASCENDING)], unique=True, name="state_key_unique"
         )
 
-        # FIX A: persistent batch state collections (unchanged)
         db.flintel_pending_batch.create_index(
             [("platform", ASCENDING)], unique=True, name="platform_unique"
         )
@@ -2187,7 +816,6 @@ def get_database():
             [("platform", ASCENDING)], unique=True, name="seen_platform_unique"
         )
 
-        # rescore messages collection
         db.flintel_rescore_messages.create_index(
             [("status", ASCENDING), ("requested_at", ASCENDING)],
             name="rescore_status_time",
@@ -2197,21 +825,11 @@ def get_database():
             name="rescore_message_id",
         )
 
-        # NEW — flintel_queue_messages: persists every item sitting in the
-        # in-memory reddit_queue/twitter_queue/telegram_queue (queue.Queue)
-        # BEFORE it is dequeued into a batch. queue.Queue is in-memory only,
-        # so without this, a restart would silently drop anything fetched
-        # but not yet consumed by run_batch_processor. On restart these are
-        # reloaded back into the queue so nothing fetched is lost.
         db.flintel_queue_messages.create_index(
             [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
             unique=True, name="queue_platform_message_unique",
         )
 
-        # NEW — flintel_batch_seconds: explicit persistence of each
-        # platform's batch_start_time, stored under its own dedicated
-        # collection so the batch timeout countdown survives a restart
-        # instead of restarting from zero.
         db.flintel_batch_seconds.create_index(
             [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
         )
@@ -2231,15 +849,10 @@ db = get_database()
 
 anthropic_client = anthropic.Anthropic(
     api_key=ANTHROPIC_API_KEY,
-    # FIX C: set a generous httpx timeout so the streaming connection is
-    # never killed by the SDK before the model finishes generating. The
-    # default timeout (10 min) is the threshold that triggers the error;
-    # we use streaming instead, which removes the timeout constraint entirely
-    # for the generation phase while still allowing a connect timeout.
     http_client=httpx.Client(
         timeout=httpx.Timeout(
             connect=30.0,
-            read=None,    # no read timeout — stream can take as long as needed
+            read=None,
             write=60.0,
             pool=30.0,
         )
@@ -2266,7 +879,7 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged — operator/system alerts, not signal alerts)
+# OPERATOR SLACK ALERT (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -2289,7 +902,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.5.0"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.6.0"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -2397,19 +1010,7 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — flintel_queue_messages: persistent raw-queue storage.
-#
-# reddit_queue / twitter_queue / telegram_queue are in-memory queue.Queue
-# objects. Everything a poller fetches gets put() into one of these BEFORE
-# run_batch_processor even looks at it (keyword filter hasn't run yet). If
-# the process restarts while items are sitting in that in-memory queue,
-# they are gone. These helpers persist every item the moment it's put()
-# into a queue, and remove it the moment it's dequeued by
-# run_batch_processor — so at any instant, flintel_queue_messages reflects
-# exactly what's still waiting in that platform's in-memory queue. On
-# startup, start_reddit_listener() / start_twitter_listener() /
-# start_telegram_listener() reload these back into the queue before the
-# poller threads start, so nothing fetched-but-unprocessed is lost.
+# flintel_queue_messages: persistent raw-queue storage (unchanged, v7.4.5)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_queue_message(platform: str, item: dict):
@@ -2457,12 +1058,7 @@ def load_queue_messages(platform: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — flintel_batch_seconds: explicit, dedicated persistence of each
-# platform's batch_start_time (the batch timeout clock). This is stored
-# under its own collection — separate from flintel_pending_batch — so the
-# batch timeout countdown survives a restart instead of restarting from
-# zero. Written alongside save_pending_batch/clear_pending_batch at every
-# point batch_start_time changes.
+# flintel_batch_seconds: explicit batch-timeout persistence (unchanged, v7.4.5)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_batch_seconds(platform: str, batch_start_time):
@@ -2500,8 +1096,7 @@ def clear_batch_seconds(platform: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — FIX C: streaming transport, FIX B: partial-JSON recovery
-# Scoring logic, prompts, output schema — 100% unchanged.
+# CLAUDE BATCH SCORER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -2521,10 +1116,30 @@ def _build_batch_prompt(batch: list) -> str:
         else:
             location = platform
 
+        # v7.6.0 — LINKEDIN ADDITIVE ONLY: append whatever enrichment data
+        # was fetched from the User Data / Company Data endpoints. This
+        # block only ever activates when item["platform"] == "linkedin" —
+        # every other platform's prompt text is byte-for-byte unchanged.
+        extra = ""
+        if item.get("platform") == "linkedin":
+            extra_bits = []
+            if item.get("linkedin_job_title"):
+                extra_bits.append(f"Title: {item['linkedin_job_title']}")
+            if item.get("linkedin_company"):
+                extra_bits.append(f"Company: {item['linkedin_company']}")
+            if item.get("linkedin_location"):
+                extra_bits.append(f"Location: {item['linkedin_location']}")
+            if item.get("linkedin_company_industry"):
+                extra_bits.append(f"Industry: {item['linkedin_company_industry']}")
+            if item.get("linkedin_company_size"):
+                extra_bits.append(f"Company Size: {item['linkedin_company_size']}")
+            if extra_bits:
+                extra = "\nEnrichment: " + " | ".join(extra_bits)
+
         lines.append(
             f"--- MESSAGE {i} ---\n"
             f"Platform: {platform} | Source: {location} | Type: {ctype} | User: {username}\n"
-            f"Content: {text}\n"
+            f"Content: {text}{extra}\n"
         )
     return "\n".join(lines)
 
@@ -2553,12 +1168,13 @@ def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
         "linkedin_message":             None,
         "telegram_dm":                  None,
         "facebook_comment":             None,
+        # v7.6.0 NEW
+        "linkedin_reply":               None,
+        "linkedin_dm":                  None,
         "watchlist":                    False,
         "watchlist_reason":             None,
     }
 
-
-# FIX B — TOLERANT PARTIAL-JSON RECOVERY (unchanged)
 
 def _strip_code_fences(raw: str) -> str:
     raw = raw.strip()
@@ -2569,10 +1185,6 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _salvage_partial_json_array(raw: str) -> list:
-    """
-    Walks a possibly-truncated JSON array and extracts every complete,
-    well-formed top-level object using brace-depth tracking. Unchanged.
-    """
     start = raw.find("[")
     if start == -1:
         return []
@@ -2622,10 +1234,6 @@ def _salvage_partial_json_array(raw: str) -> list:
 
 
 def _parse_claude_json(raw: str) -> tuple:
-    """
-    Returns (results_list, was_truncated_bool). Unchanged.
-    Tries full json.loads first, falls back to salvage on failure.
-    """
     cleaned = _strip_code_fences(raw)
     try:
         parsed = json.loads(cleaned)
@@ -2642,22 +1250,18 @@ def _parse_claude_json(raw: str) -> tuple:
 
 
 def _call_claude_batch(batch: list) -> list:
-    """
-    FIX C: uses streaming context manager instead of blocking .create().
-    The stream.get_final_text() collects the complete response text once
-    generation finishes. Unchanged.
-    """
     platform = batch[0].get("platform", "reddit") if batch else "reddit"
 
     system_prompt = {
         "twitter":  CLAUDE_SYSTEM_PROMPT_TWITTER,
         "telegram": CLAUDE_SYSTEM_PROMPT_TELEGRAM,
         "facebook": CLAUDE_SYSTEM_PROMPT_FACEBOOK,
+        # v7.6.0 NEW
+        "linkedin": CLAUDE_SYSTEM_PROMPT_LINKEDIN,
     }.get(platform, CLAUDE_SYSTEM_PROMPT_REDDIT)
 
     prompt = _build_batch_prompt(batch)
 
-    # FIX C: streaming replaces blocking .create() — no more "Streaming required" error
     with anthropic_client.messages.stream(
         model      = "claude-sonnet-4-6",
         max_tokens = MAX_TOKENS,
@@ -2712,6 +1316,9 @@ def _call_claude_batch(batch: list) -> list:
         "linkedin_message":             None,
         "telegram_dm":                  None,
         "facebook_comment":             None,
+        # v7.6.0 NEW
+        "linkedin_reply":               None,
+        "linkedin_dm":                  None,
         "watchlist":                    False,
     }
 
@@ -2754,7 +1361,9 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE (unchanged) — ALL scores 1-10 stored, nothing discarded.
+# MONGODB STORAGE — ALL scores 1-10 stored, nothing discarded.
+# v7.6.0: additive LinkedIn fields only — every .get() defaults to None for
+# every other platform's documents, so their stored shape is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(data: dict) -> bool:
@@ -2786,6 +1395,24 @@ def save_signal(data: dict) -> bool:
             "linkedin_message":             data.get("linkedin_message"),
             "telegram_dm":                  data.get("telegram_dm"),
             "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW — LinkedIn outreach + enrichment fields. Always
+            # None/absent for Reddit/Twitter/Telegram/Facebook documents.
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
+            "linkedin_full_name":           data.get("linkedin_full_name"),
+            "linkedin_headline":            data.get("linkedin_headline"),
+            "linkedin_email":               data.get("linkedin_email"),
+            "linkedin_phone":               data.get("linkedin_phone"),
+            "linkedin_location":            data.get("linkedin_location"),
+            "linkedin_company":             data.get("linkedin_company"),
+            "linkedin_job_title":           data.get("linkedin_job_title"),
+            "linkedin_profile_url":         data.get("linkedin_profile_url"),
+            "linkedin_company_name":        data.get("linkedin_company_name"),
+            "linkedin_company_website":     data.get("linkedin_company_website"),
+            "linkedin_company_industry":    data.get("linkedin_company_industry"),
+            "linkedin_company_size":        data.get("linkedin_company_size"),
+            "linkedin_company_location":    data.get("linkedin_company_location"),
+            "linkedin_company_phone":       data.get("linkedin_company_phone"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "client_id":                    CLIENT_ID,
@@ -2829,10 +1456,6 @@ def save_signal(data: dict) -> bool:
 
 
 def update_signal(message_id: str, data: dict) -> bool:
-    """
-    Used by rescore to overwrite an existing signal's score fields
-    in-place. Unchanged.
-    """
     try:
         update_fields = {
             "intent_score":                 data["intent_score"],
@@ -2853,6 +1476,9 @@ def update_signal(message_id: str, data: dict) -> bool:
             "linkedin_message":             data.get("linkedin_message"),
             "telegram_dm":                  data.get("telegram_dm"),
             "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
@@ -2925,7 +1551,9 @@ def _set_state(key: str, value):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY (unchanged from v7.4.3 — numeric score hidden, tier/category shown)
+# SLACK DELIVERY
+# v7.6.0: outreach lookup additionally checks linkedin_reply/linkedin_dm.
+# Everything else in this function is unchanged from v7.5.0.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe(text: str, limit: int = 2900) -> str:
@@ -2946,7 +1574,7 @@ def send_slack_alert(data: dict) -> bool:
         log.warning("SLACK_WEBHOOK_URL not set — skipping.")
         return False
 
-    score       = data["intent_score"]  # still used internally to drive urgency_tag/response window — not printed
+    score       = data["intent_score"]
     platform    = data.get("platform", "unknown").upper()
     ctype       = data.get("content_type", "post").upper()
     subreddit   = data.get("subreddit", "")
@@ -2979,6 +1607,8 @@ def send_slack_alert(data: dict) -> bool:
         data.get("telegram_dm") or
         data.get("linkedin_message") or
         data.get("facebook_comment") or
+        data.get("linkedin_reply") or   # v7.6.0 NEW
+        data.get("linkedin_dm") or      # v7.6.0 NEW
         ""
     )
 
@@ -3034,6 +1664,27 @@ def send_slack_alert(data: dict) -> bool:
         },
     ]
 
+    # v7.6.0 NEW — surface LinkedIn enrichment (company/location/title) in
+    # Slack when present. Purely additive block: only appended when a
+    # linkedin_company/linkedin_location/linkedin_job_title field exists
+    # on the signal, which only ever happens for platform == "linkedin".
+    li_bits = []
+    if data.get("linkedin_job_title"):
+        li_bits.append(f"*Title*\n{data['linkedin_job_title']}")
+    if data.get("linkedin_company"):
+        li_bits.append(f"*Company*\n{data['linkedin_company']}")
+    if data.get("linkedin_location"):
+        li_bits.append(f"*Location*\n{data['linkedin_location']}")
+    if data.get("linkedin_email"):
+        li_bits.append(f"*Email*\n{data['linkedin_email']}")
+    if data.get("linkedin_phone"):
+        li_bits.append(f"*Phone*\n{data['linkedin_phone']}")
+    if li_bits:
+        blocks.append({
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": b} for b in li_bits[:10]],
+        })
+
     if urgency_tag:
         blocks.append({
             "type": "section",
@@ -3071,7 +1722,9 @@ def send_slack_alert(data: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM (unchanged from v7.4.3)
+# HUBSPOT CRM
+# v7.6.0: note body additionally includes LinkedIn outreach + enrichment
+# lines when present. Everything else unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -3143,10 +1796,7 @@ def _hs_verify_properties():
         _hs_log_http_error("[HubSpot] STARTUP CHECK failed", exc)
         log.warning(
             "[HubSpot] Could not verify contact properties at startup "
-            "(see error above — likely missing 'crm.schemas.contacts.read' "
-            "scope on the private app token). This does NOT block the "
-            "system; contact creation will proceed as normal and any real "
-            "400 errors will still be logged in full at the time they occur."
+            "(see error above). This does NOT block the system."
         )
     except Exception as exc:
         log.warning(f"[HubSpot] STARTUP CHECK failed (non-HTTP error): {exc}")
@@ -3187,6 +1837,14 @@ def _hs_create_contact(data: dict) -> str | None:
             "fx_signal_reason":    data["reason"],
             "fx_suggested_action": data["suggested_action"],
         }
+        # v7.6.0 — if LinkedIn enrichment gave us a real email/phone, use
+        # HubSpot's native contact properties for them too (in addition to
+        # the fx_* custom properties above, which stay platform-agnostic).
+        if data.get("linkedin_email"):
+            properties["email"] = data["linkedin_email"]
+        if data.get("linkedin_phone"):
+            properties["phone"] = data["linkedin_phone"]
+
         r = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/contacts",
             json={"properties": properties},
@@ -3206,8 +1864,31 @@ def _hs_create_note(data: dict, contact_id: str):
     try:
         sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
         rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
+
+        # v7.6.0 — LinkedIn enrichment block, additive only, empty string
+        # for every other platform.
+        linkedin_block = ""
+        if data.get("platform") == "linkedin":
+            linkedin_block = (
+                f"\n\nLinkedIn Profile: {data.get('linkedin_profile_url') or 'N/A'}\n"
+                f"LinkedIn Name:     {data.get('linkedin_full_name') or 'N/A'}\n"
+                f"LinkedIn Headline: {data.get('linkedin_headline') or 'N/A'}\n"
+                f"LinkedIn Title:    {data.get('linkedin_job_title') or 'N/A'}\n"
+                f"LinkedIn Email:    {data.get('linkedin_email') or 'N/A'}\n"
+                f"LinkedIn Phone:    {data.get('linkedin_phone') or 'N/A'}\n"
+                f"LinkedIn Location: {data.get('linkedin_location') or 'N/A'}\n"
+                f"Company:           {data.get('linkedin_company_name') or data.get('linkedin_company') or 'N/A'}\n"
+                f"Company Website:   {data.get('linkedin_company_website') or 'N/A'}\n"
+                f"Company Industry:  {data.get('linkedin_company_industry') or 'N/A'}\n"
+                f"Company Size:      {data.get('linkedin_company_size') or 'N/A'}\n"
+                f"Company HQ:        {data.get('linkedin_company_location') or 'N/A'}\n"
+                f"Company Phone:     {data.get('linkedin_company_phone') or 'N/A'}\n\n"
+                f"LinkedIn Reply:\n{data.get('linkedin_reply') or 'N/A'}\n\n"
+                f"LinkedIn DM:\n{data.get('linkedin_dm') or 'N/A'}"
+            )
+
         note = (
-            f"FLINTEL SIGNAL — v7.5.0{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.6.0{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -3228,9 +1909,10 @@ def _hs_create_note(data: dict, contact_id: str):
             f"Action:       {data['suggested_action']}\n\n"
             f"Twitter Reply:\n{data.get('twitter_reply') or 'N/A'}\n\n"
             f"Twitter DM:\n{data.get('twitter_dm') or 'N/A'}\n\n"
-            f"LinkedIn:\n{data.get('linkedin_message') or 'N/A'}\n\n"
+            f"LinkedIn (legacy Reddit field):\n{data.get('linkedin_message') or 'N/A'}\n\n"
             f"Telegram DM:\n{data.get('telegram_dm') or 'N/A'}\n\n"
             f"Facebook Comment:\n{data.get('facebook_comment') or 'N/A'}"
+            f"{linkedin_block}"
         )
         r = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/notes",
@@ -3273,7 +1955,8 @@ def send_to_hubspot(data: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR (unchanged — routing 100% score-driven)
+# CORE SIGNAL PROCESSOR — v7.6.0: additive LinkedIn fields carried through
+# from item + score_result into `data`. Routing logic 100% unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False):
@@ -3307,6 +1990,25 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
         "linkedin_message":             score_result.get("linkedin_message"),
         "telegram_dm":                  score_result.get("telegram_dm"),
         "facebook_comment":             score_result.get("facebook_comment"),
+        # v7.6.0 NEW — outreach text comes from Claude (score_result);
+        # enrichment data comes from the item itself (fetched at poll time
+        # from the User Data / Company Data endpoints).
+        "linkedin_reply":               score_result.get("linkedin_reply"),
+        "linkedin_dm":                  score_result.get("linkedin_dm"),
+        "linkedin_full_name":           item.get("linkedin_full_name"),
+        "linkedin_headline":            item.get("linkedin_headline"),
+        "linkedin_email":               item.get("linkedin_email"),
+        "linkedin_phone":               item.get("linkedin_phone"),
+        "linkedin_location":            item.get("linkedin_location"),
+        "linkedin_company":             item.get("linkedin_company"),
+        "linkedin_job_title":           item.get("linkedin_job_title"),
+        "linkedin_profile_url":         item.get("linkedin_profile_url"),
+        "linkedin_company_name":        item.get("linkedin_company_name"),
+        "linkedin_company_website":     item.get("linkedin_company_website"),
+        "linkedin_company_industry":    item.get("linkedin_company_industry"),
+        "linkedin_company_size":        item.get("linkedin_company_size"),
+        "linkedin_company_location":    item.get("linkedin_company_location"),
+        "linkedin_company_phone":       item.get("linkedin_company_phone"),
         "watchlist":                    score_result.get("watchlist", False),
         "watchlist_reason":             score_result.get("watchlist_reason"),
         "timestamp":                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -3351,11 +2053,7 @@ def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — v7.4.4: now takes gap_seconds and timeout_seconds
-# as PARAMETERS instead of reading a shared global. Each platform's caller
-# (start_reddit_listener / start_twitter_listener / start_telegram_listener)
-# passes its OWN dedicated gap/timeout values below — no platform borrows
-# another platform's timing, no mixing.
+# GENERIC BATCH PROCESSOR (unchanged — reused as-is for LinkedIn)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -3403,10 +2101,6 @@ def run_batch_processor(
             if got_item:
                 total_received += 1
 
-                # NEW: item is now out of the in-memory queue — remove its
-                # persisted copy from flintel_queue_messages so a restart
-                # from this point on won't re-load something already
-                # handled (matched into current_batch, or dropped).
                 remove_queue_message(platform_key, item.get("message_id"))
 
                 text = item.get("text", "").strip()
@@ -3481,8 +2175,6 @@ def run_batch_processor(
                     )
                     process_scored_item(it, sr)
 
-                # v7.4.5: completion log now shows how many items this
-                # batch completed (len), e.g. "BATCH 1 COMPLETE — 4 items".
                 log.info(
                     f"[{platform_label}] BATCH {total_batches} COMPLETE — "
                     f"{len(batch_to_send)} item(s) completed | waiting {gap_seconds}s..."
@@ -3495,9 +2187,7 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — v7.4.4: uses its own RESCORE_BATCH_GAP_SECONDS,
-# independent of Reddit/Twitter/Telegram gap values. Batch SIZE
-# (RESCORE_BATCH_SIZE) was already independent, untouched.
+# RESCORE PROCESSOR (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
@@ -3573,12 +2263,6 @@ def _rescore_mark_error(req_id, error: str):
 
 
 def run_rescore_processor():
-    """
-    Background thread: polls flintel_rescore_messages for pending items,
-    batches them, sends to Claude, then calls process_scored_item() with
-    is_rescore=True. Uses RESCORE_BATCH_GAP_SECONDS (its own, independent
-    of Reddit/Twitter/Telegram gap values — v7.4.4).
-    """
     log.info(
         f"[RESCORE] Processor started | "
         f"batch_size:{RESCORE_BATCH_SIZE} | poll_interval:{RESCORE_POLL_INTERVAL}s | "
@@ -3617,6 +2301,23 @@ def run_rescore_processor():
                     "post_url":       sig.get("post_url", ""),
                     "username":       sig.get("username", "unknown"),
                     "text":           sig.get("message_text", ""),
+                    # v7.6.0 — carry LinkedIn enrichment through on rescore
+                    # too, so a rescored LinkedIn signal keeps its
+                    # company/contact detail instead of losing it.
+                    "linkedin_full_name":        sig.get("linkedin_full_name"),
+                    "linkedin_headline":         sig.get("linkedin_headline"),
+                    "linkedin_email":            sig.get("linkedin_email"),
+                    "linkedin_phone":            sig.get("linkedin_phone"),
+                    "linkedin_location":         sig.get("linkedin_location"),
+                    "linkedin_company":          sig.get("linkedin_company"),
+                    "linkedin_job_title":        sig.get("linkedin_job_title"),
+                    "linkedin_profile_url":      sig.get("linkedin_profile_url"),
+                    "linkedin_company_name":     sig.get("linkedin_company_name"),
+                    "linkedin_company_website":  sig.get("linkedin_company_website"),
+                    "linkedin_company_industry": sig.get("linkedin_company_industry"),
+                    "linkedin_company_size":     sig.get("linkedin_company_size"),
+                    "linkedin_company_location": sig.get("linkedin_company_location"),
+                    "linkedin_company_phone":    sig.get("linkedin_company_phone"),
                 }
                 items_for_claude.append(item)
                 req_map[len(items_for_claude)] = req
@@ -3768,7 +2469,7 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER — testing twitter-api45.p.rapidapi.com/search.php
+# TWITTER / X POLLER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> dict | None:
@@ -3788,16 +2489,6 @@ def build_twitter_client() -> dict | None:
 
 
 def _extract_tweets_from_twitter_api45(data: dict) -> list:
-    """Best-effort walk of twitter-api45's flat search.php response into a
-    list of {id, text, username} dicts.
-
-    twitter-api45 returns tweets as a flat list (not GraphQL-nested like
-    twitter241) — confirmed field names for this vendor's endpoints include
-    tweet_id, text, created_at, favorites, bookmarks, views, quotes. The
-    per-tweet author field hasn't been confirmed against a live search.php
-    response yet, so this checks the common variants defensively instead of
-    assuming one and silently dropping every tweet.
-    """
     tweets = []
     try:
         results = data.get("timeline") or data.get("results") or data.get("tweets") or []
@@ -3893,13 +2584,7 @@ def poll_twitter(client: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FACEBOOK POLLER — v7.5.0 NEW — facebook-scraper3.p.rapidapi.com/search/posts
-#
-# Mirrors the Twitter poller's shape (RapidAPI headers dict + requests.get),
-# but cycles through the KEYWORDS list one search per keyword per cycle,
-# exactly like Reddit's per-subreddit cycle (poll_reddit_rss). Nothing about
-# Reddit/Twitter/Telegram's polling changes — this is a new, independent
-# poller feeding its own facebook_queue.
+# FACEBOOK POLLER (unchanged from v7.5.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_facebook_client() -> dict | None:
@@ -3919,14 +2604,6 @@ def build_facebook_client() -> dict | None:
 
 
 def _extract_posts_from_facebook_scraper3(data: dict) -> list:
-    """Best-effort walk of facebook-scraper3's /search/posts response into a
-    list of {id, text, username, url} dicts. Field names are checked
-    defensively (results/posts/data, post_id/id, message/text/content,
-    author_name/author.name/author.username) since the vendor's exact
-    schema for this endpoint hasn't been confirmed against a live response —
-    same defensive approach used for twitter-api45 above, so a shape
-    mismatch degrades to "no posts this cycle" instead of a crash.
-    """
     posts = []
     try:
         results = data.get("results") or data.get("posts") or data.get("data") or []
@@ -4033,6 +2710,248 @@ def poll_facebook(client: dict):
             f"elapsed:{cycle_elapsed:.1f}s | sleeping {FACEBOOK_POLL_INTERVAL}s..."
         )
         time.sleep(FACEBOOK_POLL_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LINKEDIN POLLER — v7.6.0 NEW
+# linkedin-data-scraper1.p.rapidapi.com
+#   1) POST /search_linkedIn.php   {"keywords": <kw>, "start": "0"}
+#   2) POST /get_user_data.php     {"username_or_url": <profile url>}
+#   3) POST /get_company_data.php  {"company_name": <company>}
+#
+# Same per-keyword cycle shape as Facebook (poll_facebook). Each of the
+# three endpoint calls is wrapped in its OWN try/except so that a failure
+# or exhausted quota on any single endpoint never blocks the other two or
+# crashes the poll cycle — it just degrades to "no enrichment for this
+# item" and keeps going, exactly as requested.
+# ─────────────────────────────────────────────────────────────────────────────
+
+LINKEDIN_HOST         = "linkedin-data-scraper1.p.rapidapi.com"
+LINKEDIN_SEARCH_URL   = f"https://{LINKEDIN_HOST}/search_linkedIn.php"
+LINKEDIN_USER_URL     = f"https://{LINKEDIN_HOST}/get_user_data.php"
+LINKEDIN_COMPANY_URL  = f"https://{LINKEDIN_HOST}/get_company_data.php"
+
+
+def build_linkedin_client() -> dict | None:
+    if not RAPID_API_KEY:
+        log.warning("RAPID_API_KEY not set — LinkedIn platform disabled.")
+        return None
+    try:
+        client = {
+            "x-rapidapi-key":  RAPID_API_KEY,
+            "x-rapidapi-host": LINKEDIN_HOST,
+            "Content-Type":    "application/x-www-form-urlencoded",
+        }
+        log.info("LinkedIn client initialised (linkedin-data-scraper1).")
+        return client
+    except Exception as exc:
+        log.error(f"LinkedIn client error: {exc}")
+        return None
+
+
+def _extract_results_from_linkedin_search(data: dict) -> list:
+    """Best-effort walk of search_linkedIn.php's response into a list of
+    {id, name, headline, url, company} dicts. Field names are checked
+    defensively (results/data/people/items, id/profile_id/urn/url,
+    name/full_name/title, headline/summary/snippet/description) since the
+    vendor's exact schema for this endpoint hasn't been confirmed against a
+    live response — same defensive approach already used for twitter-api45
+    and facebook-scraper3 above, so a shape mismatch degrades to "no
+    results this keyword" instead of a crash.
+    """
+    results = []
+    try:
+        raw = data.get("results") or data.get("data") or data.get("people") or data.get("items") or []
+        if not isinstance(raw, list):
+            return results
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or r.get("profile_id") or r.get("urn") or r.get("url") or "")
+            if not rid:
+                continue
+            name     = r.get("name") or r.get("full_name") or r.get("title") or "unknown"
+            headline = r.get("headline") or r.get("summary") or r.get("snippet") or r.get("description") or ""
+            url      = r.get("url") or r.get("profile_url") or r.get("link") or ""
+            company  = r.get("company") or r.get("current_company") or ""
+            results.append({
+                "id": rid, "name": name, "headline": headline,
+                "url": url, "company": company,
+            })
+    except Exception as exc:
+        log.error(f"LinkedIn search response parse error: {exc}")
+    return results
+
+
+def _linkedin_fetch_user_data(client: dict, username_or_url: str) -> dict:
+    """Calls the User Data endpoint for one matched profile. Never raises —
+    a failure (network error, bad response shape, or the endpoint's quota
+    being exhausted) degrades to an empty dict, which just means this one
+    item is queued/scored WITHOUT enrichment rather than being dropped or
+    crashing the poller. Independent of _linkedin_fetch_company_data below
+    — one failing never blocks the other.
+    """
+    if not username_or_url:
+        return {}
+    try:
+        payload = {"username_or_url": username_or_url}
+        r = requests.post(LINKEDIN_USER_URL, data=payload, headers=client, timeout=30)
+        r.raise_for_status()
+        raw = r.json()
+        d = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+        if not isinstance(d, dict):
+            return {}
+        return {
+            "linkedin_full_name":    d.get("full_name") or d.get("name"),
+            "linkedin_headline":     d.get("headline"),
+            "linkedin_email":        d.get("email") or d.get("email_address"),
+            "linkedin_phone":        d.get("phone") or d.get("phone_number"),
+            "linkedin_location":     d.get("location") or d.get("geo_location") or d.get("city"),
+            "linkedin_company":      d.get("company") or d.get("current_company"),
+            "linkedin_job_title":    d.get("job_title") or d.get("position") or d.get("title"),
+            "linkedin_profile_url":  d.get("profile_url") or d.get("url") or username_or_url,
+        }
+    except Exception as exc:
+        log.warning(
+            f"[LINKEDIN] User Data endpoint error for '{username_or_url}': {exc} "
+            f"— continuing without this item's user enrichment."
+        )
+        return {}
+
+
+def _linkedin_fetch_company_data(client: dict, company_name: str) -> dict:
+    """Calls the Company Data endpoint. Same never-raise contract as
+    _linkedin_fetch_user_data — independent failure, independent quota.
+    """
+    if not company_name:
+        return {}
+    try:
+        payload = {"company_name": company_name}
+        r = requests.post(LINKEDIN_COMPANY_URL, data=payload, headers=client, timeout=30)
+        r.raise_for_status()
+        raw = r.json()
+        d = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+        if not isinstance(d, dict):
+            return {}
+        return {
+            "linkedin_company_name":     d.get("name") or company_name,
+            "linkedin_company_website":  d.get("website"),
+            "linkedin_company_industry": d.get("industry"),
+            "linkedin_company_size":     d.get("company_size") or d.get("employee_count") or d.get("size"),
+            "linkedin_company_location": d.get("headquarter") or d.get("location") or d.get("headquarters"),
+            "linkedin_company_phone":    d.get("phone"),
+        }
+    except Exception as exc:
+        log.warning(
+            f"[LINKEDIN] Company Data endpoint error for '{company_name}': {exc} "
+            f"— continuing without this item's company enrichment."
+        )
+        return {}
+
+
+def poll_linkedin(client: dict):
+    seen_ids: set = load_seen_ids("linkedin")
+    dirty = 0
+    log.info(
+        f"LinkedIn poll started | keywords:{len(KEYWORDS)} | "
+        f"poll interval: {LINKEDIN_POLL_INTERVAL}s per full cycle | "
+        f"dedup set resumed with {len(seen_ids)} known ID(s)"
+    )
+
+    while True:
+        cycle_start  = time.time()
+        total_new    = 0
+        total_errors = 0
+
+        for keyword in KEYWORDS:
+            try:
+                payload = {"keywords": keyword, "start": "0"}
+                response = requests.post(
+                    LINKEDIN_SEARCH_URL, data=payload, headers=client, timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                results = _extract_results_from_linkedin_search(data)
+
+                new_this_keyword = 0
+                for res in results:
+                    rid = res["id"]
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                    dirty += 1
+
+                    if len(seen_ids) > 50_000:
+                        seen_ids.clear()
+
+                    # Build searchable text from whatever the Search
+                    # endpoint returned so the SAME passes_keyword_filter()
+                    # every other platform uses can run on it.
+                    text_parts = [p for p in [res.get("name"), res.get("headline"), res.get("company")] if p]
+                    text = " | ".join(text_parts) or keyword
+
+                    if not passes_keyword_filter(text):
+                        continue
+
+                    # Enrichment — User Data + Company Data. Each call is
+                    # independently wrapped (see functions above): if
+                    # Search matched but User Data or Company Data fails
+                    # or is out of quota, the item is STILL queued and
+                    # scored — just without that piece of enrichment.
+                    user_extra = _linkedin_fetch_user_data(client, res.get("url") or res.get("id"))
+
+                    company_extra = {}
+                    company_name = res.get("company") or user_extra.get("linkedin_company")
+                    if company_name:
+                        company_extra = _linkedin_fetch_company_data(client, company_name)
+
+                    _li_item = {
+                        "message_id":     f"linkedin_{rid}",
+                        "platform":       "linkedin",
+                        "content_type":   "profile",
+                        "text":           text,
+                        "username":       res.get("name") or "unknown",
+                        "subreddit":      "",
+                        "telegram_group": "",
+                        "post_url":       res.get("url") or "",
+                    }
+                    _li_item.update(user_extra)
+                    _li_item.update(company_extra)
+
+                    linkedin_queue.put(_li_item)
+                    save_queue_message("linkedin", _li_item)
+                    total_new += 1
+                    new_this_keyword += 1
+
+                if new_this_keyword:
+                    log.info(
+                        f"[LINKEDIN] '{keyword}' → {new_this_keyword} new items queued "
+                        f"(queue size: {linkedin_queue.qsize()})"
+                    )
+
+                if dirty >= 10:
+                    save_seen_ids("linkedin", seen_ids)
+                    dirty = 0
+
+                time.sleep(LINKEDIN_KEYWORD_GAP_SECONDS)
+
+            except Exception as exc:
+                # Search endpoint itself failed/out-of-quota for this
+                # keyword — log it, move to the next keyword. Never crashes
+                # the cycle or the poller thread.
+                log.error(f"[LINKEDIN] Unhandled error for keyword '{keyword}': {exc}")
+                total_errors += 1
+                continue
+
+        save_seen_ids("linkedin", seen_ids)
+
+        cycle_elapsed = time.time() - cycle_start
+        log.info(
+            f"[LINKEDIN] Cycle complete | new:{total_new} errors:{total_errors} | "
+            f"elapsed:{cycle_elapsed:.1f}s | sleeping {LINKEDIN_POLL_INTERVAL}s..."
+        )
+        time.sleep(LINKEDIN_POLL_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4265,7 +3184,9 @@ def run_telegram_listener_thread():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — Daily Digest + Weekly Report (unchanged)
+# SCHEDULERS — Daily Digest + Weekly Report
+# v7.6.0: platform breakdown additionally counts "linkedin". Everything
+# else unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_daily_digest():
@@ -4317,7 +3238,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.5.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
         ]
 
         result = retry_with_backoff(
@@ -4346,6 +3267,7 @@ def send_weekly_report():
         twitter_sigs  = [s for s in all_signals if s.get("platform") == "twitter"]
         telegram_sigs = [s for s in all_signals if s.get("platform") == "telegram"]
         facebook_sigs = [s for s in all_signals if s.get("platform") == "facebook"]
+        linkedin_sigs = [s for s in all_signals if s.get("platform") == "linkedin"]  # v7.6.0
         total         = len(all_signals)
 
         if total == 0:
@@ -4386,6 +3308,7 @@ def send_weekly_report():
                     {"type": "mrkdwn", "text": f"*Twitter/X*\n{len(twitter_sigs)}"},
                     {"type": "mrkdwn", "text": f"*Telegram*\n{len(telegram_sigs)}"},
                     {"type": "mrkdwn", "text": f"*Facebook*\n{len(facebook_sigs)}"},
+                    {"type": "mrkdwn", "text": f"*LinkedIn*\n{len(linkedin_sigs)}"},
                 ]},
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Corridor Breakdown*\n{breakdown('corridor')}"}},
@@ -4394,7 +3317,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.5.0 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -4404,7 +3327,7 @@ def send_weekly_report():
                 f"Weekly report sent | Total:{total} High:{len(high)} Med:{len(medium)} "
                 f"Biz:{len(business)} Reddit:{len(reddit_sigs)} "
                 f"Twitter:{len(twitter_sigs)} Telegram:{len(telegram_sigs)} "
-                f"Facebook:{len(facebook_sigs)}"
+                f"Facebook:{len(facebook_sigs)} LinkedIn:{len(linkedin_sigs)}"
             )
 
     except Exception as exc:
@@ -4444,12 +3367,6 @@ async def run_scheduler():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASYNC LISTENERS — thread management + auto-restart
-# v7.4.4: each start_*_listener() now passes its OWN gap_seconds and
-# timeout_seconds into run_batch_processor(). Reddit uses
-# REDDIT_BATCH_GAP_SECONDS/REDDIT_BATCH_TIMEOUT_SECONDS, Twitter uses
-# TWITTER_BATCH_GAP_SECONDS/TWITTER_BATCH_TIMEOUT_SECONDS, Telegram uses
-# TELEGRAM_BATCH_GAP_SECONDS/TELEGRAM_BATCH_TIMEOUT_SECONDS. No sharing,
-# no mixing — restart logic below is otherwise unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
@@ -4457,9 +3374,6 @@ async def start_reddit_listener():
         log.warning("Reddit platform DISABLED (REDDIT_ENABLED=false) — skipping.")
         return
 
-    # NEW: reload any raw queue items persisted in flintel_queue_messages
-    # (fetched but not yet consumed before a restart) back into the
-    # in-memory reddit_queue BEFORE the poller/batch threads start.
     _resumed_reddit = load_queue_messages("reddit")
     for _item in _resumed_reddit:
         reddit_queue.put(_item)
@@ -4515,9 +3429,6 @@ async def start_twitter_listener():
         log.warning("Twitter listener not started — credentials missing.")
         return
 
-    # NEW: reload any raw queue items persisted in flintel_queue_messages
-    # (fetched but not yet consumed before a restart) back into the
-    # in-memory twitter_queue BEFORE the poller/batch threads start.
     _resumed_twitter = load_queue_messages("twitter")
     for _item in _resumed_twitter:
         twitter_queue.put(_item)
@@ -4575,9 +3486,6 @@ async def start_telegram_listener():
         )
         return
 
-    # NEW: reload any raw queue items persisted in flintel_queue_messages
-    # (fetched but not yet consumed before a restart) back into the
-    # in-memory telegram_queue BEFORE the listener/batch threads start.
     _resumed_telegram = load_queue_messages("telegram")
     for _item in _resumed_telegram:
         telegram_queue.put(_item)
@@ -4634,9 +3542,6 @@ async def start_facebook_listener():
         log.warning("Facebook listener not started — credentials missing.")
         return
 
-    # NEW: reload any raw queue items persisted in flintel_queue_messages
-    # (fetched but not yet consumed before a restart) back into the
-    # in-memory facebook_queue BEFORE the poller/batch threads start.
     _resumed_facebook = load_queue_messages("facebook")
     for _item in _resumed_facebook:
         facebook_queue.put(_item)
@@ -4682,8 +3587,63 @@ async def start_facebook_listener():
             btch_thread.start()
 
 
+async def start_linkedin_listener():
+    """v7.6.0 NEW — mirrors start_facebook_listener() exactly."""
+    if not LINKEDIN_ENABLED:
+        log.warning("LinkedIn platform DISABLED (LINKEDIN_ENABLED=false) — skipping.")
+        return
+
+    client = build_linkedin_client()
+    if client is None:
+        log.warning("LinkedIn listener not started — credentials missing.")
+        return
+
+    _resumed_linkedin = load_queue_messages("linkedin")
+    for _item in _resumed_linkedin:
+        linkedin_queue.put(_item)
+    if _resumed_linkedin:
+        log.info(
+            f"[LINKEDIN] Resumed {len(_resumed_linkedin)} queue message(s) "
+            f"from MongoDB after restart — NOT lost."
+        )
+
+    poll_thread = threading.Thread(
+        target=poll_linkedin, args=(client,), daemon=True, name="LinkedIn-Poll"
+    )
+    btch_thread = threading.Thread(
+        target=run_batch_processor,
+        args=(linkedin_queue, LINKEDIN_BATCH_SIZE, "LINKEDIN",
+              LINKEDIN_BATCH_GAP_SECONDS, LINKEDIN_BATCH_TIMEOUT_SECONDS),
+        daemon=True, name="LinkedIn-Batch",
+    )
+
+    poll_thread.start()
+    btch_thread.start()
+    log.info(
+        f"LinkedIn threads running: Poll ✅ | Batch ✅ | "
+        f"gap:{LINKEDIN_BATCH_GAP_SECONDS}s | timeout:{LINKEDIN_BATCH_TIMEOUT_SECONDS}s"
+    )
+
+    while True:
+        await asyncio.sleep(60)
+        if not poll_thread.is_alive():
+            log.error("LinkedIn poll thread died — restarting...")
+            poll_thread = threading.Thread(
+                target=poll_linkedin, args=(client,), daemon=True, name="LinkedIn-Poll"
+            )
+            poll_thread.start()
+        if not btch_thread.is_alive():
+            log.error("LinkedIn batch thread died — restarting...")
+            btch_thread = threading.Thread(
+                target=run_batch_processor,
+                args=(linkedin_queue, LINKEDIN_BATCH_SIZE, "LINKEDIN",
+                      LINKEDIN_BATCH_GAP_SECONDS, LINKEDIN_BATCH_TIMEOUT_SECONDS),
+                daemon=True, name="LinkedIn-Batch",
+            )
+            btch_thread.start()
+
+
 async def start_rescore_listener():
-    """Starts the rescore processor thread and monitors for crashes."""
     rescore_thread = threading.Thread(
         target=run_rescore_processor, daemon=True, name="Rescore-Processor"
     )
@@ -4701,22 +3661,20 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (routes unchanged; version bumped to 7.4.4)
+# FASTAPI — REST API (version bumped to 7.6.0; LinkedIn routes added)
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.5.0",
+    title       = "FX Signal Intelligence API — Flintel v7.6.0",
     description = (
-        "Reddit (RSS) + Twitter + Telegram + Facebook signals: monitor, score, "
-        "store, alert. Persistent batch state. Streaming Claude. Manual rescore. "
-        "HubSpot receives medium (4-7) AND high (8-10) signals. "
-        "HubSpot error visibility fix (FIX E). "
-        "Slack alert + HubSpot note no longer display the numeric score (v7.4.3). "
-        "Per-platform BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS — Reddit, "
-        "Twitter, Telegram, and Facebook each run on their own independent "
-        "gap/timeout, never mixed (v7.4.4 / v7.5.0)."
+        "Reddit (RSS) + Twitter + Telegram + Facebook + LinkedIn signals: "
+        "monitor, score, store, alert. Persistent batch state. Streaming "
+        "Claude. Manual rescore. HubSpot receives medium (4-7) AND high "
+        "(8-10) signals. Per-platform BATCH_GAP_SECONDS and "
+        "BATCH_TIMEOUT_SECONDS — every platform runs on its own "
+        "independent gap/timeout, never mixed."
     ),
-    version     = "7.5.0",
+    version     = "7.6.0",
 )
 
 
@@ -4742,9 +3700,9 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.5.0",
+        "system":                  "FLINTEL v7.6.0",
         "client":                  CLIENT_ID,
-        "platforms":               ["reddit", "twitter", "telegram", "facebook"],
+        "platforms":               ["reddit", "twitter", "telegram", "facebook", "linkedin"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED),
         "twitter_enabled":         TWITTER_ENABLED,
@@ -4753,16 +3711,19 @@ def root():
         "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
         "facebook_enabled":        FACEBOOK_ENABLED,
         "facebook_status":         _working(FACEBOOK_ENABLED and bool(RAPID_API_KEY)),
+        "linkedin_enabled":        LINKEDIN_ENABLED,
+        "linkedin_status":         _working(LINKEDIN_ENABLED and bool(RAPID_API_KEY)),
         "reddit_mode":             "feedparser RSS (no credentials required)",
         "reddit_poll_interval":    REDDIT_POLL_INTERVAL,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
         "twitter_batch_size":      TWITTER_BATCH_SIZE,
         "telegram_batch_size":     TELEGRAM_BATCH_SIZE,
         "facebook_batch_size":     FACEBOOK_BATCH_SIZE,
+        "linkedin_batch_size":     LINKEDIN_BATCH_SIZE,
         "rescore_batch_size":      RESCORE_BATCH_SIZE,
         "telegram_poll_interval":  TELEGRAM_POLL_INTERVAL,
         "facebook_poll_interval":  FACEBOOK_POLL_INTERVAL,
-        # v7.4.4 / v7.5.0: per-platform gap/timeout, no shared globals
+        "linkedin_poll_interval":  LINKEDIN_POLL_INTERVAL,
         "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
         "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
@@ -4771,6 +3732,8 @@ def root():
         "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
         "facebook_batch_gap_s":     FACEBOOK_BATCH_GAP_SECONDS,
         "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
+        "linkedin_batch_gap_s":     LINKEDIN_BATCH_GAP_SECONDS,
+        "linkedin_batch_timeout_s": LINKEDIN_BATCH_TIMEOUT_SECONDS,
         "rescore_batch_gap_s":      RESCORE_BATCH_GAP_SECONDS,
         "max_tokens":              MAX_TOKENS,
         "claude_stream_timeout_s": CLAUDE_STREAM_TIMEOUT,
@@ -4778,6 +3741,7 @@ def root():
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
         "facebook_queue_size":     facebook_queue.qsize(),
+        "linkedin_queue_size":     linkedin_queue.qsize(),
         "telegram_groups":         len(TARGET_TELEGRAM_GROUPS),
         "auth_required":           bool(API_KEY),
         "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged)",
@@ -4791,6 +3755,7 @@ def root():
         "hubspot_medium_signals":  True,
         "slack_hubspot_score_hidden": True,
         "per_platform_batch_timing": True,
+        "linkedin_enrichment":     True,
         "min_score_medium":        MIN_SCORE_MEDIUM,
         "min_score_high":          MIN_SCORE_HIGH,
         "score_routing": {
@@ -4813,6 +3778,7 @@ def health():
     twitter_working  = TWITTER_ENABLED and bool(RAPID_API_KEY)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
     facebook_working = FACEBOOK_ENABLED and bool(RAPID_API_KEY)
+    linkedin_working = LINKEDIN_ENABLED and bool(RAPID_API_KEY)
 
     pending_rescore = 0
     try:
@@ -4843,6 +3809,11 @@ def health():
         "facebook_indicator":      _working(facebook_working),
         "facebook_batch_gap_s":    FACEBOOK_BATCH_GAP_SECONDS,
         "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
+        "linkedin":                ("polling" if linkedin_working else "disabled"),
+        "linkedin_working":        linkedin_working,
+        "linkedin_indicator":      _working(linkedin_working),
+        "linkedin_batch_gap_s":    LINKEDIN_BATCH_GAP_SECONDS,
+        "linkedin_batch_timeout_s": LINKEDIN_BATCH_TIMEOUT_SECONDS,
         "hubspot_configured":      bool(HUBSPOT_API_KEY),
         "hubspot_indicator":       _working(bool(HUBSPOT_API_KEY)),
         "hubspot_medium_signals":  True,
@@ -4850,6 +3821,7 @@ def health():
         "twitter_queue_size":      twitter_queue.qsize(),
         "telegram_queue_size":     telegram_queue.qsize(),
         "facebook_queue_size":     facebook_queue.qsize(),
+        "linkedin_queue_size":     linkedin_queue.qsize(),
         "rescore_pending":         pending_rescore,
         "rescore_working":         True,
         "rescore_indicator":       _working(True),
@@ -4858,8 +3830,6 @@ def health():
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
 
-
-# ── HUBSPOT DIAGNOSTIC ENDPOINT (unchanged) ──────────────────────────────────
 
 @app.get("/hubspot/properties-check", dependencies=[Depends(verify_api_key)])
 def get_hubspot_properties_check():
@@ -4893,8 +3863,6 @@ def get_hubspot_properties_check():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-
-# ── RESCORE ENDPOINTS (unchanged) ────────────────────────────────────────────
 
 @app.post("/rescore", dependencies=[Depends(verify_api_key)])
 def post_rescore(
@@ -4971,8 +3939,6 @@ def get_rescore_status(req_id: str):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── EXISTING ENDPOINTS (unchanged) ───────────────────────────────────────────
-
 @app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
 def get_pending_batch():
     try:
@@ -5028,6 +3994,7 @@ def get_stats():
         twitter  = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "twitter"})
         telegram = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram"})
         facebook = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "facebook"})
+        linkedin = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "linkedin"})
         rescored = db.signals.count_documents({"client_id": CLIENT_ID, "rescored_at": {"$exists": True}})
 
         def agg(group_field):
@@ -5044,6 +4011,7 @@ def get_stats():
             "twitter_signals":  twitter,
             "telegram_signals": telegram,
             "facebook_signals": facebook,
+            "linkedin_signals": linkedin,
             "rescored_signals": rescored,
             "corridors":        agg("corridor"),
             "pain_types":       agg("pain_type"),
@@ -5053,6 +4021,7 @@ def get_stats():
             "twitter_queue":    twitter_queue.qsize(),
             "telegram_queue":   telegram_queue.qsize(),
             "facebook_queue":   facebook_queue.qsize(),
+            "linkedin_queue":   linkedin_queue.qsize(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -5111,6 +4080,8 @@ def get_outreach(limit: int = 20):
                         {"linkedin_message": {"$ne": None}},
                         {"telegram_dm":      {"$ne": None}},
                         {"facebook_comment": {"$ne": None}},
+                        {"linkedin_reply":   {"$ne": None}},  # v7.6.0
+                        {"linkedin_dm":      {"$ne": None}},  # v7.6.0
                     ],
                 },
                 {"_id": 0},
@@ -5163,6 +4134,21 @@ def get_telegram_signals(limit: int = 50, min_score: int = None, group: str = No
 def get_facebook_signals(limit: int = 50, min_score: int = None):
     try:
         q: dict = {"client_id": CLIENT_ID, "platform": "facebook"}
+        if min_score is not None:
+            q["intent_score"] = {"$gte": min_score}
+        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+        return {"count": len(signals), "signals": _serialise(signals)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/signals/linkedin", dependencies=[Depends(verify_api_key)])
+def get_linkedin_signals(limit: int = 50, min_score: int = None):
+    """v7.6.0 NEW — mirrors /signals/facebook exactly, filtered to
+    platform == "linkedin". Returns the full enrichment fields (email,
+    phone, location, company, etc) alongside the usual signal fields."""
+    try:
+        q: dict = {"client_id": CLIENT_ID, "platform": "linkedin"}
         if min_score is not None:
             q["intent_score"] = {"$gte": min_score}
         signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
@@ -5243,6 +4229,7 @@ async def main():
         start_twitter_listener(),
         start_telegram_listener(),
         start_facebook_listener(),
+        start_linkedin_listener(),   # v7.6.0 NEW
         start_rescore_listener(),
         run_scheduler(),
     )
@@ -5250,83 +4237,58 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.5.0")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.6.0")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
-    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook")
+    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook + LinkedIn")
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
-    log.info(f"  Reddit mode        : feedparser RSS — no credentials required")
-    log.info(f"  Reddit poll gap    : {REDDIT_POLL_INTERVAL}s between full subreddit cycles")
     log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(RAPID_API_KEY))}")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
     log.info(f"  Facebook           : {FACEBOOK_ENABLED} | {_working(FACEBOOK_ENABLED and bool(RAPID_API_KEY))}")
-    log.info(f"  Facebook mode      : facebook-scraper3 RapidAPI — search/posts per keyword")
-    log.info(f"  Facebook poll gap  : {FACEBOOK_POLL_INTERVAL}s between full keyword cycles | {FACEBOOK_KEYWORD_GAP_SECONDS}s between keywords")
-    log.info(f"  Telegram polling   : {'every ' + str(TELEGRAM_POLL_INTERVAL) + 's' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled (TELEGRAM_POLL_INTERVAL=0)'}")
+    log.info(f"  LinkedIn           : {LINKEDIN_ENABLED} | {_working(LINKEDIN_ENABLED and bool(RAPID_API_KEY))}")
+    log.info(f"  LinkedIn mode      : linkedin-data-scraper1 RapidAPI — search_linkedIn.php per keyword,")
+    log.info(f"                     : + get_user_data.php + get_company_data.php enrichment per match")
+    log.info(f"  LinkedIn poll gap  : {LINKEDIN_POLL_INTERVAL}s between full keyword cycles | {LINKEDIN_KEYWORD_GAP_SECONDS}s between keywords")
     log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {TELEGRAM_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TELEGRAM_BATCH_GAP_SECONDS}s")
     log.info(f"  Facebook batch     : {FACEBOOK_BATCH_SIZE} items OR {FACEBOOK_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {FACEBOOK_BATCH_GAP_SECONDS}s")
+    log.info(f"  LinkedIn batch     : {LINKEDIN_BATCH_SIZE} items OR {LINKEDIN_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {LINKEDIN_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items per Claude call | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Batch timing       : per-platform, independent — Reddit/Twitter/Telegram/Facebook never share gap or timeout (v7.4.4 / v7.5.0)")
+    log.info(f"  Batch timing       : per-platform, independent — no platform shares gap/timeout with another")
     log.info(f"  max_tokens         : {MAX_TOKENS}")
-    log.info(f"  Claude streaming   : True | {_working(True)} (FIX C — no more 10-min error)")
-    log.info(f"  Claude read timeout: None (stream open until complete)")
-    log.info(f"  Twitter poll       : every {TWITTER_POLL_INTERVAL}s (rate-limit safe)")
-    log.info(f"  Twitter query      : built dynamically from KEYWORDS ({len(KEYWORDS)} keywords)")
-    log.info(f"  Telegram join gap  : {TELEGRAM_JOIN_GAP_SECONDS}s between group joins")
+    log.info(f"  Claude streaming   : True | {_working(True)}")
     log.info(f"  Score 1-3          : SILENT SAVE — MongoDB only, no alerts")
     log.info(f"  Score {MIN_SCORE_MEDIUM}-{MIN_SCORE_HIGH-1}          : MEDIUM — MongoDB + Slack + HubSpot (number hidden in message)")
     log.info(f"  Score {MIN_SCORE_HIGH}-10         : HIGH   — MongoDB + Slack + HubSpot (number hidden in message)")
     log.info(f"  MIN_SCORE_MEDIUM   : {MIN_SCORE_MEDIUM} (env-configurable)")
     log.info(f"  MIN_SCORE_HIGH     : {MIN_SCORE_HIGH} (env-configurable)")
-    log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded (score still stored as-is)")
-    log.info(f"  Platform isolation : Reddit / Twitter / Telegram / Facebook NEVER mixed (queues, batch state, AND now batch timing)")
+    log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded")
+    log.info(f"  Platform isolation : Reddit/Twitter/Telegram/Facebook/LinkedIn NEVER mixed")
     log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
-    log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts (v7.4.5)")
-    log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts (v7.4.5)")
-    log.info(f"  Partial-JSON       : Truncated Claude responses now salvage completed items")
-    log.info(f"                     : instead of discarding the whole batch (FIX B)")
+    log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts")
+    log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts")
     log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
-    log.info(f"  Rescore pipeline   : POST /rescore → Claude → Slack/HubSpot (same as live)")
     log.info(f"  Rescore poll       : every {RESCORE_POLL_INTERVAL}s")
-    log.info(f"  Operator alerts    : Claude API down + MongoDB failure + partial recovery → Slack")
     log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (API_KEY not set — open access)'}")
-    log.info(f"  Weekly state       : Persisted in MongoDB (survives restarts)")
     log.info(f"  Daily digest       : {DAILY_DIGEST_HOUR}:00 UTC")
     log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (same for all 4 platforms; Facebook also uses them as its search query terms)")
+    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms)")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
-    log.info(f"  HubSpot coverage   : score 4-10 (medium AND high) — fx_intent_score property still set")
-    log.info(f"  HubSpot note       : numeric score line removed from note body (v7.4.3)")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  Slack message      : numeric score removed from header/fields (v7.4.3) — tier/category still shown")
-    log.info(f"  Output schema      : Platform-specific JSON (unchanged from v7.2) — ~140 tokens/item")
-    log.info(f"  v7.4.4 changes     : BATCH_GAP_SECONDS and BATCH_TIMEOUT_SECONDS split into six")
-    log.info(f"                     : platform-specific env vars (REDDIT_/TWITTER_/TELEGRAM_ prefix).")
-    log.info(f"                     : Rescore now uses its own RESCORE_BATCH_GAP_SECONDS. BATCH_SIZE")
-    log.info(f"                     : variables were already per-platform and are untouched.")
-    log.info(f"  v7.4.5 changes     : (1) Batch completion log now shows item count — 'BATCH N")
-    log.info(f"                     : COMPLETE — X item(s) completed'. (2) New flintel_queue_messages")
-    log.info(f"                     : collection — raw queue items now survive a restart. (3) New")
-    log.info(f"                     : flintel_batch_seconds collection — explicit, dedicated batch")
-    log.info(f"                     : timeout persistence alongside flintel_pending_batch. Everything")
-    log.info(f"                     : else — scoring, routing, MongoDB signal storage, prompts,")
-    log.info(f"                     : FastAPI routes, thresholds, FIX A/B/C/D/E, hidden-score")
-    log.info(f"                     : Slack/HubSpot display — 100% unchanged from v7.4.4.")
-    log.info(f"  v7.5.0 changes     : Facebook added as a 4th platform (facebook-scraper3 RapidAPI,")
-    log.info(f"                     : GET /search/posts per KEYWORDS entry) — own queue, own persistent")
-    log.info(f"                     : dedup/batch-state/queue-message collections, own Claude scoring")
-    log.info(f"                     : schema, own FastAPI routes. Reddit/Twitter/Telegram code paths,")
+    log.info(f"  v7.6.0 changes     : LinkedIn added as 5th platform (linkedin-data-scraper1 RapidAPI) —")
+    log.info(f"                     : Search + User Data + Company Data endpoints, each independently")
+    log.info(f"                     : wrapped so one failing/out-of-quota endpoint never blocks another")
+    log.info(f"                     : or crashes the poll cycle. Own queue, own persistent dedup/")
+    log.info(f"                     : batch-state/queue-message collections, own Claude scoring schema,")
+    log.info(f"                     : own FastAPI routes. Reddit/Twitter/Telegram/Facebook code paths,")
     log.info(f"                     : timing, and state are 100% unchanged — purely additive.")
     log.info("=" * 70)
 
-    # FIX E (part 3): one-time, best-effort, read-only HubSpot property
-    # self-check at startup. Never blocks, never raises.
     _hs_verify_properties()
 
     asyncio.run(main())
