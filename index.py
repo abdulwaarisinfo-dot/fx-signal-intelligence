@@ -90,12 +90,28 @@ Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged fr
            rescore feature, and v7.4.5's queue/batch-seconds persistence
            are byte-for-byte identical to v7.5.0.
 
-Changelog (index.py — this deliverable only): Twitter/X now authenticates
-with its OWN dedicated RapidAPI key (TWT_RAPID_API_KEY) instead of sharing
-RAPID_API_KEY with Facebook/LinkedIn. This is the ONLY change relative to
-the v7.6.0 source above — the Twitter endpoint, request shape, polling
-logic, batching, scoring, storage, and every other platform's code path
-are 100% unchanged.
+Changelog (index.py — this deliverable only):
+  1) Twitter/X now authenticates with its OWN dedicated RapidAPI key
+     (TWT_RAPID_API_KEY) instead of sharing RAPID_API_KEY with
+     Facebook/LinkedIn. The Twitter endpoint, request shape, polling
+     logic, batching, scoring, storage, and every other platform's code
+     path are 100% unchanged.
+  2) BUGFIX — CLAUDE_SYSTEM_PROMPT_TWITTER's output schema now includes
+     the "index", "intent_score", and "is_business" keys that
+     _call_claude_batch() requires from EVERY platform's response
+     (Reddit/Telegram/Facebook/LinkedIn's prompts already had these;
+     Twitter's did not — it only asked for "score" instead of
+     "intent_score", and never asked for "index" or "is_business" at
+     all). That mismatch was causing every Twitter batch to fail
+     validation with "Missing keys in Claude response:
+     {'is_business', 'index', 'intent_score'}", exhaust all 3 retries,
+     and fall back to score-1 for the whole batch. This is a pure
+     prompt-schema fix — Twitter's scoring criteria (buyer signals,
+     reject list, intent bands, categories, buyer types) are byte-for-
+     byte unchanged; only the required output keys were added, and
+     "score" was renamed to "intent_score" to match the field name every
+     other platform (and _call_claude_batch/_derive_fields/save_signal)
+     already uses. No other platform's prompt was touched.
 
 Prior changelogs (v7.0 → v7.5.0) are unchanged from the previous version of
 this file and are omitted here only to keep this header readable — no
@@ -490,8 +506,16 @@ def _derive_fields(score: int) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Reddit/Twitter/Telegram/Facebook prompts byte-for-byte identical to
-# v7.5.0. CLAUDE_SYSTEM_PROMPT_LINKEDIN is new (v7.6.0), same _SCORING_CORE.
+# Reddit/Telegram/Facebook prompts byte-for-byte identical to v7.5.0.
+# CLAUDE_SYSTEM_PROMPT_LINKEDIN is new (v7.6.0), same _SCORING_CORE.
+# CLAUDE_SYSTEM_PROMPT_TWITTER — BUGFIX (this file only): output schema
+# updated to include "index", "intent_score", and "is_business" (required
+# by _call_claude_batch for every platform, but missing from Twitter's
+# prompt previously — it only had "score" instead of "intent_score", and
+# never had "index" or "is_business" at all). All scoring criteria below
+# (buyer signal definition, reject list, intent bands, categories, buyer
+# types) are unchanged from before — only the required output keys were
+# added/renamed to match what the rest of the pipeline expects.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORING_CORE = """
@@ -700,24 +724,27 @@ Raw JSON only.
 Each object MUST contain:
 
 {
-  "score": 1-10,
+  "index": <1-based integer matching post number, required>,
+  "intent_score": <number 1-10, required>,
+  "is_business": <true|false, required — true if the author is plausibly a business, company, merchant, or business owner account, false for individuals/unknown>,
   "category": "crypto" | "forex" | "high_risk" | "general_payments" | "none",
   "buyer_type": "merchant" | "founder" | "developer" | "finance_ops" | "unknown",
   "reason": "...",
   "suggested_action": "...",
 
-  // Only include when score >= 4
+  // Only include when intent_score >= 4
   "twitter_reply": "...",
   "twitter_dm": "..."
 }
 
 Rules:
+- index and intent_score and is_business are REQUIRED on every object, with no exceptions.
 - reason: maximum 15 words.
 - suggested_action: maximum 10 words.
-- For scores 1-3:
+- For intent_score 1-3:
     DO NOT include twitter_reply.
     DO NOT include twitter_dm.
-- For scores 4-10:
+- For intent_score 4-10:
     Include both twitter_reply and twitter_dm.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -852,7 +879,8 @@ unknown
 OUTPUT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Return ONLY the JSON array.
+Return ONLY the JSON array, with every object containing AT MINIMUM the
+required keys: index, intent_score, is_business, reason, suggested_action.
 
 No explanations.
 
@@ -4478,7 +4506,10 @@ if __name__ == "__main__":
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
     log.info(f"  index.py change    : Twitter/X now authenticates with its OWN TWT_RAPID_API_KEY")
     log.info(f"                     : (was shared RAPID_API_KEY). Endpoint/logic 100% unchanged —")
-    log.info(f"                     : only the credential source moved. All other platforms unaffected.")
+    log.info(f"                     : only the credential source moved. BUGFIX: Twitter's Claude")
+    log.info(f"                     : output schema now includes index/intent_score/is_business —")
+    log.info(f"                     : it was missing those required keys, causing every Twitter")
+    log.info(f"                     : batch to fail validation and fall back to score 1.")
     log.info("=" * 70)
 
     _hs_verify_properties()
