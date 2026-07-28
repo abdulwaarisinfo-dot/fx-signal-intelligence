@@ -653,7 +653,7 @@ Return JSON array only. Always. Every single time.
 MINIMUM score is 1 — never return 0.
 """
 
-CLAUDE_SYSTEM_PROMPT_REDDIT = + """
+CLAUDE_SYSTEM_PROMPT_REDDIT =  """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BATCH SCORING FORMAT — REDDIT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
