@@ -1455,7 +1455,7 @@ def _call_claude_batch(batch: list) -> list:
     prompt = _build_batch_prompt(batch)
 
     with anthropic_client.messages.stream(
-        model      = "claude-haiku-4-20250514",
+        model      = "claude-haiku-4-5-20251001",
         max_tokens = MAX_TOKENS,
         system     = system_prompt,
         messages   = [{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
