@@ -1,48 +1,8 @@
 """
-FX Signal Intelligence System — FLINTEL v7.8.0
+FX Signal Intelligence System — FLINTEL v7.7.0
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X + Telegram (Telethon)
             + Facebook (facebook-scraper3 RapidAPI) + LinkedIn (linkedin-data-scraper1 RapidAPI)
-
-Changelog v7.8.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.7.0):
-
-  CHANGE — search_keyword NOW POPULATED FOR ALL 5 PLATFORMS.
-
-           In v7.7.0, search_keyword was only ever set for Facebook and
-           LinkedIn (the two platforms that search KEYWORD-BY-KEYWORD, so
-           they already know which keyword they searched with at fetch
-           time). Reddit, Twitter, and Telegram fetch first and filter
-           after, via passes_keyword_filter(), which previously only
-           returned True/False — so there was no way to know WHICH keyword
-           in the KEYWORDS list actually matched.
-
-           Fix: passes_keyword_filter() now returns the matched keyword
-           STRING (the exact KEYWORDS entry) instead of True/False, or
-           None if nothing matched. This is fully backward compatible —
-           every existing call site used it in a boolean context
-           (`if not passes_keyword_filter(text):`), and a non-empty
-           string is truthy while None is falsy, so all existing
-           match/no-match branching behaves identically to before.
-
-           run_batch_processor() — the SAME generic function every
-           platform already shares — now captures this matched keyword
-           and sets item["search_keyword"] = matched_keyword, but ONLY
-           when the item doesn't already carry a search_keyword. Facebook
-           and LinkedIn already set it at poll time (v7.7.0) — that
-           existing value is preserved exactly as-is and is NOT
-           overwritten. Reddit, Twitter, and Telegram never had this
-           field populated before, so they now get it filled in with
-           whichever KEYWORDS entry matched their fetched text.
-
-           Everything downstream (process_scored_item, save_signal,
-           MongoDB storage, the search_keyword index added in v7.7.0) is
-           completely unchanged — it already reads item.get("search_keyword")
-           and stores it as-is, so no further changes were needed there.
-
-           NOTHING ELSE CHANGED — scoring logic, prompts, routing
-           thresholds, Slack/HubSpot delivery, FastAPI routes, keyword
-           list, poll/batch timing, and Facebook/LinkedIn's own
-           search_keyword behavior are byte-for-byte identical to v7.7.0.
 
 Changelog v7.7.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.6.0):
 
@@ -431,11 +391,9 @@ linkedin_queue: queue.Queue = queue.Queue()
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # PASTE YOUR EXISTING KEYWORDS LIST HERE — UNCHANGED FROM v7.5.0.
-    # (Omitted in this snippet only to keep this deliverable focused on the
-    # LinkedIn addition; nothing in the list itself changes.)
-    
-     "alternative to stripe",
+    # ── SENDING MONEY ────────────────────────────────────────────────────────
+
+ "alternative to stripe",
  "stripe froze my funds",
  "looking for crypto payment gateway",
  "looking for crypto payment gateway for my saas",
@@ -2938,28 +2896,13 @@ KEYWORDS = [
 ]
 
 
-def passes_keyword_filter(text: str):
-    """
-    v7.8.0 CHANGE — now returns the MATCHED KEYWORD STRING (the exact
-    KEYWORDS list entry that matched) instead of a plain True/False.
-    Returns None if nothing matched.
 
-    This is a backward-compatible change: every existing call site used
-    this in a boolean context (`if not passes_keyword_filter(text):` /
-    `if passes_keyword_filter(text):`), and a non-empty string is truthy
-    while None is falsy — so all existing "matched / not matched" branch
-    logic behaves exactly as before. The ONLY thing that changes is that
-    callers can now also inspect WHICH keyword matched, if they choose to
-    (used by run_batch_processor below to populate search_keyword for
-    Reddit/Twitter/Telegram, the three platforms that don't already know
-    their matching keyword the way Facebook/LinkedIn's per-keyword search
-    loops do).
-    """
+def passes_keyword_filter(text: str) -> bool:
     t = text.lower()
     for kw in KEYWORDS:
         if kw.lower() in t:
-            return kw
-    return None
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4703,8 +4646,7 @@ def run_batch_processor(
                     q.task_done()
                     continue
 
-                matched_keyword = passes_keyword_filter(text)
-                if not matched_keyword:
+                if not passes_keyword_filter(text):
                     total_dropped += 1
                     log.debug(
                         f"[{platform_label}] FILTERED | "
@@ -4712,18 +4654,6 @@ def run_batch_processor(
                     )
                     q.task_done()
                     continue
-
-                # v7.8.0 NEW — populate item["search_keyword"] with the
-                # keyword that matched via passes_keyword_filter, but ONLY
-                # if the item doesn't already carry one. Facebook and
-                # LinkedIn already set search_keyword at poll time (the
-                # exact keyword they searched with) — that value is
-                # preserved as-is, unchanged, and is NOT overwritten here.
-                # Reddit, Twitter, and Telegram never set this field
-                # before, so they now get it filled in from whichever
-                # KEYWORDS entry matched the fetched text.
-                if not item.get("search_keyword"):
-                    item["search_keyword"] = matched_keyword
 
                 total_matched += 1
 
