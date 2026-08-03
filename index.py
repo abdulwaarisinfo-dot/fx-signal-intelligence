@@ -432,7 +432,12 @@ TARGET_SUBREDDITS = [
     "Entrepreneur", "EntrepreneurRideAlong", "startups",
     "smallbusinessowner", "solopreneur", "freelance",
 
-    "personalfinance", "financialindependence", "CFA",
+    "personalfinance", "financialindependence", "CFA",    
+    "CryptoCurrency", "Bitcoin", "ethereum", "defi",
+    "stripe", "SaaS", "ecommerce", "shopify",
+    "Entrepreneur", "startups", "smallbusiness",
+    "indiehackers", "microsaas", "digitalnomad",
+    "Remittance", "moneytransfer", "freelance"
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
