@@ -171,47 +171,6 @@ working indicators (FIX D), HubSpot error visibility + startup property
 check (FIX E), manual rescore pipeline, per-platform batch gap/timeout,
 persistent raw-queue backup + explicit batch-timeout persistence (v7.4.5),
 and Facebook as the 4th platform (v7.5.0). Claude model: claude-sonnet-4-6.
-
-Changelog v7.9.0 (ONE ADDITIVE/ISOLATION CHANGE ONLY — everything else
-100% unchanged from v7.8.0):
-
-  CHANGE — PER-PLATFORM SIGNAL DOCUMENT ISOLATION (MongoDB storage only).
-
-           Before this change, every saved signal document carried EVERY
-           platform's fields — a Reddit signal stored twitter_reply,
-           twitter_dm, telegram_dm, facebook_comment, and all 16
-           linkedin_* fields as null, even though a Reddit item can never
-           populate any of them. Same story in reverse for every other
-           platform. This made documents unnecessarily long and mixed
-           platforms' shapes together for no functional reason.
-
-           Fix: save_signal() and update_signal() now build the document
-           from a common core (the fields every platform actually shares
-           — score, category, tier, reason, corridor, etc.) PLUS ONLY
-           that platform's own fields, looked up from two small maps
-           (_PLATFORM_CORE_EXTRA_FIELDS for inserts, _PLATFORM_OUTREACH_FIELDS
-           for rescore updates). A Reddit signal now only ever contains
-           subreddit/post_url/linkedin_message (Reddit's own outreach
-           field). A Twitter signal only contains post_url/twitter_reply/
-           twitter_dm. Telegram only telegram_group/telegram_dm. Facebook
-           only post_url/facebook_comment. LinkedIn only its own outreach
-           + enrichment fields. Platforms are never mixed in storage.
-
-           This is storage-only. Nothing about scoring, the Claude prompts
-           (_build_batch_prompt already only ever attaches LinkedIn
-           enrichment when item["platform"] == "linkedin" — unchanged),
-           routing thresholds, Slack alerts, HubSpot notes, or any FastAPI
-           route changed. Slack/HubSpot already read every field via
-           data.get(...), so fields that no longer exist for a given
-           platform simply resolve to their existing default (None/"N/A"),
-           exactly as they did before when the field was explicitly null.
-           MongoDB's own semantics treat a missing field the same as an
-           explicit null for equality/$ne queries, so /signals/outreach
-           and friends behave identically to before.
-
-           NOTHING ELSE CHANGED — every other function, prompt, threshold,
-           route, and platform's fetch/poll/batch logic is byte-for-byte
-           identical to v7.8.0.
 """
 
 import asyncio
@@ -432,12 +391,7 @@ TARGET_SUBREDDITS = [
     "Entrepreneur", "EntrepreneurRideAlong", "startups",
     "smallbusinessowner", "solopreneur", "freelance",
 
-    "personalfinance", "financialindependence", "CFA",    
-    "CryptoCurrency", "Bitcoin", "ethereum", "defi",
-    "stripe", "SaaS", "ecommerce", "shopify",
-    "Entrepreneur", "startups", "smallbusiness",
-    "indiehackers", "microsaas", "digitalnomad",
-    "Remittance", "moneytransfer", "freelance"
+    "personalfinance", "financialindependence", "CFA",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,7 +434,8 @@ KEYWORDS = [
     # PASTE YOUR EXISTING KEYWORDS LIST HERE — UNCHANGED FROM v7.5.0.
     # (Omitted in this snippet only to keep this deliverable focused on the
     # LinkedIn addition; nothing in the list itself changes.)
- "alternative to stripe",
+    
+     "alternative to stripe",
  "stripe froze my funds",
  "looking for crypto payment gateway",
  "looking for crypto payment gateway for my saas",
@@ -3993,54 +3948,20 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE
-# v7.9.0: save_signal()/update_signal() now build documents from a common
-# core PLUS ONLY the current platform's own fields (see
-# _PLATFORM_CORE_EXTRA_FIELDS / _PLATFORM_OUTREACH_FIELDS below). This is
-# storage-only isolation — no scoring, routing, Slack, or HubSpot behavior
-# changed anywhere in this file.
+# MONGODB STORAGE — ALL scores 1-10 stored, nothing discarded.
+# v7.6.0: additive LinkedIn fields only — every .get() defaults to None for
+# every other platform's documents, so their stored shape is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# v7.9.0 NEW — each platform's OWN fields only. A Reddit signal never
-# carries twitter_reply/telegram_dm/linkedin_* etc; a Twitter signal never
-# carries subreddit/facebook_comment/linkedin_* etc; and so on. Every
-# platform's data stays isolated to its own document shape.
-_PLATFORM_CORE_EXTRA_FIELDS = {
-    "reddit":   ["subreddit", "post_url", "linkedin_message"],
-    "twitter":  ["post_url", "twitter_reply", "twitter_dm"],
-    "telegram": ["telegram_group", "telegram_dm"],
-    "facebook": ["post_url", "facebook_comment"],
-    "linkedin": [
-        "post_url", "linkedin_reply", "linkedin_dm",
-        "linkedin_full_name", "linkedin_headline", "linkedin_email",
-        "linkedin_phone", "linkedin_location", "linkedin_company",
-        "linkedin_job_title", "linkedin_profile_url",
-        "linkedin_company_name", "linkedin_company_website",
-        "linkedin_company_industry", "linkedin_company_size",
-        "linkedin_company_location", "linkedin_company_phone",
-    ],
-}
-
-# v7.9.0 NEW — outreach-only subset of the map above, used by
-# update_signal() on rescore so a rescored signal only ever has ITS OWN
-# platform's outreach field(s) touched — never another platform's.
-_PLATFORM_OUTREACH_FIELDS = {
-    "reddit":   ["linkedin_message"],
-    "twitter":  ["twitter_reply", "twitter_dm"],
-    "telegram": ["telegram_dm"],
-    "facebook": ["facebook_comment"],
-    "linkedin": ["linkedin_reply", "linkedin_dm"],
-}
-
 
 def save_signal(data: dict) -> bool:
     try:
-        platform = data.get("platform", "unknown")
-
         doc = {
             "message_id":                   data["message_id"],
-            "platform":                     platform,
+            "platform":                     data.get("platform", "unknown"),
             "content_type":                 data.get("content_type", "unknown"),
+            "subreddit":                    data.get("subreddit", ""),
+            "telegram_group":               data.get("telegram_group", ""),
+            "post_url":                     data.get("post_url", ""),
             "username":                     data.get("username", "unknown"),
             "message_text":                 data["message_text"],
             "intent_score":                 data["intent_score"],
@@ -4056,8 +3977,31 @@ def save_signal(data: dict) -> bool:
             "urgency":                      data.get("urgency", "none"),
             "reason":                       data["reason"],
             "suggested_action":             data["suggested_action"],
-            # v7.7.0/v7.8.0 — search_keyword is now populated for all 5
-            # platforms (see passes_keyword_filter / run_batch_processor).
+            "twitter_reply":                data.get("twitter_reply"),
+            "twitter_dm":                   data.get("twitter_dm"),
+            "linkedin_message":             data.get("linkedin_message"),
+            "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW — LinkedIn outreach + enrichment fields. Always
+            # None/absent for Reddit/Twitter/Telegram/Facebook documents.
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
+            "linkedin_full_name":           data.get("linkedin_full_name"),
+            "linkedin_headline":            data.get("linkedin_headline"),
+            "linkedin_email":               data.get("linkedin_email"),
+            "linkedin_phone":               data.get("linkedin_phone"),
+            "linkedin_location":            data.get("linkedin_location"),
+            "linkedin_company":             data.get("linkedin_company"),
+            "linkedin_job_title":           data.get("linkedin_job_title"),
+            "linkedin_profile_url":         data.get("linkedin_profile_url"),
+            "linkedin_company_name":        data.get("linkedin_company_name"),
+            "linkedin_company_website":     data.get("linkedin_company_website"),
+            "linkedin_company_industry":    data.get("linkedin_company_industry"),
+            "linkedin_company_size":        data.get("linkedin_company_size"),
+            "linkedin_company_location":    data.get("linkedin_company_location"),
+            "linkedin_company_phone":       data.get("linkedin_company_phone"),
+            # v7.7.0 NEW — the KEYWORDS entry that produced this item
+            # (Facebook/LinkedIn only; None for every other platform).
             "search_keyword":               data.get("search_keyword"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
@@ -4067,26 +4011,18 @@ def save_signal(data: dict) -> bool:
             "digest_included":              False,
             "created_at":                   datetime.now(timezone.utc),
         }
-
-        # v7.9.0 NEW — attach ONLY this platform's own fields. Every other
-        # platform's fields are simply absent from the document (instead
-        # of being written as null), so Reddit/Twitter/Telegram/Facebook/
-        # LinkedIn signals never mix each other's shape.
-        for field in _PLATFORM_CORE_EXTRA_FIELDS.get(platform, []):
-            doc[field] = data.get(field)
-
         db.signals.insert_one(doc)
 
-        platform_up = platform.upper()
+        platform = data.get("platform", "?").upper()
         score    = data["intent_score"]
         user     = data.get("username", "?")
         ctype    = data.get("content_type", "")
         sub      = data.get("subreddit", "")
         grp      = data.get("telegram_group", "")
-        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform_up)
+        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
 
         log.info(
-            f"SAVED [{platform_up}] | Score:{score} | Tier:{data.get('tier','?')} | "
+            f"SAVED [{platform}] | Score:{score} | Tier:{data.get('tier','?')} | "
             f"u/{user} | {ctype} | {source}"
         )
         return True
@@ -4111,8 +4047,6 @@ def save_signal(data: dict) -> bool:
 
 def update_signal(message_id: str, data: dict) -> bool:
     try:
-        platform = data.get("platform", "unknown")
-
         update_fields = {
             "intent_score":                 data["intent_score"],
             "signal_category":              data["signal_category"],
@@ -4127,19 +4061,20 @@ def update_signal(message_id: str, data: dict) -> bool:
             "urgency":                      data.get("urgency", "none"),
             "reason":                       data["reason"],
             "suggested_action":             data["suggested_action"],
+            "twitter_reply":                data.get("twitter_reply"),
+            "twitter_dm":                   data.get("twitter_dm"),
+            "linkedin_message":             data.get("linkedin_message"),
+            "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
             "alerted_slack":                False,
             "alerted_hubspot":              False,
         }
-
-        # v7.9.0 NEW — only update THIS platform's own outreach field(s).
-        # A rescored Reddit signal never gets twitter_reply/telegram_dm/
-        # linkedin_* written onto it, and so on for every other platform.
-        for field in _PLATFORM_OUTREACH_FIELDS.get(platform, []):
-            update_fields[field] = data.get(field)
-
         result = db.signals.update_one(
             {"message_id": message_id},
             {"$set": update_fields},
@@ -6960,14 +6895,13 @@ if __name__ == "__main__":
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  v7.9.0 changes     : Per-platform signal document isolation in MongoDB storage —")
-    log.info(f"                     : save_signal()/update_signal() now write ONLY each platform's own")
-    log.info(f"                     : fields (Reddit: subreddit/post_url/linkedin_message, Twitter:")
-    log.info(f"                     : post_url/twitter_reply/twitter_dm, Telegram: telegram_group/")
-    log.info(f"                     : telegram_dm, Facebook: post_url/facebook_comment, LinkedIn: its")
-    log.info(f"                     : own outreach + enrichment fields) instead of every OTHER")
-    log.info(f"                     : platform's fields as null. Storage-only — scoring, Slack,")
-    log.info(f"                     : HubSpot, and every route are byte-for-byte unchanged.")
+    log.info(f"  v7.6.0 changes     : LinkedIn added as 5th platform (linkedin-data-scraper1 RapidAPI) —")
+    log.info(f"                     : Search + User Data + Company Data endpoints, each independently")
+    log.info(f"                     : wrapped so one failing/out-of-quota endpoint never blocks another")
+    log.info(f"                     : or crashes the poll cycle. Own queue, own persistent dedup/")
+    log.info(f"                     : batch-state/queue-message collections, own Claude scoring schema,")
+    log.info(f"                     : own FastAPI routes. Reddit/Twitter/Telegram/Facebook code paths,")
+    log.info(f"                     : timing, and state are 100% unchanged — purely additive.")
     log.info("=" * 70)
 
     _hs_verify_properties()
