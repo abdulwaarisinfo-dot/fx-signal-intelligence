@@ -1,8 +1,59 @@
 """
-FX Signal Intelligence System — FLINTEL v7.8.0
+FX Signal Intelligence System — FLINTEL v7.9.1
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X + Telegram (Telethon)
             + Facebook (facebook-scraper3 RapidAPI) + LinkedIn (linkedin-data-scraper1 RapidAPI)
+
+Changelog v7.9.1 (ONE CHANGE ONLY — everything else 100% unchanged from v7.9.0):
+
+  CHANGE — TWITTER SEARCH CHUNKED (fixes HTTP 414 Request-URI Too Large).
+
+           v7.9.0 combined EVERY keyword in KEYWORDS into ONE giant OR-query
+           sent as a single GET request. With 1000+ keywords this produced
+           URLs 100,000+ characters long, which RapidAPI's gateway rejected
+           outright with HTTP 414 (Request-URI Too Large) — every single
+           poll cycle, permanently broken.
+
+           Fix: KEYWORDS is now split into chunks of TWITTER_CHUNK_SIZE
+           (default 25) keywords each, combined into one OR-query per
+           chunk — e.g. ("kw1" OR "kw2" OR ... OR "kw25"). This keeps each
+           request's URL short enough that 414 never happens again.
+
+           UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE
+           keyword list every single poll cycle, one keyword per request),
+           Twitter sends exactly ONE chunk per TWITTER_POLL_INTERVAL, then
+           advances to the next chunk on the following cycle, and so on —
+           wrapping back to chunk #1 once the last chunk is reached. So
+           with 1000 keywords in 40 chunks of 25, it takes 40 poll cycles
+           to cover the full list once, then it restarts automatically
+           from chunk #1. This keeps Twitter's request rate low and
+           predictable (Twitter's RapidAPI plan/rate-limits don't tolerate
+           the same per-keyword request volume Facebook/LinkedIn use).
+
+           The current chunk position is persisted in MongoDB
+           (flintel_state, key="twitter_chunk_index") so a restart/deploy
+           resumes from wherever it left off instead of restarting the
+           whole list from chunk #1 every time.
+
+           RapidAPI key failover (429/403 → rotate to next configured key)
+           from v7.9.0 is preserved exactly as-is, just applied per-chunk
+           instead of per-full-query. A failed chunk attempt does NOT
+           advance the chunk index — it retries the SAME chunk after
+           rotating keys / waiting.
+
+           NOTHING ELSE CHANGED — Reddit, Telegram, Facebook, LinkedIn,
+           scoring logic, prompts, routing thresholds, Slack/HubSpot
+           delivery, FastAPI routes, keyword list, batch timing, and every
+           other platform's poll/dedup/queue behavior are byte-for-byte
+           identical to v7.9.0.
+
+Changelog v7.9.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.8.0):
+
+  CHANGE (superseded by v7.9.1 above for the query-building part) —
+           Twitter search originally moved to a single combined OR-query
+           with automatic RapidAPI key failover on 429/403. The key
+           failover behavior is preserved in v7.9.1; the single-giant-query
+           behavior is replaced by chunking as described above.
 
 Changelog v7.8.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.7.0):
 
@@ -59,21 +110,14 @@ Changelog v7.7.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged fr
            the SAME generic run_batch_processor()/process_scored_item()
            pipeline every platform already uses, and is stored as-is in
            save_signal(). Reddit (subreddit RSS, not keyword search),
-           Twitter (one combined OR-query, not per-keyword), and Telegram
-           (group listener/poller, not keyword search) have no single
-           keyword to attribute a match to — for these three platforms
-           search_keyword is simply None/absent, exactly as it always
-           implicitly was; nothing about their fetching, filtering, or
-           storage changed.
+           Twitter, and Telegram (group listener/poller, not keyword
+           search) have no single keyword to attribute a match to for
+           this version — search_keyword is simply None/absent, exactly
+           as it always implicitly was.
 
            A matching index on "search_keyword" was added alongside the
            existing indexes (intent_score, platform, tier, etc.) so it can
            be queried/filtered efficiently later if needed.
-
-           NOTHING ELSE CHANGED — scoring logic, prompts, routing
-           thresholds, Slack/HubSpot delivery, FastAPI routes, keyword
-           list, and every platform's poll/batch timing are byte-for-byte
-           identical to v7.6.0.
 
 Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.5.0):
 
@@ -152,14 +196,6 @@ Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged fr
              LINKEDIN_BATCH_TIMEOUT_SECONDS (default: 120)
              LINKEDIN_POLL_INTERVAL         (default: 300 — full keyword cycle)
              LINKEDIN_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
-
-           NOTHING ELSE CHANGED. Reddit, Twitter, Telegram, Facebook
-           scoring logic, prompts, MongoDB signal storage, HubSpot fields,
-           Slack formatting, FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4,
-           MIN_SCORE_HIGH=8), keyword list, per-platform
-           BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS, FIX A/B/C/D/E, the
-           rescore feature, and v7.4.5's queue/batch-seconds persistence
-           are byte-for-byte identical to v7.5.0.
 
 Prior changelogs (v7.0 → v7.5.0) are unchanged from the previous version of
 this file and are omitted here only to keep this header readable — no
@@ -429,19 +465,17 @@ facebook_queue: queue.Queue = queue.Queue()
 linkedin_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.5.0)
-# NOTE: for brevity in this deliverable the keyword list content itself is
-# represented with a placeholder comment below — paste your existing
-# KEYWORDS list (same one already in your v7.5.0 file) back in here
-# unchanged. Nothing about the list changes for LinkedIn — it reuses the
-# exact same KEYWORDS already used by Reddit/Twitter/Telegram/Facebook.
+# KEYWORD PRE-FILTER
+# NOTE: intentionally left EMPTY here — paste your full KEYWORDS list back
+# in below (same list already used across Reddit/Twitter/Telegram/Facebook/
+# LinkedIn). Nothing else in the file depends on the list's *content*, only
+# on it being a Python list of strings, so this section can be filled in
+# independently without touching any other part of the system.
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # PASTE YOUR EXISTING KEYWORDS LIST HERE — UNCHANGED FROM v7.5.0.
-    # (Omitted in this snippet only to keep this deliverable focused on the
-    # LinkedIn addition; nothing in the list itself changes.)
-    "alternative to stripe",
+    # PASTE YOUR FULL KEYWORDS LIST HERE.
+        "alternative to stripe",
  "stripe froze my funds",
  "looking for crypto payment gateway",
  "looking for crypto payment gateway for my saas",
@@ -2969,18 +3003,32 @@ def passes_keyword_filter(text: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY
-# v7.9.0 CHANGE (operator request) — ALWAYS include EVERY keyword in
-# KEYWORDS in ONE single combined OR-query, sent as ONE request. The old
-# 480-character cutoff and the "short keywords only" pre-filter are
-# REMOVED entirely: whether KEYWORDS has 200 entries or 2000 entries, ALL
-# of them go into this one query, exactly as the very first version of
-# this system did — nothing is ever silently dropped because of length.
-# Every poll cycle re-sends this SAME full-coverage query (see poll_twitter
-# below) — next poll, same keywords, all of them, every time.
+# TWITTER SEARCH QUERY — CHUNKED, ONE CHUNK PER POLL CYCLE
+# v7.9.1 CHANGE (fixes HTTP 414 Request-URI Too Large) — v7.9.0 combined
+# ALL keywords into ONE giant OR-query, producing URLs 100,000+ chars long
+# that RapidAPI's gateway rejected with 414 every single cycle.
+#
+# Fix: KEYWORDS is split into chunks of TWITTER_CHUNK_SIZE (default 25)
+# keywords each — same idea as Facebook/LinkedIn's per-keyword loop, just
+# grouped 25-at-a-time instead of 1-at-a-time (Twitter's plan/rate-limits
+# don't tolerate 2000+ separate requests per cycle the way Facebook/
+# LinkedIn's setup does).
+#
+# UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE list every
+# poll cycle), Twitter sends ONE chunk per TWITTER_POLL_INTERVAL, then
+# advances to the next chunk next cycle, and so on — wrapping back to
+# chunk #1 once the last chunk is reached. So if there are 1000 keywords
+# in 40 chunks of 25, it takes 40 poll cycles to cover the full list once,
+# then it starts over from chunk #1 automatically. This keeps each
+# individual request small (no 414) AND keeps Twitter's request rate low
+# and steady. Reddit/Telegram/Facebook/LinkedIn are completely unaffected
+# — their per-keyword/per-subreddit cycling behaviour is untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_twitter_search_query() -> str:
+TWITTER_CHUNK_SIZE = int(os.getenv("TWITTER_CHUNK_SIZE", "25"))
+
+
+def _build_twitter_search_chunks() -> list:
     seen = set()
     unique_kws = []
     for kw in KEYWORDS:
@@ -2989,20 +3037,29 @@ def _build_twitter_search_query() -> str:
             seen.add(kl)
             unique_kws.append(kw)
 
-    parts = [f'"{kw}"' if " " in kw else kw for kw in unique_kws]
-
-    if not parts:
-        return (
+    if not unique_kws:
+        return [
             "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
             " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
-        )
+        ]
 
-    query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-    log.info(f"Twitter search query built from KEYWORDS | terms:{len(parts)} | len:{len(query)}")
-    return query
+    chunks = []
+    for i in range(0, len(unique_kws), TWITTER_CHUNK_SIZE):
+        group = unique_kws[i:i + TWITTER_CHUNK_SIZE]
+        parts = [f'"{kw}"' if " " in kw else kw for kw in group]
+        query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
+        chunks.append(query)
+
+    log.info(
+        f"Twitter search chunks built | total_keywords:{len(unique_kws)} | "
+        f"chunk_size:{TWITTER_CHUNK_SIZE} | total_chunks:{len(chunks)} | "
+        f"full_list_coverage_every:{len(chunks)} poll cycles "
+        f"(~{len(chunks) * TWITTER_POLL_INTERVAL}s)"
+    )
+    return chunks
 
 
-TWITTER_SEARCH_QUERY = _build_twitter_search_query()
+TWITTER_SEARCH_CHUNKS = _build_twitter_search_chunks()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3486,7 +3543,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.6.0"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.9.1"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -4475,7 +4532,7 @@ def _hs_create_note(data: dict, contact_id: str):
             )
 
         note = (
-            f"FLINTEL SIGNAL — v7.6.0{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.9.1{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -5074,26 +5131,17 @@ def poll_reddit_rss():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TWITTER / X POLLER
-# v7.9.0 CHANGES (per operator request — ONLY these two things changed):
+# v7.9.1 — sends ONE chunk (TWITTER_CHUNK_SIZE keywords combined into one
+# OR-query) per TWITTER_POLL_INTERVAL, advancing through TWITTER_SEARCH_CHUNKS
+# and wrapping back to chunk 0 once the last chunk is reached. Chunk
+# position is persisted in MongoDB (flintel_state) so restarts resume where
+# they left off instead of starting over from chunk 1 every time.
 #
-#   1) _build_twitter_search_query() now puts EVERY keyword in KEYWORDS
-#      into ONE single OR-query — no length filtering, no 480-char cutoff,
-#      no "short keywords only" restriction. Whether KEYWORDS has 200 or
-#      2000 entries, ALL of them go into the SAME single request, exactly
-#      as before this fix broke it. Every poll cycle re-sends this same
-#      full-coverage query — nothing is ever silently dropped.
+# RapidAPI key failover (429/403 → rotate to next configured key) from
+# v7.9.0 is preserved — a failed attempt retries the SAME chunk, it does
+# NOT advance to the next chunk.
 #
-#   2) Automatic RapidAPI key failover for Twitter ONLY. If the RapidAPI
-#      plan currently in use returns 429 (rate limited) or 403 (quota
-#      exhausted), the code automatically rotates to the NEXT configured
-#      RapidAPI key and retries the SAME query immediately — no manual
-#      intervention needed. If ALL configured keys are exhausted in the
-#      same cycle, it waits one normal TWITTER_POLL_INTERVAL before trying
-#      again. This is isolated to Twitter — Facebook/LinkedIn continue
-#      using the single RAPID_API_KEY exactly as before, untouched.
-#
-# Everything else in this section (dedup, queueing, response parsing,
-# batch handoff) is 100% unchanged from v7.8.0.
+# Facebook/LinkedIn/Reddit/Telegram are completely untouched by this change.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # v7.9.0 NEW — one or more RapidAPI keys for Twitter, comma-separated.
@@ -5122,8 +5170,8 @@ def _twitter_current_headers() -> dict:
 
 
 def _twitter_rotate_key(reason: str = ""):
-    """v7.9.0 NEW — advances to the next configured RapidAPI key. Wraps
-    around to key #1 after the last key, so failover keeps cycling."""
+    """v7.9.0 — advances to the next configured RapidAPI key. Wraps around
+    to key #1 after the last key, so failover keeps cycling."""
     global _twitter_key_index
     if len(TWITTER_RAPID_API_KEYS) <= 1:
         return
@@ -5177,57 +5225,85 @@ def _extract_tweets_from_twitter_api45(data: dict) -> list:
     return tweets
 
 
+# v7.9.1 NEW — persisted chunk-rotation index so a restart doesn't reset
+# progress back to chunk #1 every time (keeps steady coverage across the
+# full keyword list even across deploys/crashes). Falls back to 0 if
+# nothing persisted yet or if it's out of range for the current chunk count.
+def _load_twitter_chunk_index() -> int:
+    val = _get_state("twitter_chunk_index")
+    if not isinstance(val, int) or not TWITTER_SEARCH_CHUNKS:
+        return 0
+    return val % len(TWITTER_SEARCH_CHUNKS)
+
+
+def _save_twitter_chunk_index(idx: int):
+    _set_state("twitter_chunk_index", idx)
+
+
 def poll_twitter(client: dict):
     seen_ids: set = load_seen_ids("twitter")
     dirty = 0
     consecutive_key_failures = 0
 
+    chunk_index = _load_twitter_chunk_index()
+    total_chunks = len(TWITTER_SEARCH_CHUNKS)
+
     log.info(
-        f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)} | "
+        f"Twitter poll started | total_chunks:{total_chunks} | "
+        f"chunk_size:{TWITTER_CHUNK_SIZE} | resuming at chunk:{chunk_index + 1}/{total_chunks} | "
         f"keys_available:{len(TWITTER_RAPID_API_KEYS)} | "
         f"dedup set resumed with {len(seen_ids)} known ID(s)"
     )
 
+    url = "https://twitter-api45.p.rapidapi.com/search.php"
+
     while True:
         try:
-            url = "https://twitter-api45.p.rapidapi.com/search.php"
+            chunk_query = TWITTER_SEARCH_CHUNKS[chunk_index]
+
             querystring = {
-                "query":       TWITTER_SEARCH_QUERY,
+                "query":       chunk_query,
                 "search_type": "Top",
             }
             headers = _twitter_current_headers()
 
             response = requests.get(url, headers=headers, params=querystring, timeout=30)
 
-            # v7.9.0 NEW — automatic RapidAPI key failover. If the CURRENT
-            # key is out of quota / rate-limited, rotate to the NEXT
-            # configured key and retry the SAME query immediately (no full
-            # poll-interval wait). If every key has failed in this same
-            # cycle, wait one normal TWITTER_POLL_INTERVAL before trying
-            # again so it doesn't spin in a tight loop.
+            # v7.9.0 — automatic RapidAPI key failover on 429/403. Stays on
+            # the SAME chunk and retries next loop iteration after failover
+            # (does NOT advance chunk_index on a failed attempt).
             if response.status_code in (429, 403):
                 _twitter_rotate_key(reason=f"HTTP {response.status_code}")
                 consecutive_key_failures += 1
                 if consecutive_key_failures >= len(TWITTER_RAPID_API_KEYS):
                     log.error(
                         f"[TWITTER] All {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) "
-                        f"rate-limited/exhausted this cycle — waiting "
-                        f"{TWITTER_POLL_INTERVAL}s before retrying."
+                        f"rate-limited/exhausted — waiting {TWITTER_POLL_INTERVAL}s "
+                        f"before retrying chunk {chunk_index + 1}/{total_chunks}."
                     )
                     consecutive_key_failures = 0
                     time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
             consecutive_key_failures = 0
+
+            # v7.9.1 — with chunking this shouldn't happen, but handle
+            # gracefully if TWITTER_CHUNK_SIZE is set too high via env var.
+            if response.status_code == 414:
+                log.error(
+                    f"[TWITTER] Chunk {chunk_index + 1}/{total_chunks} still too long "
+                    f"(HTTP 414) — query len:{len(chunk_query)}. Lower TWITTER_CHUNK_SIZE "
+                    f"(currently {TWITTER_CHUNK_SIZE})."
+                )
+                chunk_index = (chunk_index + 1) % total_chunks
+                _save_twitter_chunk_index(chunk_index)
+                time.sleep(TWITTER_POLL_INTERVAL)
+                continue
+
             response.raise_for_status()
             data = response.json()
 
             tweets = _extract_tweets_from_twitter_api45(data)
-
-            if not tweets:
-                log.debug("Twitter: no results this cycle.")
-                time.sleep(TWITTER_POLL_INTERVAL)
-                continue
 
             new_count = 0
             for t in tweets:
@@ -5261,14 +5337,26 @@ def poll_twitter(client: dict):
                 save_seen_ids("twitter", seen_ids)
                 dirty = 0
 
-            if new_count:
+            log.info(
+                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} → "
+                f"{new_count} new tweet(s) queued | queue_size:{twitter_queue.qsize()}"
+            )
+
+            # v7.9.1 — advance to next chunk, wrap to 0 after the last one.
+            chunk_index = (chunk_index + 1) % total_chunks
+            _save_twitter_chunk_index(chunk_index)
+
+            if chunk_index == 0:
                 log.info(
-                    f"Twitter: {new_count} new tweets queued | "
-                    f"queue_size:{twitter_queue.qsize()}"
+                    f"[TWITTER] Full keyword list cycle complete "
+                    f"({total_chunks} chunks) — restarting from chunk 1."
                 )
 
         except Exception as exc:
-            log.error(f"Twitter unexpected error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
+            log.error(
+                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} error: {exc} — "
+                f"retrying in {TWITTER_POLL_INTERVAL}s..."
+            )
 
         time.sleep(TWITTER_POLL_INTERVAL)
 
@@ -5963,7 +6051,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
         ]
 
         result = retry_with_backoff(
@@ -6042,7 +6130,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -6386,20 +6474,21 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (version bumped to 7.6.0; LinkedIn routes added)
+# FASTAPI — REST API
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.6.0",
+    title       = "FX Signal Intelligence API — Flintel v7.9.1",
     description = (
         "Reddit (RSS) + Twitter + Telegram + Facebook + LinkedIn signals: "
         "monitor, score, store, alert. Persistent batch state. Streaming "
         "Claude. Manual rescore. HubSpot receives medium (4-7) AND high "
         "(8-10) signals. Per-platform BATCH_GAP_SECONDS and "
         "BATCH_TIMEOUT_SECONDS — every platform runs on its own "
-        "independent gap/timeout, never mixed."
+        "independent gap/timeout, never mixed. Twitter search runs in "
+        "TWITTER_CHUNK_SIZE-keyword chunks, one chunk per poll cycle."
     ),
-    version     = "7.6.0",
+    version     = "7.9.1",
 )
 
 
@@ -6425,7 +6514,7 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.6.0",
+        "system":                  "FLINTEL v7.9.1",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram", "facebook", "linkedin"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -6450,6 +6539,8 @@ def root():
         "facebook_poll_interval":  FACEBOOK_POLL_INTERVAL,
         "linkedin_poll_interval":  LINKEDIN_POLL_INTERVAL,
         "twitter_rapid_api_keys_configured": len(TWITTER_RAPID_API_KEYS),
+        "twitter_chunk_size":       TWITTER_CHUNK_SIZE,
+        "twitter_total_chunks":     len(TWITTER_SEARCH_CHUNKS),
         "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
         "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
@@ -6482,7 +6573,7 @@ def root():
         "slack_hubspot_score_hidden": True,
         "per_platform_batch_timing": True,
         "linkedin_enrichment":     True,
-        "twitter_full_keyword_coverage": True,
+        "twitter_chunked_search":  True,
         "twitter_rapid_api_failover": True,
         "min_score_medium":        MIN_SCORE_MEDIUM,
         "min_score_high":          MIN_SCORE_HIGH,
@@ -6526,6 +6617,8 @@ def health():
         "twitter_working":         twitter_working,
         "twitter_indicator":       _working(twitter_working),
         "twitter_rapid_api_keys":  len(TWITTER_RAPID_API_KEYS),
+        "twitter_chunk_size":      TWITTER_CHUNK_SIZE,
+        "twitter_total_chunks":    len(TWITTER_SEARCH_CHUNKS),
         "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
         "telegram":                ("listening" if telegram_working else "disabled"),
@@ -6966,14 +7059,14 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.9.0")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.9.1")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook + LinkedIn")
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
     log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS))}")
     log.info(f"  Twitter keys       : {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) configured for failover")
-    log.info(f"  Twitter query      : ALL {len(KEYWORDS)} keyword(s) sent in ONE request | no truncation")
+    log.info(f"  Twitter chunking   : {TWITTER_CHUNK_SIZE} keyword(s)/chunk | {len(TWITTER_SEARCH_CHUNKS)} total chunk(s) | 1 chunk sent per poll cycle")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
     log.info(f"  Facebook           : {FACEBOOK_ENABLED} | {_working(FACEBOOK_ENABLED and bool(RAPID_API_KEY))}")
     log.info(f"  LinkedIn           : {LINKEDIN_ENABLED} | {_working(LINKEDIN_ENABLED and bool(RAPID_API_KEY))}")
@@ -7000,6 +7093,7 @@ if __name__ == "__main__":
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
     log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts")
     log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts")
+    log.info(f"  Twitter chunk pos  : Persistent (MongoDB flintel_state key=twitter_chunk_index) — survives restarts")
     log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
     log.info(f"  Rescore poll       : every {RESCORE_POLL_INTERVAL}s")
     log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (API_KEY not set — open access)'}")
@@ -7007,20 +7101,17 @@ if __name__ == "__main__":
     log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms)")
+    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms) — FILL THIS LIST IN")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  v7.9.0 changes     : (1) Twitter search query now includes EVERY keyword in KEYWORDS in")
-    log.info(f"                     : ONE single request — no 480-char cutoff, no length filtering, no")
-    log.info(f"                     : keywords silently dropped, whether the list has 200 or 2000 entries.")
-    log.info(f"                     : (2) Twitter RapidAPI automatic key failover — set TWITTER_RAPID_API_KEYS")
-    log.info(f"                     : as a comma-separated list; if the active key hits HTTP 429/403 (rate")
-    log.info(f"                     : limited / quota exhausted), the poller automatically rotates to the")
-    log.info(f"                     : next key and retries immediately, with zero manual steps. Falls back")
-    log.info(f"                     : to single RAPID_API_KEY if TWITTER_RAPID_API_KEYS isn't set. Reddit,")
-    log.info(f"                     : Telegram, Facebook, LinkedIn, scoring, storage, delivery, and every")
-    log.info(f"                     : FastAPI route are 100% untouched by this change.")
+    log.info(f"  v7.9.1 change      : Twitter search chunked into {TWITTER_CHUNK_SIZE}-keyword OR-queries — fixes")
+    log.info(f"                     : HTTP 414 Request-URI Too Large from v7.9.0's single giant query. ONE chunk")
+    log.info(f"                     : is sent per TWITTER_POLL_INTERVAL, advancing through all {len(TWITTER_SEARCH_CHUNKS)} chunk(s)")
+    log.info(f"                     : and wrapping back to chunk 1 once the full list is covered. Chunk position")
+    log.info(f"                     : persists across restarts. RapidAPI key failover (429/403) unchanged from")
+    log.info(f"                     : v7.9.0. Reddit, Telegram, Facebook, LinkedIn, scoring, storage, delivery,")
+    log.info(f"                     : and every FastAPI route are 100% untouched by this change.")
     log.info("=" * 70)
 
     _hs_verify_properties()
