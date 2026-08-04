@@ -522,7 +522,7 @@ KEYWORDS = [
     "chief financial officer", "head of finance", "finance director",
     "controller international", "global controller",
 ]
-]
+
 
 
 def passes_keyword_filter(text: str):
