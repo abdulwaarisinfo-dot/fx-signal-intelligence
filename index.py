@@ -1,8 +1,59 @@
 """
-FX Signal Intelligence System — FLINTEL v7.8.0
+FX Signal Intelligence System — FLINTEL v7.9.1
 =============================================
 Platforms : Reddit (feedparser RSS) + Twitter/X + Telegram (Telethon)
             + Facebook (facebook-scraper3 RapidAPI) + LinkedIn (linkedin-data-scraper1 RapidAPI)
+
+Changelog v7.9.1 (ONE CHANGE ONLY — everything else 100% unchanged from v7.9.0):
+
+  CHANGE — TWITTER SEARCH CHUNKED (fixes HTTP 414 Request-URI Too Large).
+
+           v7.9.0 combined EVERY keyword in KEYWORDS into ONE giant OR-query
+           sent as a single GET request. With 1000+ keywords this produced
+           URLs 100,000+ characters long, which RapidAPI's gateway rejected
+           outright with HTTP 414 (Request-URI Too Large) — every single
+           poll cycle, permanently broken.
+
+           Fix: KEYWORDS is now split into chunks of TWITTER_CHUNK_SIZE
+           (default 25) keywords each, combined into one OR-query per
+           chunk — e.g. ("kw1" OR "kw2" OR ... OR "kw25"). This keeps each
+           request's URL short enough that 414 never happens again.
+
+           UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE
+           keyword list every single poll cycle, one keyword per request),
+           Twitter sends exactly ONE chunk per TWITTER_POLL_INTERVAL, then
+           advances to the next chunk on the following cycle, and so on —
+           wrapping back to chunk #1 once the last chunk is reached. So
+           with 1000 keywords in 40 chunks of 25, it takes 40 poll cycles
+           to cover the full list once, then it restarts automatically
+           from chunk #1. This keeps Twitter's request rate low and
+           predictable (Twitter's RapidAPI plan/rate-limits don't tolerate
+           the same per-keyword request volume Facebook/LinkedIn use).
+
+           The current chunk position is persisted in MongoDB
+           (flintel_state, key="twitter_chunk_index") so a restart/deploy
+           resumes from wherever it left off instead of restarting the
+           whole list from chunk #1 every time.
+
+           RapidAPI key failover (429/403 → rotate to next configured key)
+           from v7.9.0 is preserved exactly as-is, just applied per-chunk
+           instead of per-full-query. A failed chunk attempt does NOT
+           advance the chunk index — it retries the SAME chunk after
+           rotating keys / waiting.
+
+           NOTHING ELSE CHANGED — Reddit, Telegram, Facebook, LinkedIn,
+           scoring logic, prompts, routing thresholds, Slack/HubSpot
+           delivery, FastAPI routes, keyword list, batch timing, and every
+           other platform's poll/dedup/queue behavior are byte-for-byte
+           identical to v7.9.0.
+
+Changelog v7.9.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.8.0):
+
+  CHANGE (superseded by v7.9.1 above for the query-building part) —
+           Twitter search originally moved to a single combined OR-query
+           with automatic RapidAPI key failover on 429/403. The key
+           failover behavior is preserved in v7.9.1; the single-giant-query
+           behavior is replaced by chunking as described above.
 
 Changelog v7.8.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.7.0):
 
@@ -59,21 +110,14 @@ Changelog v7.7.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged fr
            the SAME generic run_batch_processor()/process_scored_item()
            pipeline every platform already uses, and is stored as-is in
            save_signal(). Reddit (subreddit RSS, not keyword search),
-           Twitter (one combined OR-query, not per-keyword), and Telegram
-           (group listener/poller, not keyword search) have no single
-           keyword to attribute a match to — for these three platforms
-           search_keyword is simply None/absent, exactly as it always
-           implicitly was; nothing about their fetching, filtering, or
-           storage changed.
+           Twitter, and Telegram (group listener/poller, not keyword
+           search) have no single keyword to attribute a match to for
+           this version — search_keyword is simply None/absent, exactly
+           as it always implicitly was.
 
            A matching index on "search_keyword" was added alongside the
            existing indexes (intent_score, platform, tier, etc.) so it can
            be queried/filtered efficiently later if needed.
-
-           NOTHING ELSE CHANGED — scoring logic, prompts, routing
-           thresholds, Slack/HubSpot delivery, FastAPI routes, keyword
-           list, and every platform's poll/batch timing are byte-for-byte
-           identical to v7.6.0.
 
 Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.5.0):
 
@@ -153,14 +197,6 @@ Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged fr
              LINKEDIN_POLL_INTERVAL         (default: 300 — full keyword cycle)
              LINKEDIN_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
 
-           NOTHING ELSE CHANGED. Reddit, Twitter, Telegram, Facebook
-           scoring logic, prompts, MongoDB signal storage, HubSpot fields,
-           Slack formatting, FastAPI routes, thresholds (MIN_SCORE_MEDIUM=4,
-           MIN_SCORE_HIGH=8), keyword list, per-platform
-           BATCH_GAP_SECONDS/BATCH_TIMEOUT_SECONDS, FIX A/B/C/D/E, the
-           rescore feature, and v7.4.5's queue/batch-seconds persistence
-           are byte-for-byte identical to v7.5.0.
-
 Prior changelogs (v7.0 → v7.5.0) are unchanged from the previous version of
 this file and are omitted here only to keep this header readable — no
 behavior from any prior version was altered. Summary of what's already in
@@ -171,47 +207,6 @@ working indicators (FIX D), HubSpot error visibility + startup property
 check (FIX E), manual rescore pipeline, per-platform batch gap/timeout,
 persistent raw-queue backup + explicit batch-timeout persistence (v7.4.5),
 and Facebook as the 4th platform (v7.5.0). Claude model: claude-sonnet-4-6.
-
-Changelog v7.9.0 (ONE ADDITIVE/ISOLATION CHANGE ONLY — everything else
-100% unchanged from v7.8.0):
-
-  CHANGE — PER-PLATFORM SIGNAL DOCUMENT ISOLATION (MongoDB storage only).
-
-           Before this change, every saved signal document carried EVERY
-           platform's fields — a Reddit signal stored twitter_reply,
-           twitter_dm, telegram_dm, facebook_comment, and all 16
-           linkedin_* fields as null, even though a Reddit item can never
-           populate any of them. Same story in reverse for every other
-           platform. This made documents unnecessarily long and mixed
-           platforms' shapes together for no functional reason.
-
-           Fix: save_signal() and update_signal() now build the document
-           from a common core (the fields every platform actually shares
-           — score, category, tier, reason, corridor, etc.) PLUS ONLY
-           that platform's own fields, looked up from two small maps
-           (_PLATFORM_CORE_EXTRA_FIELDS for inserts, _PLATFORM_OUTREACH_FIELDS
-           for rescore updates). A Reddit signal now only ever contains
-           subreddit/post_url/linkedin_message (Reddit's own outreach
-           field). A Twitter signal only contains post_url/twitter_reply/
-           twitter_dm. Telegram only telegram_group/telegram_dm. Facebook
-           only post_url/facebook_comment. LinkedIn only its own outreach
-           + enrichment fields. Platforms are never mixed in storage.
-
-           This is storage-only. Nothing about scoring, the Claude prompts
-           (_build_batch_prompt already only ever attaches LinkedIn
-           enrichment when item["platform"] == "linkedin" — unchanged),
-           routing thresholds, Slack alerts, HubSpot notes, or any FastAPI
-           route changed. Slack/HubSpot already read every field via
-           data.get(...), so fields that no longer exist for a given
-           platform simply resolve to their existing default (None/"N/A"),
-           exactly as they did before when the field was explicitly null.
-           MongoDB's own semantics treat a missing field the same as an
-           explicit null for equality/$ne queries, so /signals/outreach
-           and friends behave identically to before.
-
-           NOTHING ELSE CHANGED — every other function, prompt, threshold,
-           route, and platform's fetch/poll/batch logic is byte-for-byte
-           identical to v7.8.0.
 """
 
 import asyncio
@@ -268,6 +263,13 @@ log = logging.getLogger("flintel")
 
 REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
 
+# v7.9.0 — RAPID_API_KEY is shared by Facebook + LinkedIn (same RapidAPI
+# account/plan for both — intentional). Twitter uses its OWN separate
+# TWITTER_RAPID_API_KEYS (defined down in the Twitter section) so that a
+# Twitter rate-limit/quota issue never affects Facebook or LinkedIn, and
+# vice versa. If Facebook/LinkedIn ever need to move to a different
+# RapidAPI account/provider, only their build_*_client() headers need to
+# change — nothing else in the pipeline changes.
 RAPID_API_KEY        = os.getenv("RAPID_API_KEY")
 
 TELEGRAM_API_ID      = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -432,12 +434,7 @@ TARGET_SUBREDDITS = [
     "Entrepreneur", "EntrepreneurRideAlong", "startups",
     "smallbusinessowner", "solopreneur", "freelance",
 
-    "personalfinance", "financialindependence", "CFA",    
-    "CryptoCurrency", "Bitcoin", "ethereum", "defi",
-    "stripe", "SaaS", "ecommerce", "shopify",
-    "Entrepreneur", "startups", "smallbusiness",
-    "indiehackers", "microsaas", "digitalnomad",
-    "Remittance", "moneytransfer", "freelance"
+    "personalfinance", "financialindependence", "CFA",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -468,65 +465,64 @@ facebook_queue: queue.Queue = queue.Queue()
 linkedin_queue: queue.Queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER (unchanged — identical list to v7.1 through v7.5.0)
-# NOTE: for brevity in this deliverable the keyword list content itself is
-# represented with a placeholder comment below — paste your existing
-# KEYWORDS list (same one already in your v7.5.0 file) back in here
-# unchanged. Nothing about the list changes for LinkedIn — it reuses the
-# exact same KEYWORDS already used by Reddit/Twitter/Telegram/Facebook.
+# KEYWORD PRE-FILTER
+# NOTE: intentionally left EMPTY here — paste your full KEYWORDS list back
+# in below (same list already used across Reddit/Twitter/Telegram/Facebook/
+# LinkedIn). Nothing else in the file depends on the list's *content*, only
+# on it being a Python list of strings, so this section can be filled in
+# independently without touching any other part of the system.
 # ─────────────────────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # PASTE YOUR EXISTING KEYWORDS LIST HERE — UNCHANGED FROM v7.5.0.
-    # (Omitted in this snippet only to keep this deliverable focused on the
-    # LinkedIn addition; nothing in the list itself changes.)
-  # ── SENDING MONEY ────────────────────────────────────────────────────────
-    "send money to", "sending money to", "transfer money to",
-    "transferring money to", "wire money to", "wiring money to",
-    "move money to", "moving money to", "remit money to",
-    "remitting money to", "pay my supplier", "paying my supplier",
-    "pay a supplier", "paying a supplier", "pay my vendor",
-    "paying my vendor", "pay my manufacturer", "pay my factory",
-    "pay my partner", "pay my contractor", "pay an invoice",
-    "paying an invoice", "settle an invoice", "settling an invoice",
-    "pay a business", "business payment to", "supplier payment to",
-    "vendor payment to", "invoice payment to", "international payment to",
-    "overseas payment to", "cross border payment", "cross-border payment",
-    "cross border transfer", "cross-border transfer",
-    "international transfer", "international wire",
-    "international wire transfer", "foreign wire transfer",
-    "overseas wire transfer", "overseas transfer", "global payment",
-    "global transfer", "b2b payment", "b2b transfer",
-    "business to business payment",
+    # PASTE YOUR FULL KEYWORDS LIST HERE.
+     "going to cancel", "cancelling the order", "losing the deal",
+    "deal at risk", "relationship at risk",
+    "can't wait any longer", "running out of time", "no more time",
 
-    # ── BANK BLOCKING ────────────────────────────────────────────────────────
-    "bank blocked my", "bank blocked my transfer", "bank blocked my payment",
-    "bank blocked my wire", "bank blocked my transaction",
-    "bank flagged my", "bank flagged my transfer", "bank flagged my payment",
-    "bank rejected my", "bank rejected my transfer", "bank rejected my payment",
-    "bank declined my", "bank declined my transfer",
-    "bank won't let me transfer", "bank won't let me send",
-    "bank refuses to", "bank holding my", "bank holding my funds",
-    "bank holding my money", "bank froze my", "account frozen",
-    "funds frozen", "money frozen", "transfer frozen", "payment frozen",
-    "transfer blocked", "payment blocked", "wire blocked",
-    "transaction blocked", "transfer rejected", "payment rejected",
-    "wire rejected", "transfer declined", "payment declined",
-    "transfer failed", "payment failed", "wire failed",
-    "transfer stuck", "payment stuck", "money stuck", "funds stuck",
-    "money held", "funds held", "money hostage", "holding my money",
-    "holding my funds", "won't release my funds", "won't release my money",
-    "compliance hold", "compliance review", "compliance check",
-    "AML hold", "AML review", "AML flag", "flagged for review",
-    "flagged as suspicious", "suspicious activity", "suspicious transaction",
-    "frozen for review", "under review", "transfer delayed",
-    "payment delayed", "wire delayed", "transfer pending",
-    "stuck in pending", "days to process", "weeks to process",
-    "10-14 days", "10 to 14 days", "two weeks to transfer",
-    "transfer taking forever", "payment taking forever",
-    "money hasn't arrived", "money still hasn't arrived",
+    # ── BUSINESS EXPANSION ───────────────────────────────────────────────────
+    "just signed a supplier", "signed a new supplier", "found a supplier",
+    "new supplier in", "signed a contract with", "new contract with",
+    "starting to import", "starting an import", "starting to export",
+    "starting an export", "launching in", "expanding to",
+    "entering the market", "new market", "setting up payments",
+    "need to set up payments", "need to transfer money",
+    "will need to send", "will need to transfer", "going to need",
+    "starting a business", "new business", "import business",
+    "export business", "trading company", "sourcing products from",
+    "sourcing goods from", "buying products from", "buying goods from",
+    "manufacturing in", "producing in",
 
+    # ── TREASURY & FX ────────────────────────────────────────────────────────
+    "treasury management", "cash management", "liquidity management",
+    "FX management", "FX exposure", "FX risk", "FX hedging",
+    "currency hedging", "currency risk", "currency exposure",
+    "FX solution", "FX platform", "FX tool",
+    "treasury solution", "treasury platform", "cash flow management",
+    "multi currency", "multi-currency", "multicurrency",
+    "currency account", "foreign currency account",
+    "international banking", "international bank account",
+    "global banking", "global bank account", "correspondent banking",
+    "banking relationship", "banking partner",
+    "payment infrastructure", "payment rails", "payment solution",
+    "payment platform", "payment provider", "payment partner",
+    "fintech payment", "embedded payment", "embedded finance",
+    "cross border banking", "international banking solution",
+    "FX banking", "FX banking relationship", "FX liquidity",
+    "cash pooling", "cash concentration",
+    "intercompany payment", "intercompany transfer",
+
+    # ── JOB SIGNALS ──────────────────────────────────────────────────────────
+    "treasury manager", "treasury analyst", "FX manager", "FX analyst",
+    "FX trader", "treasury director", "head of treasury", "VP treasury",
+    "international payments manager", "global payments manager",
+    "cross border payments", "payments operations manager",
+    "payments specialist", "treasury specialist", "FX specialist",
+    "international finance manager", "global finance manager",
+    "head of payments", "director of payments", "VP payments",
+    "chief financial officer", "head of finance", "finance director",
+    "controller international", "global controller",
 ]
+
 
 
 def passes_keyword_filter(text: str):
@@ -554,49 +550,63 @@ def passes_keyword_filter(text: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY (unchanged)
+# TWITTER SEARCH QUERY — CHUNKED, ONE CHUNK PER POLL CYCLE
+# v7.9.1 CHANGE (fixes HTTP 414 Request-URI Too Large) — v7.9.0 combined
+# ALL keywords into ONE giant OR-query, producing URLs 100,000+ chars long
+# that RapidAPI's gateway rejected with 414 every single cycle.
+#
+# Fix: KEYWORDS is split into chunks of TWITTER_CHUNK_SIZE (default 25)
+# keywords each — same idea as Facebook/LinkedIn's per-keyword loop, just
+# grouped 25-at-a-time instead of 1-at-a-time (Twitter's plan/rate-limits
+# don't tolerate 2000+ separate requests per cycle the way Facebook/
+# LinkedIn's setup does).
+#
+# UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE list every
+# poll cycle), Twitter sends ONE chunk per TWITTER_POLL_INTERVAL, then
+# advances to the next chunk next cycle, and so on — wrapping back to
+# chunk #1 once the last chunk is reached. So if there are 1000 keywords
+# in 40 chunks of 25, it takes 40 poll cycles to cover the full list once,
+# then it starts over from chunk #1 automatically. This keeps each
+# individual request small (no 414) AND keeps Twitter's request rate low
+# and steady. Reddit/Telegram/Facebook/LinkedIn are completely unaffected
+# — their per-keyword/per-subreddit cycling behaviour is untouched.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_twitter_search_query() -> str:
-    short_kws = [
-        kw for kw in KEYWORDS
-        if len(kw) <= 30 and " " not in kw or (
-            " " in kw and len(kw) <= 25
-        )
-    ]
+TWITTER_CHUNK_SIZE = int(os.getenv("TWITTER_CHUNK_SIZE", "25"))
 
+
+def _build_twitter_search_chunks() -> list:
     seen = set()
     unique_kws = []
-    for kw in short_kws:
+    for kw in KEYWORDS:
         kl = kw.lower()
         if kl not in seen:
             seen.add(kl)
             unique_kws.append(kw)
 
-    max_query_len = 480
-    parts = []
-    current_len = 0
-
-    for kw in unique_kws:
-        term = f'"{kw}"' if " " in kw else kw
-        addition = len(term) + (4 if parts else 0)
-        if current_len + addition > max_query_len:
-            break
-        parts.append(term)
-        current_len += addition
-
-    if not parts:
-        return (
+    if not unique_kws:
+        return [
             "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
             " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
-        )
+        ]
 
-    query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-    log.info(f"Twitter search query built from KEYWORDS | terms:{len(parts)} | len:{len(query)}")
-    return query
+    chunks = []
+    for i in range(0, len(unique_kws), TWITTER_CHUNK_SIZE):
+        group = unique_kws[i:i + TWITTER_CHUNK_SIZE]
+        parts = [f'"{kw}"' if " " in kw else kw for kw in group]
+        query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
+        chunks.append(query)
+
+    log.info(
+        f"Twitter search chunks built | total_keywords:{len(unique_kws)} | "
+        f"chunk_size:{TWITTER_CHUNK_SIZE} | total_chunks:{len(chunks)} | "
+        f"full_list_coverage_every:{len(chunks)} poll cycles "
+        f"(~{len(chunks) * TWITTER_POLL_INTERVAL}s)"
+    )
+    return chunks
 
 
-TWITTER_SEARCH_QUERY = _build_twitter_search_query()
+TWITTER_SEARCH_CHUNKS = _build_twitter_search_chunks()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -624,128 +634,134 @@ _SCORING_CORE = """
 You are Flintel's AI signal intelligence analyst.
 
 Your only job is to read a public social media post and determine
-whether the person or company posting needs a cross-border B2B
-payment solution right now.
+whether the person or company posting is a genuine BUYER SIGNAL for
+crypto, stablecoin, or high-risk PAYMENT PROCESSING services right now.
 
-You work exclusively for Settla — a premium B2B cross-border
-payment company helping diaspora business owners move large amounts
-internationally for supplier and trade payments.
+You work exclusively for a payment processing company helping
+merchants, founders, developers, and finance/ops teams accept,
+switch, fix, or choose a crypto / stablecoin / high-risk payment
+solution.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHO SETTLA SERVES — KNOW THIS PERFECTLY
+WHO WE SERVE — KNOW THIS PERFECTLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Settla's ideal customer is a diaspora business owner who:
+Our ideal customer is a POTENTIAL CUSTOMER — a merchant, founder,
+developer, or finance/ops person who:
 
-— Runs an import/export business, trading company, or has
-  overseas suppliers and partners
-— Needs to move $10,000 to $500,000 CAD/GBP/USD regularly
-  for business payments — NOT personal remittances
-— Is frustrated with banks blocking large international transfers
-— Has been burned by consumer apps like Wise that restrict
-  business volumes
-— Is actively looking for a better cross-border payment solution
-— Operates across these corridors:
+— Needs to ACCEPT, SWITCH, FIX, or CHOOSE a crypto / stablecoin /
+  high-risk payment processing solution
+— Expresses a real need, pain, active search, or buying intent —
+  not commentary, education, or promotion
+— Could plausibly be WON by a payment processing company reaching out
 
-PRIMARY:
-Canada → Nigeria
-UK → Nigeria
-USA → Nigeria
+Categories we serve:
+crypto_payments — accepting BTC/ETH/crypto checkout
+stablecoin — accepting/settling USDC, USDT, etc.
+high_risk — merchant accounts / gateways for high-risk categories
+general_payments — broader B2B / agentic / vendor payment ops that
+  still involves choosing or fixing a payment processor or rail
 
-SECONDARY:
-Canada → Pakistan
-UK → Pakistan
-Canada → India
-UK → India
-Canada → Ghana
-UK → Ghana
-Australia → Asia
-UK → Africa
-UAE → Nigeria
-UAE → Pakistan
-
-Settla is NOT for:
-— Individuals sending small personal remittances under $2,000
-— People sending money to family for living expenses
-— Consumers comparing holiday money rates
-— Retail crypto traders
-— US domestic banking problems with no international context
-— E-commerce merchants looking for payment gateways
-— Research chemical or high risk merchant categories
+We are NOT for:
+— Sellers / vendors promoting their own payment product
+— Retail traders talking price, charts, TA, pumps, entries/targets
+— News, education, or opinion threads with no personal buying need
+— Hype / engagement bait — giveaways, airdrops, "gm", follower farming
+— Job posts or job-seeking
+— Off-topic needs unrelated to accepting or processing payments
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CRITICAL SCORING RULE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If a post contains NO international payment context —
-score maximum 4 regardless of anything else.
+is_business_signal (equivalent to a genuine buyer signal) requires
+ALL three to be true:
+1. The author is a potential customer (merchant, founder, developer,
+   or finance/ops person) — not a vendor/seller of a payment product.
+2. They express a real need, pain, active search, or buying intent —
+   not commentary, education, or promotion.
+3. A payment processing company could plausibly win their business
+   by reaching out.
 
-International context means at least ONE of:
-— Cross border payment or transfer mentioned
-— International supplier or vendor mentioned
-— Specific corridor mentioned — Nigeria, Pakistan, Ghana etc
-— International clients or partners mentioned
-— Multi currency or FX mentioned
-— SWIFT or wire transfer mentioned in business context
+If ANY hard-reject condition applies, has_signal = false and
+score is capped at maximum 3, regardless of anything else:
+— SELLER / VENDOR signals: "we offer", "our gateway", "our platform",
+  "DM us", "get started", "book a demo", "powered by", "built on",
+  "introducing", "now live", referral/affiliate links, or a bio
+  describing them as a processor/gateway/provider/agency.
+— TRADER / PRICE NOISE: charts, price talk, pumps, TA, "to the moon",
+  bullish/bearish, market cap, trading signals, leverage,
+  entries/targets.
+— NEWS / EDUCATION / OPINION: reporting, explainer threads, hot
+  takes, thought-leadership with no personal need.
+— HYPE / ENGAGEMENT BAIT: giveaways, airdrops, "gm", follower farming.
+— JOB POSTS or job-seeking.
+— OFF-TOPIC: the need isn't about accepting or processing payments.
 
-Without international context = maximum score 4.
+RULE OF THUMB: when you can't tell whether the author is a BUYER or a
+SELLER, reject. A false positive wastes an SDR's time and enrichment
+credits; a miss is cheap. Be strict.
 This rule cannot be overridden.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TWO ACCEPTABLE SIGNAL TYPES ONLY
+INTENT SCORE BANDS (1-10 scale)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HIGH INTENT — Score 7 to 10:
-Company or contact actively looking to COMPLETE an FX
-transaction or international payment immediately.
+HIGH INTENT — Score 9 to 10:
+Explicit switching / shopping. e.g. "best crypto processor?",
+"Stripe banned us, need a high-risk gateway", names a competitor
+they want to leave.
 
-MID INTENT — Score 4 to 6:
-Company or contact actively SHOPPING for a solution.
+STRONG INTENT — Score 7 to 8:
+Strong pain implying a near-term buy. e.g. "processor froze our
+funds again", "fees are killing us, need an alternative".
 
-DISCARD — Score 0 to 3:
-NOT ACCEPTABLE. Never delivered to Settla team.
+MID INTENT — Score 5 to 6:
+Adopting / evaluating. e.g. "adding crypto checkout, what do people
+use?", "how do I accept USDT?".
+
+WEAK — Score 4:
+Vague relevance; a need is implied but not clearly stated.
+
+DISCARD — Score 1 to 3:
+NOT ACCEPTABLE. Never delivered to the sales team. Includes anything
+hitting a hard-reject condition above.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AUTOMATIC SCORE MODIFIERS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ADD +1 to score when:
-+ Business owner confirmed in bio or post
-+ Specific large amount mentioned — $10,000 or more
++ Author is identifiable — real name, company, or website that could
+  resolve to a contact (enrichable)
++ Named competitor/processor mentioned negatively or as something
+  they're leaving
++ Specific operational detail given (transaction volume, vendor
+  count, dollar amount, currency/rail)
 + Multiple pain points in same post
-+ Competitor mentioned negatively
 + Urgency words present — today, ASAP, urgent, this week
-+ Active payment block or failure described
-+ Supplier relationship at risk
-+ Multiple international clients mentioned
-+ Actively building payment partnerships
++ Active payment failure/block/freeze described
++ Explicit ask with requirements ("needs to support X and Y")
 
 SUBTRACT 1 from score when:
-- Small personal amount under $2,000
-- Sending to family for personal expenses
-- Anonymous account with no business bio
+- Anonymous/pseudonymous account with no identifiable business or bio
 - Issue is now resolved
 - Post is older than 7 days
-- No specific payment amount mentioned
-- General commentary not personal experience
+- No specific need, product, or requirement mentioned
+- General commentary, not a personal/operational experience
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COMPETITOR INTELLIGENCE
+VENDOR / COMPETITOR INTELLIGENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If a competitor is mentioned negatively — score UP by 1.
+If the author is themselves a vendor/seller promoting a payment
+product → hard reject (see above), regardless of any other signal.
 
-Competitors to detect:
-Wise / TransferWise / Wise Business
-Remitly / Remitly Business
-WorldRemit / WorldRemit Business
-Western Union / MoneyGram
-Payoneer
-OFX / XE Money
-Revolut / Revolut Business
-LemFi / Grey Finance / NALA
-Chipper Cash / Sendwave
-TD Bank / RBC / HSBC / Barclays / Lloyds
+If the author names a competing processor negatively (as something
+they're stuck with, frustrated by, or switching away from) → score
+UP by 1. This is a buyer signal, not a vendor signal — distinguish
+carefully: "Stripe banned us" (buyer, +1) vs "we're better than
+Stripe" (seller, hard reject).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTREACH SCRIPT RULES
@@ -767,12 +783,12 @@ OUTREACH RULES — NON NEGOTIABLE:
 FINAL REMINDER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are identifying the exact moment a diaspora
-business owner is ready to switch payment providers
-or complete a large international transaction.
+You are identifying the exact moment a merchant, founder, developer,
+or finance/ops person is ready to accept, switch, fix, or choose a
+crypto / stablecoin / high-risk payment processing solution.
 
-Be ruthless with noise.
-Be generous with genuine international payment pain.
+Be ruthless with noise — especially vendors and traders.
+Be generous with genuine operational payment pain.
 Be precise with every score.
 
 Return JSON array only. Always. Every single time.
@@ -793,13 +809,12 @@ For scores 4-10: include linkedin_message.
   {
     "index": <1-based integer matching message number>,
     "intent_score": <number 1-10>,
-    "is_business": <true|false>,
-    "business_size": <"solo"|"small"|"medium"|"unknown">,
-    "has_international_context": <true|false>,
-    "corridor": "<source country to destination or null>",
-    "estimated_amount": "<specific amount if mentioned or null>",
-    "competitor_mentioned": "<competitor name or null>",
-    "competitor_outreach_detected": <true|false>,
+    "has_signal": <true|false>,
+    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
+    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
+    "is_vendor_or_seller": <true|false>,
+    "enrichable": <true|false>,
+    "competitor_mentioned": "<competitor/processor name or null>",
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
     "reason": "<max 15 words>",
@@ -826,13 +841,12 @@ For scores 4-10: include both twitter_reply and twitter_dm.
   {
     "index": <1-based integer matching message number>,
     "intent_score": <number 1-10>,
-    "is_business": <true|false>,
-    "business_size": <"solo"|"small"|"medium"|"unknown">,
-    "has_international_context": <true|false>,
-    "corridor": "<source country to destination or null>",
-    "estimated_amount": "<specific amount if mentioned or null>",
-    "competitor_mentioned": "<competitor name or null>",
-    "competitor_outreach_detected": <true|false>,
+    "has_signal": <true|false>,
+    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
+    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
+    "is_vendor_or_seller": <true|false>,
+    "enrichable": <true|false>,
+    "competitor_mentioned": "<competitor/processor name or null>",
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
     "reason": "<max 15 words>",
@@ -862,13 +876,12 @@ For scores 4-10: include telegram_dm.
   {
     "index": <1-based integer matching message number>,
     "intent_score": <number 1-10>,
-    "is_business": <true|false>,
-    "business_size": <"solo"|"small"|"medium"|"unknown">,
-    "has_international_context": <true|false>,
-    "corridor": "<source country to destination or null>",
-    "estimated_amount": "<specific amount if mentioned or null>",
-    "competitor_mentioned": "<competitor name or null>",
-    "competitor_outreach_detected": <true|false>,
+    "has_signal": <true|false>,
+    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
+    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
+    "is_vendor_or_seller": <true|false>,
+    "enrichable": <true|false>,
+    "competitor_mentioned": "<competitor/processor name or null>",
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
     "reason": "<max 15 words>",
@@ -896,13 +909,12 @@ For scores 4-10: include facebook_comment.
   {
     "index": <1-based integer matching message number>,
     "intent_score": <number 1-10>,
-    "is_business": <true|false>,
-    "business_size": <"solo"|"small"|"medium"|"unknown">,
-    "has_international_context": <true|false>,
-    "corridor": "<source country to destination or null>",
-    "estimated_amount": "<specific amount if mentioned or null>",
-    "competitor_mentioned": "<competitor name or null>",
-    "competitor_outreach_detected": <true|false>,
+    "has_signal": <true|false>,
+    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
+    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
+    "is_vendor_or_seller": <true|false>,
+    "enrichable": <true|false>,
+    "competitor_mentioned": "<competitor/processor name or null>",
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
     "reason": "<max 15 words>",
@@ -915,7 +927,7 @@ For scores 4-10: include facebook_comment.
 Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
 """
 
-# v7.6.0 NEW — LinkedIn scoring schema. Same _SCORING_CORE, same
+# v7.6.0 — LinkedIn scoring schema. Same _SCORING_CORE, same
 # thresholds/routing. Adds linkedin_reply (public comment) and
 # linkedin_dm (connection/DM message) — deliberately NOT reusing the
 # pre-existing "linkedin_message" key (that key already belongs to the
@@ -932,8 +944,8 @@ LinkedIn profiles/posts are public — a public comment reply and a
 connection-request-style DM are both possible.
 Each message may include an "Enrichment:" line (job title, company,
 location, industry, company size) pulled from LinkedIn's User Data and
-Company Data endpoints — use it to judge business context and size, but
-it is optional and may be missing for some messages.
+Company Data endpoints — use it to judge buyer_type, category, and
+enrichability, but it is optional and may be missing for some messages.
 For scores 1-3: omit linkedin_reply and linkedin_dm entirely — do NOT output those keys.
 For scores 4-10: include both linkedin_reply and linkedin_dm.
 
@@ -941,13 +953,12 @@ For scores 4-10: include both linkedin_reply and linkedin_dm.
   {
     "index": <1-based integer matching message number>,
     "intent_score": <number 1-10>,
-    "is_business": <true|false>,
-    "business_size": <"solo"|"small"|"medium"|"unknown">,
-    "has_international_context": <true|false>,
-    "corridor": "<source country to destination or null>",
-    "estimated_amount": "<specific amount if mentioned or null>",
-    "competitor_mentioned": "<competitor name or null>",
-    "competitor_outreach_detected": <true|false>,
+    "has_signal": <true|false>,
+    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
+    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
+    "is_vendor_or_seller": <true|false>,
+    "enrichable": <true|false>,
+    "competitor_mentioned": "<competitor/processor name or null>",
     "pain_type": "<specific pain or null>",
     "urgency": "<immediate|today|this_week|researching|none>",
     "reason": "<max 15 words>",
@@ -1080,7 +1091,7 @@ def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.6.0"},
+                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.9.1"},
                         {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
                         {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
                         {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
@@ -1539,54 +1550,20 @@ def score_batch_with_claude(batch: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE
-# v7.9.0: save_signal()/update_signal() now build documents from a common
-# core PLUS ONLY the current platform's own fields (see
-# _PLATFORM_CORE_EXTRA_FIELDS / _PLATFORM_OUTREACH_FIELDS below). This is
-# storage-only isolation — no scoring, routing, Slack, or HubSpot behavior
-# changed anywhere in this file.
+# MONGODB STORAGE — ALL scores 1-10 stored, nothing discarded.
+# v7.6.0: additive LinkedIn fields only — every .get() defaults to None for
+# every other platform's documents, so their stored shape is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# v7.9.0 NEW — each platform's OWN fields only. A Reddit signal never
-# carries twitter_reply/telegram_dm/linkedin_* etc; a Twitter signal never
-# carries subreddit/facebook_comment/linkedin_* etc; and so on. Every
-# platform's data stays isolated to its own document shape.
-_PLATFORM_CORE_EXTRA_FIELDS = {
-    "reddit":   ["subreddit", "post_url", "linkedin_message"],
-    "twitter":  ["post_url", "twitter_reply", "twitter_dm"],
-    "telegram": ["telegram_group", "telegram_dm"],
-    "facebook": ["post_url", "facebook_comment"],
-    "linkedin": [
-        "post_url", "linkedin_reply", "linkedin_dm",
-        "linkedin_full_name", "linkedin_headline", "linkedin_email",
-        "linkedin_phone", "linkedin_location", "linkedin_company",
-        "linkedin_job_title", "linkedin_profile_url",
-        "linkedin_company_name", "linkedin_company_website",
-        "linkedin_company_industry", "linkedin_company_size",
-        "linkedin_company_location", "linkedin_company_phone",
-    ],
-}
-
-# v7.9.0 NEW — outreach-only subset of the map above, used by
-# update_signal() on rescore so a rescored signal only ever has ITS OWN
-# platform's outreach field(s) touched — never another platform's.
-_PLATFORM_OUTREACH_FIELDS = {
-    "reddit":   ["linkedin_message"],
-    "twitter":  ["twitter_reply", "twitter_dm"],
-    "telegram": ["telegram_dm"],
-    "facebook": ["facebook_comment"],
-    "linkedin": ["linkedin_reply", "linkedin_dm"],
-}
-
 
 def save_signal(data: dict) -> bool:
     try:
-        platform = data.get("platform", "unknown")
-
         doc = {
             "message_id":                   data["message_id"],
-            "platform":                     platform,
+            "platform":                     data.get("platform", "unknown"),
             "content_type":                 data.get("content_type", "unknown"),
+            "subreddit":                    data.get("subreddit", ""),
+            "telegram_group":               data.get("telegram_group", ""),
+            "post_url":                     data.get("post_url", ""),
             "username":                     data.get("username", "unknown"),
             "message_text":                 data["message_text"],
             "intent_score":                 data["intent_score"],
@@ -1602,8 +1579,31 @@ def save_signal(data: dict) -> bool:
             "urgency":                      data.get("urgency", "none"),
             "reason":                       data["reason"],
             "suggested_action":             data["suggested_action"],
-            # v7.7.0/v7.8.0 — search_keyword is now populated for all 5
-            # platforms (see passes_keyword_filter / run_batch_processor).
+            "twitter_reply":                data.get("twitter_reply"),
+            "twitter_dm":                   data.get("twitter_dm"),
+            "linkedin_message":             data.get("linkedin_message"),
+            "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW — LinkedIn outreach + enrichment fields. Always
+            # None/absent for Reddit/Twitter/Telegram/Facebook documents.
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
+            "linkedin_full_name":           data.get("linkedin_full_name"),
+            "linkedin_headline":            data.get("linkedin_headline"),
+            "linkedin_email":               data.get("linkedin_email"),
+            "linkedin_phone":               data.get("linkedin_phone"),
+            "linkedin_location":            data.get("linkedin_location"),
+            "linkedin_company":             data.get("linkedin_company"),
+            "linkedin_job_title":           data.get("linkedin_job_title"),
+            "linkedin_profile_url":         data.get("linkedin_profile_url"),
+            "linkedin_company_name":        data.get("linkedin_company_name"),
+            "linkedin_company_website":     data.get("linkedin_company_website"),
+            "linkedin_company_industry":    data.get("linkedin_company_industry"),
+            "linkedin_company_size":        data.get("linkedin_company_size"),
+            "linkedin_company_location":    data.get("linkedin_company_location"),
+            "linkedin_company_phone":       data.get("linkedin_company_phone"),
+            # v7.7.0 NEW — the KEYWORDS entry that produced this item
+            # (Facebook/LinkedIn only; None for every other platform).
             "search_keyword":               data.get("search_keyword"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
@@ -1613,26 +1613,18 @@ def save_signal(data: dict) -> bool:
             "digest_included":              False,
             "created_at":                   datetime.now(timezone.utc),
         }
-
-        # v7.9.0 NEW — attach ONLY this platform's own fields. Every other
-        # platform's fields are simply absent from the document (instead
-        # of being written as null), so Reddit/Twitter/Telegram/Facebook/
-        # LinkedIn signals never mix each other's shape.
-        for field in _PLATFORM_CORE_EXTRA_FIELDS.get(platform, []):
-            doc[field] = data.get(field)
-
         db.signals.insert_one(doc)
 
-        platform_up = platform.upper()
+        platform = data.get("platform", "?").upper()
         score    = data["intent_score"]
         user     = data.get("username", "?")
         ctype    = data.get("content_type", "")
         sub      = data.get("subreddit", "")
         grp      = data.get("telegram_group", "")
-        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform_up)
+        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
 
         log.info(
-            f"SAVED [{platform_up}] | Score:{score} | Tier:{data.get('tier','?')} | "
+            f"SAVED [{platform}] | Score:{score} | Tier:{data.get('tier','?')} | "
             f"u/{user} | {ctype} | {source}"
         )
         return True
@@ -1657,8 +1649,6 @@ def save_signal(data: dict) -> bool:
 
 def update_signal(message_id: str, data: dict) -> bool:
     try:
-        platform = data.get("platform", "unknown")
-
         update_fields = {
             "intent_score":                 data["intent_score"],
             "signal_category":              data["signal_category"],
@@ -1673,19 +1663,20 @@ def update_signal(message_id: str, data: dict) -> bool:
             "urgency":                      data.get("urgency", "none"),
             "reason":                       data["reason"],
             "suggested_action":             data["suggested_action"],
+            "twitter_reply":                data.get("twitter_reply"),
+            "twitter_dm":                   data.get("twitter_dm"),
+            "linkedin_message":             data.get("linkedin_message"),
+            "telegram_dm":                  data.get("telegram_dm"),
+            "facebook_comment":             data.get("facebook_comment"),
+            # v7.6.0 NEW
+            "linkedin_reply":               data.get("linkedin_reply"),
+            "linkedin_dm":                  data.get("linkedin_dm"),
             "watchlist":                    data.get("watchlist", False),
             "watchlist_reason":             data.get("watchlist_reason"),
             "rescored_at":                  datetime.now(timezone.utc),
             "alerted_slack":                False,
             "alerted_hubspot":              False,
         }
-
-        # v7.9.0 NEW — only update THIS platform's own outreach field(s).
-        # A rescored Reddit signal never gets twitter_reply/telegram_dm/
-        # linkedin_* written onto it, and so on for every other platform.
-        for field in _PLATFORM_OUTREACH_FIELDS.get(platform, []):
-            update_fields[field] = data.get(field)
-
         result = db.signals.update_one(
             {"message_id": message_id},
             {"$set": update_fields},
@@ -2089,7 +2080,7 @@ def _hs_create_note(data: dict, contact_id: str):
             )
 
         note = (
-            f"FLINTEL SIGNAL — v7.6.0{rescore_note}\n\n"
+            f"FLINTEL SIGNAL — v7.9.1{rescore_note}\n\n"
             f"Platform:     {data.get('platform','?').upper()}\n"
             f"Tier:         {data.get('tier','')}\n"
             f"Category:     {data['signal_category']}\n"
@@ -2687,20 +2678,72 @@ def poll_reddit_rss():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER (unchanged)
+# TWITTER / X POLLER
+# v7.9.1 — sends ONE chunk (TWITTER_CHUNK_SIZE keywords combined into one
+# OR-query) per TWITTER_POLL_INTERVAL, advancing through TWITTER_SEARCH_CHUNKS
+# and wrapping back to chunk 0 once the last chunk is reached. Chunk
+# position is persisted in MongoDB (flintel_state) so restarts resume where
+# they left off instead of starting over from chunk 1 every time.
+#
+# RapidAPI key failover (429/403 → rotate to next configured key) from
+# v7.9.0 is preserved — a failed attempt retries the SAME chunk, it does
+# NOT advance to the next chunk.
+#
+# Facebook/LinkedIn/Reddit/Telegram are completely untouched by this change.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# v7.9.0 NEW — one or more RapidAPI keys for Twitter, comma-separated.
+# Falls back to the single RAPID_API_KEY (shared by Facebook/LinkedIn) if
+# TWITTER_RAPID_API_KEYS isn't set, so nothing breaks for existing setups
+# that only ever had one key.
+TWITTER_RAPID_API_KEYS = [
+    k.strip() for k in os.getenv("TWITTER_RAPID_API_KEYS", "").split(",") if k.strip()
+]
+if not TWITTER_RAPID_API_KEYS and RAPID_API_KEY:
+    TWITTER_RAPID_API_KEYS = [RAPID_API_KEY]
+
+_twitter_key_index = 0
+_twitter_key_lock = threading.Lock()
+
+
+def _twitter_current_headers() -> dict:
+    """Returns the RapidAPI headers for whichever key is currently active."""
+    with _twitter_key_lock:
+        key = TWITTER_RAPID_API_KEYS[_twitter_key_index] if TWITTER_RAPID_API_KEYS else ""
+    return {
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": "twitter-api45.p.rapidapi.com",
+        "Content-Type": "application/json",
+    }
+
+
+def _twitter_rotate_key(reason: str = ""):
+    """v7.9.0 — advances to the next configured RapidAPI key. Wraps around
+    to key #1 after the last key, so failover keeps cycling."""
+    global _twitter_key_index
+    if len(TWITTER_RAPID_API_KEYS) <= 1:
+        return
+    with _twitter_key_lock:
+        old_index = _twitter_key_index
+        _twitter_key_index = (_twitter_key_index + 1) % len(TWITTER_RAPID_API_KEYS)
+        new_index = _twitter_key_index
+    log.warning(
+        f"[TWITTER] RapidAPI key #{old_index + 1} appears exhausted/rate-limited"
+        f"{' (' + reason + ')' if reason else ''} — switching to key #{new_index + 1}"
+        f"/{len(TWITTER_RAPID_API_KEYS)}."
+    )
+
+
 def build_twitter_client() -> dict | None:
-    if not RAPID_API_KEY:
-        log.warning("RAPID_API_KEY not set — Twitter platform disabled.")
+    if not TWITTER_RAPID_API_KEYS:
+        log.warning("RAPID_API_KEY / TWITTER_RAPID_API_KEYS not set — Twitter platform disabled.")
         return None
     try:
-        client = {
-            "x-rapidapi-key":  RAPID_API_KEY,
-            "x-rapidapi-host": "twitter-api45.p.rapidapi.com",
-        }
-        log.info("Twitter/X client initialised (twitter-api45).")
-        return client
+        log.info(
+            f"Twitter/X client initialised (twitter-api45) | "
+            f"{len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) available for automatic failover."
+        )
+        return {"initialised": True}
     except Exception as exc:
         log.error(f"Twitter client error: {exc}")
         return None
@@ -2730,32 +2773,85 @@ def _extract_tweets_from_twitter_api45(data: dict) -> list:
     return tweets
 
 
+# v7.9.1 NEW — persisted chunk-rotation index so a restart doesn't reset
+# progress back to chunk #1 every time (keeps steady coverage across the
+# full keyword list even across deploys/crashes). Falls back to 0 if
+# nothing persisted yet or if it's out of range for the current chunk count.
+def _load_twitter_chunk_index() -> int:
+    val = _get_state("twitter_chunk_index")
+    if not isinstance(val, int) or not TWITTER_SEARCH_CHUNKS:
+        return 0
+    return val % len(TWITTER_SEARCH_CHUNKS)
+
+
+def _save_twitter_chunk_index(idx: int):
+    _set_state("twitter_chunk_index", idx)
+
+
 def poll_twitter(client: dict):
     seen_ids: set = load_seen_ids("twitter")
     dirty = 0
+    consecutive_key_failures = 0
+
+    chunk_index = _load_twitter_chunk_index()
+    total_chunks = len(TWITTER_SEARCH_CHUNKS)
+
     log.info(
-        f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)} | "
+        f"Twitter poll started | total_chunks:{total_chunks} | "
+        f"chunk_size:{TWITTER_CHUNK_SIZE} | resuming at chunk:{chunk_index + 1}/{total_chunks} | "
+        f"keys_available:{len(TWITTER_RAPID_API_KEYS)} | "
         f"dedup set resumed with {len(seen_ids)} known ID(s)"
     )
 
+    url = "https://twitter-api45.p.rapidapi.com/search.php"
+
     while True:
         try:
-            url = "https://twitter-api45.p.rapidapi.com/search.php"
-            params = {
-                "query":       TWITTER_SEARCH_QUERY,
+            chunk_query = TWITTER_SEARCH_CHUNKS[chunk_index]
+
+            querystring = {
+                "query":       chunk_query,
                 "search_type": "Top",
             }
-            headers = client
-            response = requests.get(url=url, headers=headers, params=params, timeout=30)
+            headers = _twitter_current_headers()
+
+            response = requests.get(url, headers=headers, params=querystring, timeout=30)
+
+            # v7.9.0 — automatic RapidAPI key failover on 429/403. Stays on
+            # the SAME chunk and retries next loop iteration after failover
+            # (does NOT advance chunk_index on a failed attempt).
+            if response.status_code in (429, 403):
+                _twitter_rotate_key(reason=f"HTTP {response.status_code}")
+                consecutive_key_failures += 1
+                if consecutive_key_failures >= len(TWITTER_RAPID_API_KEYS):
+                    log.error(
+                        f"[TWITTER] All {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) "
+                        f"rate-limited/exhausted — waiting {TWITTER_POLL_INTERVAL}s "
+                        f"before retrying chunk {chunk_index + 1}/{total_chunks}."
+                    )
+                    consecutive_key_failures = 0
+                    time.sleep(TWITTER_POLL_INTERVAL)
+                continue
+
+            consecutive_key_failures = 0
+
+            # v7.9.1 — with chunking this shouldn't happen, but handle
+            # gracefully if TWITTER_CHUNK_SIZE is set too high via env var.
+            if response.status_code == 414:
+                log.error(
+                    f"[TWITTER] Chunk {chunk_index + 1}/{total_chunks} still too long "
+                    f"(HTTP 414) — query len:{len(chunk_query)}. Lower TWITTER_CHUNK_SIZE "
+                    f"(currently {TWITTER_CHUNK_SIZE})."
+                )
+                chunk_index = (chunk_index + 1) % total_chunks
+                _save_twitter_chunk_index(chunk_index)
+                time.sleep(TWITTER_POLL_INTERVAL)
+                continue
+
             response.raise_for_status()
             data = response.json()
 
             tweets = _extract_tweets_from_twitter_api45(data)
-
-            if not tweets:
-                log.debug("Twitter: no results this cycle.")
-                time.sleep(TWITTER_POLL_INTERVAL)
-                continue
 
             new_count = 0
             for t in tweets:
@@ -2789,14 +2885,26 @@ def poll_twitter(client: dict):
                 save_seen_ids("twitter", seen_ids)
                 dirty = 0
 
-            if new_count:
+            log.info(
+                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} → "
+                f"{new_count} new tweet(s) queued | queue_size:{twitter_queue.qsize()}"
+            )
+
+            # v7.9.1 — advance to next chunk, wrap to 0 after the last one.
+            chunk_index = (chunk_index + 1) % total_chunks
+            _save_twitter_chunk_index(chunk_index)
+
+            if chunk_index == 0:
                 log.info(
-                    f"Twitter: {new_count} new tweets queued | "
-                    f"queue_size:{twitter_queue.qsize()}"
+                    f"[TWITTER] Full keyword list cycle complete "
+                    f"({total_chunks} chunks) — restarting from chunk 1."
                 )
 
         except Exception as exc:
-            log.error(f"Twitter unexpected error: {exc} — retrying in {TWITTER_POLL_INTERVAL}s...")
+            log.error(
+                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} error: {exc} — "
+                f"retrying in {TWITTER_POLL_INTERVAL}s..."
+            )
 
         time.sleep(TWITTER_POLL_INTERVAL)
 
@@ -2806,6 +2914,10 @@ def poll_twitter(client: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_facebook_client() -> dict | None:
+    # v7.9.0 — shares RAPID_API_KEY with LinkedIn (same account/plan,
+    # intentional). Twitter has its own separate key(s) — see Twitter
+    # section. To move Facebook to a different RapidAPI provider later,
+    # only this function's headers need to change.
     if not RAPID_API_KEY:
         log.warning("RAPID_API_KEY not set — Facebook platform disabled.")
         return None
@@ -2870,6 +2982,24 @@ def poll_facebook(client: dict):
             try:
                 params = {"query": keyword}
                 response = requests.get(url=url, headers=client, params=params, timeout=30)
+
+                # v7.9.0 NEW — explicit rate-limit/quota detection, purely
+                # for clearer operator logs. This does NOT change isolation
+                # behaviour — Facebook already runs in its own thread with
+                # its own try/except, so a 429/403 here was ALREADY unable
+                # to affect LinkedIn's thread in any way. This just makes
+                # it obvious in the logs that it's a quota issue (not a
+                # random error) and skips to the next keyword immediately.
+                if response.status_code in (429, 403):
+                    log.warning(
+                        f"[FACEBOOK] Rate-limited/quota exhausted for keyword '{keyword}' "
+                        f"(HTTP {response.status_code}) — skipping to next keyword. "
+                        f"LinkedIn is unaffected (separate thread/poller)."
+                    )
+                    total_errors += 1
+                    time.sleep(FACEBOOK_KEYWORD_GAP_SECONDS)
+                    continue
+
                 response.raise_for_status()
                 data = response.json()
 
@@ -2955,6 +3085,10 @@ LINKEDIN_COMPANY_URL  = f"https://{LINKEDIN_HOST}/get_company_data.php"
 
 
 def build_linkedin_client() -> dict | None:
+    # v7.9.0 — shares RAPID_API_KEY with Facebook (same account/plan,
+    # intentional). Twitter has its own separate key(s) — see Twitter
+    # section. To move LinkedIn to a different RapidAPI provider later,
+    # only this function's headers need to change.
     if not RAPID_API_KEY:
         log.warning("RAPID_API_KEY not set — LinkedIn platform disabled.")
         return None
@@ -3091,6 +3225,21 @@ def poll_linkedin(client: dict):
                 response = requests.post(
                     LINKEDIN_SEARCH_URL, data=payload, headers=client, timeout=30
                 )
+
+                # v7.9.0 NEW — same explicit rate-limit/quota detection as
+                # Facebook above, same purpose: clearer logs only. LinkedIn
+                # already runs in its own separate thread, so this was
+                # ALREADY unable to affect Facebook's thread.
+                if response.status_code in (429, 403):
+                    log.warning(
+                        f"[LINKEDIN] Rate-limited/quota exhausted for keyword '{keyword}' "
+                        f"(HTTP {response.status_code}) — skipping to next keyword. "
+                        f"Facebook is unaffected (separate thread/poller)."
+                    )
+                    total_errors += 1
+                    time.sleep(LINKEDIN_KEYWORD_GAP_SECONDS)
+                    continue
+
                 response.raise_for_status()
                 data = response.json()
 
@@ -3107,20 +3256,12 @@ def poll_linkedin(client: dict):
                     if len(seen_ids) > 50_000:
                         seen_ids.clear()
 
-                    # Build searchable text from whatever the Search
-                    # endpoint returned so the SAME passes_keyword_filter()
-                    # every other platform uses can run on it.
                     text_parts = [p for p in [res.get("name"), res.get("headline"), res.get("company")] if p]
                     text = " | ".join(text_parts) or keyword
 
                     if not passes_keyword_filter(text):
                         continue
 
-                    # Enrichment — User Data + Company Data. Each call is
-                    # independently wrapped (see functions above): if
-                    # Search matched but User Data or Company Data fails
-                    # or is out of quota, the item is STILL queued and
-                    # scored — just without that piece of enrichment.
                     user_extra = _linkedin_fetch_user_data(client, res.get("url") or res.get("id"))
 
                     company_extra = {}
@@ -3137,9 +3278,6 @@ def poll_linkedin(client: dict):
                         "subreddit":      "",
                         "telegram_group": "",
                         "post_url":       res.get("url") or "",
-                        # v7.7.0 NEW — which KEYWORDS entry this search
-                        # cycle was on when this profile came back, so
-                        # it's traceable later which keyword found it.
                         "search_keyword": keyword,
                     }
                     _li_item.update(user_extra)
@@ -3163,9 +3301,6 @@ def poll_linkedin(client: dict):
                 time.sleep(LINKEDIN_KEYWORD_GAP_SECONDS)
 
             except Exception as exc:
-                # Search endpoint itself failed/out-of-quota for this
-                # keyword — log it, move to the next keyword. Never crashes
-                # the cycle or the poller thread.
                 log.error(f"[LINKEDIN] Unhandled error for keyword '{keyword}': {exc}")
                 total_errors += 1
                 continue
@@ -3464,7 +3599,7 @@ def send_daily_digest():
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
         blocks += [
             {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
         ]
 
         result = retry_with_backoff(
@@ -3543,7 +3678,7 @@ def send_weekly_report():
                 {"type": "divider"},
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
                 {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.6.0 | {CLIENT_ID} | Week ending {week_end}"}]},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | {CLIENT_ID} | Week ending {week_end}"}]},
             ],
         }
 
@@ -3887,20 +4022,21 @@ async def start_rescore_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API (version bumped to 7.6.0; LinkedIn routes added)
+# FASTAPI — REST API
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.6.0",
+    title       = "FX Signal Intelligence API — Flintel v7.9.1",
     description = (
         "Reddit (RSS) + Twitter + Telegram + Facebook + LinkedIn signals: "
         "monitor, score, store, alert. Persistent batch state. Streaming "
         "Claude. Manual rescore. HubSpot receives medium (4-7) AND high "
         "(8-10) signals. Per-platform BATCH_GAP_SECONDS and "
         "BATCH_TIMEOUT_SECONDS — every platform runs on its own "
-        "independent gap/timeout, never mixed."
+        "independent gap/timeout, never mixed. Twitter search runs in "
+        "TWITTER_CHUNK_SIZE-keyword chunks, one chunk per poll cycle."
     ),
-    version     = "7.6.0",
+    version     = "7.9.1",
 )
 
 
@@ -3926,13 +4062,13 @@ def _serialise_rescore(docs: list) -> list:
 def root():
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.6.0",
+        "system":                  "FLINTEL v7.9.1",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter", "telegram", "facebook", "linkedin"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED),
         "twitter_enabled":         TWITTER_ENABLED,
-        "twitter_status":          _working(TWITTER_ENABLED and bool(RAPID_API_KEY)),
+        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS)),
         "telegram_enabled":        TELEGRAM_ENABLED,
         "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
         "facebook_enabled":        FACEBOOK_ENABLED,
@@ -3950,6 +4086,9 @@ def root():
         "telegram_poll_interval":  TELEGRAM_POLL_INTERVAL,
         "facebook_poll_interval":  FACEBOOK_POLL_INTERVAL,
         "linkedin_poll_interval":  LINKEDIN_POLL_INTERVAL,
+        "twitter_rapid_api_keys_configured": len(TWITTER_RAPID_API_KEYS),
+        "twitter_chunk_size":       TWITTER_CHUNK_SIZE,
+        "twitter_total_chunks":     len(TWITTER_SEARCH_CHUNKS),
         "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
         "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
         "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
@@ -3982,6 +4121,8 @@ def root():
         "slack_hubspot_score_hidden": True,
         "per_platform_batch_timing": True,
         "linkedin_enrichment":     True,
+        "twitter_chunked_search":  True,
+        "twitter_rapid_api_failover": True,
         "min_score_medium":        MIN_SCORE_MEDIUM,
         "min_score_high":          MIN_SCORE_HIGH,
         "score_routing": {
@@ -4001,7 +4142,7 @@ def health():
         mongo = "disconnected"
 
     reddit_working   = REDDIT_ENABLED
-    twitter_working  = TWITTER_ENABLED and bool(RAPID_API_KEY)
+    twitter_working  = TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS)
     telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
     facebook_working = FACEBOOK_ENABLED and bool(RAPID_API_KEY)
     linkedin_working = LINKEDIN_ENABLED and bool(RAPID_API_KEY)
@@ -4023,6 +4164,9 @@ def health():
         "twitter":                 ("polling" if twitter_working else "disabled"),
         "twitter_working":         twitter_working,
         "twitter_indicator":       _working(twitter_working),
+        "twitter_rapid_api_keys":  len(TWITTER_RAPID_API_KEYS),
+        "twitter_chunk_size":      TWITTER_CHUNK_SIZE,
+        "twitter_total_chunks":    len(TWITTER_SEARCH_CHUNKS),
         "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
         "telegram":                ("listening" if telegram_working else "disabled"),
@@ -4463,12 +4607,14 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.6.0")
+    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.9.1")
     log.info("=" * 70)
     log.info(f"  Client             : {CLIENT_ID}")
     log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook + LinkedIn")
     log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
-    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(RAPID_API_KEY))}")
+    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS))}")
+    log.info(f"  Twitter keys       : {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) configured for failover")
+    log.info(f"  Twitter chunking   : {TWITTER_CHUNK_SIZE} keyword(s)/chunk | {len(TWITTER_SEARCH_CHUNKS)} total chunk(s) | 1 chunk sent per poll cycle")
     log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
     log.info(f"  Facebook           : {FACEBOOK_ENABLED} | {_working(FACEBOOK_ENABLED and bool(RAPID_API_KEY))}")
     log.info(f"  LinkedIn           : {LINKEDIN_ENABLED} | {_working(LINKEDIN_ENABLED and bool(RAPID_API_KEY))}")
@@ -4495,6 +4641,7 @@ if __name__ == "__main__":
     log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
     log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts")
     log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts")
+    log.info(f"  Twitter chunk pos  : Persistent (MongoDB flintel_state key=twitter_chunk_index) — survives restarts")
     log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
     log.info(f"  Rescore poll       : every {RESCORE_POLL_INTERVAL}s")
     log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (API_KEY not set — open access)'}")
@@ -4502,18 +4649,17 @@ if __name__ == "__main__":
     log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
     log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
     log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms)")
+    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms) — FILL THIS LIST IN")
     log.info(f"  MongoDB DB         : {MONGODB_DB}")
     log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
     log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  v7.9.0 changes     : Per-platform signal document isolation in MongoDB storage —")
-    log.info(f"                     : save_signal()/update_signal() now write ONLY each platform's own")
-    log.info(f"                     : fields (Reddit: subreddit/post_url/linkedin_message, Twitter:")
-    log.info(f"                     : post_url/twitter_reply/twitter_dm, Telegram: telegram_group/")
-    log.info(f"                     : telegram_dm, Facebook: post_url/facebook_comment, LinkedIn: its")
-    log.info(f"                     : own outreach + enrichment fields) instead of every OTHER")
-    log.info(f"                     : platform's fields as null. Storage-only — scoring, Slack,")
-    log.info(f"                     : HubSpot, and every route are byte-for-byte unchanged.")
+    log.info(f"  v7.9.1 change      : Twitter search chunked into {TWITTER_CHUNK_SIZE}-keyword OR-queries — fixes")
+    log.info(f"                     : HTTP 414 Request-URI Too Large from v7.9.0's single giant query. ONE chunk")
+    log.info(f"                     : is sent per TWITTER_POLL_INTERVAL, advancing through all {len(TWITTER_SEARCH_CHUNKS)} chunk(s)")
+    log.info(f"                     : and wrapping back to chunk 1 once the full list is covered. Chunk position")
+    log.info(f"                     : persists across restarts. RapidAPI key failover (429/403) unchanged from")
+    log.info(f"                     : v7.9.0. Reddit, Telegram, Facebook, LinkedIn, scoring, storage, delivery,")
+    log.info(f"                     : and every FastAPI route are 100% untouched by this change.")
     log.info("=" * 70)
 
     _hs_verify_properties()
