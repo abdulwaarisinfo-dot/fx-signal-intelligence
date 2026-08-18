@@ -16,11 +16,11 @@ Flintel is a two-service system: a background discovery engine that never stops 
 
 | # | Concept | Where it lives | What it does |
 |---|---|---|---|
-| 1 | **API endpoints** | `app/routers/` (FastAPI) | REST endpoints serving signals, scores, and account data to the web app, with request validation and proper status codes |
-| 2 | **Database** | MongoDB Atlas, `app/database.py` | Persists discovered signals, scores, and per-user/per-tenant state; survives restarts by design — the whole pipeline is built to resume, not replay |
-| 3 | **Background jobs** | `app/workers/` | Multi-threaded workers continuously poll Twitter, Reddit, and Telegram every 60 seconds, run keyword discovery, and hand candidates to the scoring layer — entirely off the request path |
-| 4 | **Caching** | `app/cache.py` | Expensive steps (repeated prompt context, semantic similarity lookups) are cached rather than recomputed, which is also the main lever used to control LLM cost at scale |
-| 5 | **LLM integration** | `app/scoring.py` | Each candidate signal goes through Claude/GPT-based scoring, returning a 0–10 intent score plus a drafted outreach message — a narrow, validated AI job behind an endpoint, with usage logged for cost tracking |
+| 1 | **API endpoints** | `index.py` (FastAPI routes) | REST endpoints serving signals, scores, and account data to the web app, with request validation and proper status codes |
+| 2 | **Database** | MongoDB Atlas, connection + queries in `index.py` | Persists discovered signals, scores, and per-user/per-tenant state; survives restarts by design — the whole pipeline is built to resume, not replay |
+| 3 | **Background jobs** | Worker/polling functions in `index.py` | Continuously polls Twitter, Reddit, and Telegram every 60 seconds, runs keyword discovery, and hands candidates to the scoring layer — entirely off the request path |
+| 4 | **Caching** | Caching logic in `index.py` | Expensive steps (repeated prompt context, semantic similarity lookups) are cached rather than recomputed, which is also the main lever used to control LLM cost at scale |
+| 5 | **LLM integration** | Scoring functions in `index.py` | Each candidate signal goes through Claude/GPT-based scoring, returning a 0–10 intent score plus a drafted outreach message — a narrow, validated AI job behind an endpoint, with usage logged for cost tracking |
 
 No swaps were needed — the five core concepts fit the project's actual shape without substitution.
 
@@ -52,10 +52,10 @@ git clone <flintel-repo-url>
 cd flintel
 pip install -r requirements.txt --break-system-packages
 cp .env.example .env   # fill in MongoDB URI, LLM API key, platform API keys
-uvicorn app.main:app --reload
+python index.py        # or: uvicorn index:app --reload, depending on the entry point
 ```
 
-Full setup and API details are in the repository README.
+The repository also includes `render.yaml` for one-command deployment to Render's free tier.
 
 ### One real limitation
 
