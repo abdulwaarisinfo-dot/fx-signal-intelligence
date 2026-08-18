@@ -1,4 +1,4 @@
-# My 10x Solution - Waris Ali
+# My 10x Solution - Muhammad Waris
 
 ## 1. The problem
 
