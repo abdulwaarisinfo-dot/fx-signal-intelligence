@@ -236,7 +236,7 @@ def _random_engagement_fallback() -> int:
 #     right after its SERP results are all saved to flintel_google_posts
 #     — it will never be re-fetched.
 REDDIT_SEARCH_KEYWORDS = [
-  
+
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
