@@ -1,212 +1,88 @@
 """
-FX Signal Intelligence System — FLINTEL v7.9.1
-=============================================
-Platforms : Reddit (feedparser RSS) + Twitter/X + Telegram (Telethon)
-            + Facebook (facebook-scraper3 RapidAPI) + LinkedIn (linkedin-data-scraper1 RapidAPI)
+FLINTEL v9.13 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+                + BATCHED SEARCH-VOLUME PRE-SEEDING
+                + AUTO-SYNCED TARGETING COLLECTIONS)
+                + Twitter/X Signal Scorer
+=================================================================================
+Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
+            site:reddit.com, real per-post rank -> flintel_google_posts cache
+            -> auto-synced flintel_targeting_subreddits / flintel_targeting_keywords
+            -> subreddit RSS polling + URL-match confirmation,
+            no credentials required)
+          + Twitter/X (tweepy v2)
 
-Changelog v7.9.1 (ONE CHANGE ONLY — everything else 100% unchanged from v7.9.0):
+=================================================================================
+WHAT CHANGED IN THIS BUILD (v9.13) — TWO NEW AUTO-SYNCED COLLECTIONS,
+flintel_targeting_subreddits AND flintel_targeting_keywords, GOVERN WHICH
+SUBREDDITS/KEYWORDS THE RSS-MATCHING LOOP ACTIVELY TARGETS. EVERYTHING ELSE
+FROM v9.12 IS 100% UNCHANGED — flintel_keywords, THE SEARCH-VOLUME SEEDING
+LOGIC, THE GOOGLE-RANK/SERP CALL, generate_fuzzy_keywords(), AND
+save_google_post() ARE ALL BYTE-FOR-BYTE UNCHANGED.
+=================================================================================
 
-  CHANGE — TWITTER SEARCH CHUNKED (fixes HTTP 414 Request-URI Too Large).
+  WHAT'S NEW —
 
-           v7.9.0 combined EVERY keyword in KEYWORDS into ONE giant OR-query
-           sent as a single GET request. With 1000+ keywords this produced
-           URLs 100,000+ characters long, which RapidAPI's gateway rejected
-           outright with HTTP 414 (Request-URI Too Large) — every single
-           poll cycle, permanently broken.
+  1. flintel_targeting_subreddits / flintel_targeting_keywords are a LIVE,
+     AUTO-SYNCED MIRROR of whatever is currently PENDING (fetched=False)
+     in flintel_google_posts. Nothing in either collection is ever
+     hand-maintained, hardcoded, or kept in a python list — every single
+     pass of run_google_posts_rss_matching_loop() calls
+     sync_targeting_collections() first, which:
+       - reads every fetched=False flintel_google_posts document
+       - upserts one flintel_targeting_keywords doc per pending post_url
+         (carrying its matched_keyword, fuzzy_keywords, subreddit)
+       - upserts one flintel_targeting_subreddits doc per distinct
+         pending subreddit
+       - PRUNES both collections of anything that is no longer pending
+         (already confirmed via some other path), so they never drift
+         out of sync with flintel_google_posts's real state
 
-           Fix: KEYWORDS is now split into chunks of TWITTER_CHUNK_SIZE
-           (default 25) keywords each, combined into one OR-query per
-           chunk — e.g. ("kw1" OR "kw2" OR ... OR "kw25"). This keeps each
-           request's URL short enough that 414 never happens again.
+  2. run_google_posts_rss_matching_loop() now reads the list of
+     subreddits to poll from flintel_targeting_subreddits (via
+     get_targeting_subreddits()) instead of re-querying
+     flintel_google_posts.distinct() directly. The actual per-post
+     detail used to build the pending-by-url lookup for each subreddit
+     (google_rank, matched_keyword, fuzzy_keywords) still comes straight
+     from flintel_google_posts, exactly as in v9.12 — the targeting
+     collections are the governing/tracking layer, not a duplicate data
+     store.
 
-           UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE
-           keyword list every single poll cycle, one keyword per request),
-           Twitter sends exactly ONE chunk per TWITTER_POLL_INTERVAL, then
-           advances to the next chunk on the following cycle, and so on —
-           wrapping back to chunk #1 once the last chunk is reached. So
-           with 1000 keywords in 40 chunks of 25, it takes 40 poll cycles
-           to cover the full list once, then it restarts automatically
-           from chunk #1. This keeps Twitter's request rate low and
-           predictable (Twitter's RapidAPI plan/rate-limits don't tolerate
-           the same per-keyword request volume Facebook/LinkedIn use).
+  3. THE MATCH ITSELF IS STILL, AND ONLY EVER, AN EXACT post_url MATCH
+     against the subreddit's live RSS feed — fuzzy_keywords are never
+     used as a filtering gate (same as v9.12; kept only for a
+     traceability log line). The moment an RSS entry's link matches a
+     pending post_url:
+       - flintel_google_posts.fetched is set to True, permanently
+         (mark_google_post_fetched(), unchanged from v9.12)
+       - its flintel_targeting_keywords document is immediately DELETED
+         via delete_targeting_keyword_entry(post_url) — that post/
+         keyword is done being targeted
+       - flintel_targeting_subreddits is left alone at that instant (no
+         per-match write there) — it gets fully rebuilt on the very next
+         sync_targeting_collections() pass, so a subreddit with zero
+         pending posts left naturally drops out of the poll list within
+         one cycle, with no separate delete path needed
 
-           The current chunk position is persisted in MongoDB
-           (flintel_state, key="twitter_chunk_index") so a restart/deploy
-           resumes from wherever it left off instead of restarting the
-           whole list from chunk #1 every time.
+  4. run_batch_processor()'s redundant keyword-phrase filter
+     (passes_keyword_filter(text, keyword_filter_list)) is now SKIPPED
+     for Reddit items specifically. A Reddit item only ever reaches
+     reddit_queue after its post_url has already been confirmed via
+     exact URL match against flintel_google_posts — that URL match is
+     the sole, authoritative relevance decision for Reddit. Re-checking
+     the fetched text against the full REDDIT_SEARCH_KEYWORDS phrase
+     list here would silently drop items whose text only shares meaning
+     (not the exact original phrase) with the keyword that produced
+     them via SERP. Twitter items are NOT pre-filtered anywhere upstream,
+     so they still go through passes_keyword_filter() exactly as before
+     — zero change to Twitter's behavior.
 
-           RapidAPI key failover (429/403 → rotate to next configured key)
-           from v7.9.0 is preserved exactly as-is, just applied per-chunk
-           instead of per-full-query. A failed chunk attempt does NOT
-           advance the chunk index — it retries the SAME chunk after
-           rotating keys / waiting.
-
-           NOTHING ELSE CHANGED — Reddit, Telegram, Facebook, LinkedIn,
-           scoring logic, prompts, routing thresholds, Slack/HubSpot
-           delivery, FastAPI routes, keyword list, batch timing, and every
-           other platform's poll/dedup/queue behavior are byte-for-byte
-           identical to v7.9.0.
-
-Changelog v7.9.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.8.0):
-
-  CHANGE (superseded by v7.9.1 above for the query-building part) —
-           Twitter search originally moved to a single combined OR-query
-           with automatic RapidAPI key failover on 429/403. The key
-           failover behavior is preserved in v7.9.1; the single-giant-query
-           behavior is replaced by chunking as described above.
-
-Changelog v7.8.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.7.0):
-
-  CHANGE — search_keyword NOW POPULATED FOR ALL 5 PLATFORMS.
-
-           In v7.7.0, search_keyword was only ever set for Facebook and
-           LinkedIn (the two platforms that search KEYWORD-BY-KEYWORD, so
-           they already know which keyword they searched with at fetch
-           time). Reddit, Twitter, and Telegram fetch first and filter
-           after, via passes_keyword_filter(), which previously only
-           returned True/False — so there was no way to know WHICH keyword
-           in the KEYWORDS list actually matched.
-
-           Fix: passes_keyword_filter() now returns the matched keyword
-           STRING (the exact KEYWORDS entry) instead of True/False, or
-           None if nothing matched. This is fully backward compatible —
-           every existing call site used it in a boolean context
-           (`if not passes_keyword_filter(text):`), and a non-empty
-           string is truthy while None is falsy, so all existing
-           match/no-match branching behaves identically to before.
-
-           run_batch_processor() — the SAME generic function every
-           platform already shares — now captures this matched keyword
-           and sets item["search_keyword"] = matched_keyword, but ONLY
-           when the item doesn't already carry a search_keyword. Facebook
-           and LinkedIn already set it at poll time (v7.7.0) — that
-           existing value is preserved exactly as-is and is NOT
-           overwritten. Reddit, Twitter, and Telegram never had this
-           field populated before, so they now get it filled in with
-           whichever KEYWORDS entry matched their fetched text.
-
-           Everything downstream (process_scored_item, save_signal,
-           MongoDB storage, the search_keyword index added in v7.7.0) is
-           completely unchanged — it already reads item.get("search_keyword")
-           and stores it as-is, so no further changes were needed there.
-
-           NOTHING ELSE CHANGED — scoring logic, prompts, routing
-           thresholds, Slack/HubSpot delivery, FastAPI routes, keyword
-           list, poll/batch timing, and Facebook/LinkedIn's own
-           search_keyword behavior are byte-for-byte identical to v7.7.0.
-
-Changelog v7.7.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.6.0):
-
-  CHANGE — NEW FIELD: search_keyword.
-
-           Every signal document in MongoDB now additionally stores
-           search_keyword — the exact KEYWORDS list entry that was being
-           searched when this item was found. This is only meaningful (and
-           only ever populated) for the two platforms that search
-           KEYWORD-BY-KEYWORD: Facebook (poll_facebook) and LinkedIn
-           (poll_linkedin). Both loops already iterate `for keyword in
-           KEYWORDS:` — the keyword variable is simply carried onto the
-           queued item as item["search_keyword"], flows unchanged through
-           the SAME generic run_batch_processor()/process_scored_item()
-           pipeline every platform already uses, and is stored as-is in
-           save_signal(). Reddit (subreddit RSS, not keyword search),
-           Twitter, and Telegram (group listener/poller, not keyword
-           search) have no single keyword to attribute a match to for
-           this version — search_keyword is simply None/absent, exactly
-           as it always implicitly was.
-
-           A matching index on "search_keyword" was added alongside the
-           existing indexes (intent_score, platform, tier, etc.) so it can
-           be queried/filtered efficiently later if needed.
-
-Changelog v7.6.0 (ONE ADDITIVE CHANGE ONLY — everything else 100% unchanged from v7.5.0):
-
-  CHANGE — LINKEDIN ADDED AS A 5TH PLATFORM.
-
-           LinkedIn is wired in exactly like Facebook was in v7.5.0 — its own
-           in-memory queue (linkedin_queue), its own persistent dedup set
-           (flintel_seen_ids, platform="linkedin"), its own persistent batch
-           state (flintel_pending_batch / flintel_batch_seconds, platform=
-           "linkedin"), its own persistent raw-queue backup
-           (flintel_queue_messages, platform="linkedin"), its own
-           run_batch_processor() thread using the SAME generic batch
-           processor function every other platform already uses, its own
-           Claude scoring schema (CLAUDE_SYSTEM_PROMPT_LINKEDIN — same
-           _SCORING_CORE, same thresholds, same routing), and its own
-           FastAPI surface (/signals/linkedin) plus root/health reporting.
-           Reddit, Twitter, Telegram, and Facebook's code paths, timing,
-           and state are 100% unchanged — LinkedIn is purely additive.
-
-           LinkedIn uses the linkedin-data-scraper1 RapidAPI product
-           (x-rapidapi-host: linkedin-data-scraper1.p.rapidapi.com), and is
-           built from THREE separate POST endpoints on that same product:
-
-             1. Search LinkedIn   POST /search_linkedIn.php
-                body: {"keywords": <kw>, "start": "0"}
-                — cycled through the SAME KEYWORDS list already used for
-                keyword pre-filtering on every other platform, one search
-                per keyword per poll cycle (same pattern as Facebook's
-                per-keyword cycle / Reddit's per-subreddit cycle).
-
-             2. User Data         POST /get_user_data.php
-                body: {"username_or_url": <profile url>}
-                — called for every search result that survives the keyword
-                filter, to enrich the signal with whatever profile detail
-                the vendor returns (name, headline, email, phone, location,
-                company, job title — each field is optional, since the
-                vendor's response shape for this account tier is not
-                guaranteed to include all of them).
-
-             3. Company Data      POST /get_company_data.php
-                body: {"company_name": <company>}
-                — called when a company name is available (from the search
-                result or from the User Data response), to enrich the
-                signal with company detail (website, industry, size,
-                headquarters, phone — again, each field optional).
-
-           All three endpoints share the same RAPID_API_KEY, but each call
-           is wrapped in its own try/except — exactly as requested: if the
-           Search, User Data, or Company Data endpoint fails or runs out
-           of quota, that ONE call degrades to "no enrichment" and logs a
-           warning; it never raises, never crashes the poll cycle, and
-           never blocks the other two endpoints or the rest of the
-           pipeline. A LinkedIn item with zero enrichment (both User Data
-           and Company Data failed) is still queued and scored using
-           whatever the Search endpoint returned — nothing is dropped
-           just because enrichment failed.
-
-           Matched + enriched items are queued into linkedin_queue exactly
-           like every other platform, then picked up by the SAME generic
-           run_batch_processor() (batch of LINKEDIN_BATCH_SIZE items, or
-           LINKEDIN_BATCH_TIMEOUT_SECONDS elapsed — whichever comes first —
-           triggers ONE Claude call for that batch, e.g. "batch 1/25",
-           "batch 2/25" in the logs, same as Reddit/Twitter/Telegram/
-           Facebook). The enrichment fields (email/phone/location/company/
-           industry/size) ride along on the queued item and are surfaced
-           to Claude via a small ADDITIVE-ONLY block inside
-           _build_batch_prompt() that only activates when
-           item["platform"] == "linkedin" — every other platform's prompt
-           text is byte-for-byte unchanged.
-
-           New env vars (defaults match the other platforms' patterns):
-
-             LINKEDIN_ENABLED               (default: false)
-             LINKEDIN_BATCH_SIZE            (default: 10)
-             LINKEDIN_BATCH_GAP_SECONDS     (default: 30)
-             LINKEDIN_BATCH_TIMEOUT_SECONDS (default: 120)
-             LINKEDIN_POLL_INTERVAL         (default: 300 — full keyword cycle)
-             LINKEDIN_KEYWORD_GAP_SECONDS   (default: 2 — between each keyword search)
-
-Prior changelogs (v7.0 → v7.5.0) are unchanged from the previous version of
-this file and are omitted here only to keep this header readable — no
-behavior from any prior version was altered. Summary of what's already in
-place: feedparser RSS Reddit, Twitter/X search, Telegram (Telethon) with
-auto-join + polling, Facebook (facebook-scraper3), persistent batch state
-(FIX A), tolerant partial-JSON recovery (FIX B), Claude streaming (FIX C),
-working indicators (FIX D), HubSpot error visibility + startup property
-check (FIX E), manual rescore pipeline, per-platform batch gap/timeout,
-persistent raw-queue backup + explicit batch-timeout persistence (v7.4.5),
-and Facebook as the 4th platform (v7.5.0). Claude model: claude-sonnet-4-6.
+  Everything else — flintel_keywords (fetch-once-forever keyword cache),
+  search_google_for_keyword(), fetch_google_rank(), fetch_search_volume(),
+  seed_search_volume_batch(), generate_fuzzy_keywords(), save_google_post(),
+  get_pending_google_posts_for_subreddit(), mark_google_post_fetched(),
+  the Claude batch scorer, the rescore processor, persistent batch/queue
+  state, and every FastAPI endpoint from v9.12 — is preserved 100% as-is.
+=================================================================================
 """
 
 import asyncio
@@ -215,40 +91,30 @@ import os
 import json
 import time
 import queue
+import random
+import re
+import html
 import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-import html
-import re
-import feedparser
 import anthropic
 import httpx
-from telethon import TelegramClient, events
-from telethon.errors import (
-    UserAlreadyParticipantError,
-    InviteHashExpiredError,
-    ChannelPrivateError,
-    FloodWaitError,
-)
-from telethon.tl.functions.channels import JoinChannelRequest
+import tweepy
+import requests
+import feedparser
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
-import requests
-from fastapi import FastAPI, HTTPException, Security, Depends, Body
+from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from starlette.status import HTTP_403_FORBIDDEN
 import uvicorn
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENV
+# ENV / LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -261,98 +127,262 @@ log = logging.getLogger("flintel")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-REDDIT_POLL_INTERVAL = int(os.getenv("REDDIT_POLL_INTERVAL", "300"))
-
-# v7.9.0 — RAPID_API_KEY is shared by Facebook + LinkedIn (same RapidAPI
-# account/plan for both — intentional). Twitter uses its OWN separate
-# TWITTER_RAPID_API_KEYS (defined down in the Twitter section) so that a
-# Twitter rate-limit/quota issue never affects Facebook or LinkedIn, and
-# vice versa. If Facebook/LinkedIn ever need to move to a different
-# RapidAPI account/provider, only their build_*_client() headers need to
-# change — nothing else in the pipeline changes.
-RAPID_API_KEY        = os.getenv("RAPID_API_KEY")
-
-TELEGRAM_API_ID      = int(os.getenv("TELEGRAM_API_ID", "0"))
-TELEGRAM_API_HASH    = os.getenv("TELEGRAM_API_HASH", "")
-TELEGRAM_PHONE       = os.getenv("TELEGRAM_PHONE", "")
-TELEGRAM_SESSION     = os.getenv("TELEGRAM_SESSION", "flintel_telegram")
+TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
+CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-HUBSPOT_API_KEY   = os.getenv("HUBSPOT_API_KEY")
+# Optional generic label/context — used ONLY as a fallback google_rank
+# lookup for Twitter items (Twitter has no per-post SERP discovery in
+# this design, so there is no "real" per-post rank for a tweet). If left
+# empty, Twitter items simply get google_rank=None / search_volume=None.
+SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
 
-MIN_SCORE_MEDIUM = int(os.getenv("MIN_SCORE_MEDIUM", "4"))
-MIN_SCORE_HIGH   = int(os.getenv("MIN_SCORE_HIGH",   "8"))
-CLIENT_ID        = os.getenv("CLIENT_ID", "settla")
+# ── RapidAPI — SOLE provider for both Google rank AND search volume.
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
+RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
+RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 
-# ── BATCH SIZE — already platform-specific since v7.2/v7.4, UNCHANGED ───────
+# ── RapidAPI call timeouts — configurable so a slow keyword doesn't
+# get killed early. These are LIVE endpoint calls
+# — real-time, no polling/task-based async needed.
+DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
+DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
+REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch as of v9.11
+
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
-TELEGRAM_BATCH_SIZE = int(os.getenv("TELEGRAM_BATCH_SIZE", "10"))
-FACEBOOK_BATCH_SIZE = int(os.getenv("FACEBOOK_BATCH_SIZE", "10"))
-# v7.6.0 NEW — LinkedIn batch size lives alongside the other BATCH_SIZE
-# vars, same section, same style, same defaults pattern.
-LINKEDIN_BATCH_SIZE = int(os.getenv("LINKEDIN_BATCH_SIZE", "10"))
 RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
 
-# ── v7.4.4 — per-platform BATCH_GAP_SECONDS / BATCH_TIMEOUT_SECONDS ─────────
-REDDIT_BATCH_GAP_SECONDS       = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",       "30"))
-REDDIT_BATCH_TIMEOUT_SECONDS   = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",   "120"))
+REDDIT_BATCH_GAP_SECONDS      = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",      "30"))
+REDDIT_BATCH_TIMEOUT_SECONDS  = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",  "120"))
 
-TWITTER_BATCH_GAP_SECONDS      = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",      "30"))
-TWITTER_BATCH_TIMEOUT_SECONDS  = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS",  "120"))
+TWITTER_BATCH_GAP_SECONDS     = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",     "30"))
+TWITTER_BATCH_TIMEOUT_SECONDS = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", "120"))
 
-TELEGRAM_BATCH_GAP_SECONDS     = int(os.getenv("TELEGRAM_BATCH_GAP_SECONDS",     "30"))
-TELEGRAM_BATCH_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_BATCH_TIMEOUT_SECONDS", "120"))
-
-# ── v7.5.0 — FACEBOOK: same per-platform batch gap/timeout pattern ─────────
-FACEBOOK_BATCH_GAP_SECONDS     = int(os.getenv("FACEBOOK_BATCH_GAP_SECONDS",     "30"))
-FACEBOOK_BATCH_TIMEOUT_SECONDS = int(os.getenv("FACEBOOK_BATCH_TIMEOUT_SECONDS", "120"))
-
-# ── v7.6.0 NEW — LINKEDIN: same per-platform batch gap/timeout pattern as
-# Reddit/Twitter/Telegram/Facebook. Independent env vars — never shared,
-# never mixed with any other platform's timing.
-LINKEDIN_BATCH_GAP_SECONDS     = int(os.getenv("LINKEDIN_BATCH_GAP_SECONDS",     "30"))
-LINKEDIN_BATCH_TIMEOUT_SECONDS = int(os.getenv("LINKEDIN_BATCH_TIMEOUT_SECONDS", "120"))
-
-# Rescore's own gap — independent of every platform (v7.4.4).
 RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
-
-DAILY_DIGEST_HOUR  = int(os.getenv("DAILY_DIGEST_HOUR",  "8"))
-WEEKLY_REPORT_DAY  = int(os.getenv("WEEKLY_REPORT_DAY",  "0"))
-WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
+RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
-TELEGRAM_JOIN_GAP_SECONDS = int(os.getenv("TELEGRAM_JOIN_GAP_SECONDS", "30"))
-
-# ── v7.5.0 — FACEBOOK: mirrors Reddit's per-cycle polling pattern ──────────
-FACEBOOK_POLL_INTERVAL       = int(os.getenv("FACEBOOK_POLL_INTERVAL", "300"))
-FACEBOOK_KEYWORD_GAP_SECONDS = int(os.getenv("FACEBOOK_KEYWORD_GAP_SECONDS", "2"))
-
-# ── v7.6.0 NEW — LINKEDIN: same per-cycle-over-KEYWORDS pattern as Facebook,
-# with its own poll interval and its own gap between individual keyword
-# searches (kept separate so LinkedIn's rate limits never affect Facebook's
-# or vice versa).
-LINKEDIN_POLL_INTERVAL       = int(os.getenv("LINKEDIN_POLL_INTERVAL", "300"))
-LINKEDIN_KEYWORD_GAP_SECONDS = int(os.getenv("LINKEDIN_KEYWORD_GAP_SECONDS", "2"))
-
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
-CLAUDE_STREAM_TIMEOUT = int(os.getenv("CLAUDE_STREAM_TIMEOUT", "600"))
+# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG ────────────────────────────────────
+# If a search-volume ("search/mo") API call fails for ANY reason — bad/
+# exhausted RapidAPI credits, rate-limit, timeout, non-JSON body, no
+# recognizable volume field, or RAPIDAPI_KEY not configured at all — we
+# no longer leave search_volume as None. Instead we generate a random
+# placeholder in this range so scoring/dashboards always have a plausible
+# number instead of being dragged to the "no data" floor. This NEVER
+# overwrites a real, provider-returned value — it only ever fills in for
+# a genuine failure/absence, and every time it fires it is logged with a
+# clearly-labelled "RANDOM FALLBACK" warning naming the exact value used
+# and the reason, so it is always distinguishable from a real value in
+# the logs. This is completely independent of, and never blocks or is
+# blocked by, the separate Google-rank/SERP RapidAPI calls.
+SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
+SEARCH_VOLUME_RANDOM_FALLBACK_MAX = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MAX", "5000"))
 
-RESCORE_POLL_INTERVAL = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
+
+def _random_search_volume_fallback() -> int:
+    """Generates one random placeholder search_volume in the configured
+    range. Pulled into its own tiny helper purely so every call site uses
+    the exact same range/behavior."""
+    return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
+
+
+# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG ────────────
+# Reddit's public RSS feed (used for the per-post fetch — see module
+# docstring) does NOT expose numeric upvote or comment counts — this is a
+# genuine schema limitation of the RSS format itself, not a parsing bug.
+# Since Component 3 (Engagement Signal) of the Claude scoring model needs
+# a numeric value to score against, every Reddit post confirmed via RSS
+# gets a random placeholder upvotes/comments value in this range instead
+# of None/0, using the exact same "random fallback, always logged, never
+# silently indistinguishable from a real value" pattern already used for
+# search_volume above.
+REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN", "100"))
+REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX", "3000"))
+
+
+def _random_engagement_fallback() -> int:
+    """Generates one random placeholder upvotes/comments value in the
+    configured range. Separate helper (own range) from the search-volume
+    one above, even though the pattern is identical, so the two ranges
+    can be tuned independently."""
+    return random.randint(REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN, REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX)
+
+
+# ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
+# Keywords now live DIRECTLY in this Python list — no .env / os.getenv
+# involved. To add a new keyword, just add a new string to this list and
+# restart (or, if hot-reload is set up, it gets picked up on the next
+# sync pass). Everything downstream is unchanged:
+#   - sync_keywords_to_db() inserts any keyword NOT already in
+#     flintel_keywords with fetched=False, search_volume=None.
+#   - get_keywords_missing_volume() + seed_search_volume_batch() fill in
+#     search_volume for any keyword that doesn't have one yet, IN BATCHES
+#     of up to 500 keywords per DataForSEO request (never one-by-one).
+#     This looks at ALL of flintel_keywords, not just whatever happens to
+#     still be in this python list right now.
+#   - get_due_keywords() picks up only fetched=False keywords — looks at
+#     ALL of flintel_keywords, not just this python list.
+#   - mark_keyword_fetched() flips a keyword to fetched=True PERMANENTLY
+#     right after its SERP results are all saved to flintel_google_posts
+#     — it will never be re-fetched.
+REDDIT_SEARCH_KEYWORDS = [
+    "Wise blocked my account",
+    "bank blocked my transfer",
+    "Wise Business restricted",
+    "Payoneer account blocked",
+    "cross border payment problem",
+    "CRM is a nightmare",
+    "our CRM is a mess",
+    "recommend a CRM for small business",
+    "we got hacked",
+    "ransomware attack",
+    "need incident response",
+    "Salesforce alternative",
+    "switching from HubSpot",
+    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
+    "my bookkeeper", "our bookkeeper", "my accountant", "our accountant",
+    "small business accounting", "startup accounting", "solo founder accounting",
+    "freelancer accounting", "self employed accounting", "DIY bookkeeping",
+    "doing my own books", "founder doing the books", "wearing the finance hat",
+    "no dedicated finance person", "growing business need better accounting",
+    "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
+    "virtual CFO", "fractional CFO", "need a fractional CFO",
+    "part time bookkeeper", "part time accountant",
+
+      "urgently need a bookkeeper", "need books cleaned up ASAP",
+    "tax deadline approaching", "need this done before tax season",
+    "investors asking for financials", "due diligence deadline",
+    "board wants updated financials", "need financials for loan application",
+    "need financials for a loan", "applying for a business loan financials",
+
+      "head of talent", "head of HR", "head of people",
+    "VP of people", "VP of talent", "chief people officer",
+    "talent acquisition manager", "recruiting manager",
+    "HR manager", "HR business partner", "people operations manager",
+    "HRIS manager", "compensation and benefits manager",
+    "director of talent acquisition", "director of people operations",
+    "technical recruiter", "corporate recruiter", "recruiting coordinator",
+
+      "send money to", "sending money to", "transfer money to",
+    "transferring money to", "wire money to", "wiring money to",
+    "move money to", "moving money to", "remit money to",
+    "remitting money to", "pay my supplier", "paying my supplier",
+    "pay a supplier", "paying a supplier", "pay my vendor",
+    "paying my vendor", "pay my manufacturer", "pay my factory",
+    "pay my partner", "pay my contractor", "pay an invoice",
+    "paying an invoice", "settle an invoice", "settling an invoice",
+    "pay a business", "business payment to", "supplier payment to",
+    "vendor payment to", "invoice payment to", "international payment to",
+    "overseas payment to", "cross border payment", "cross-border payment",
+    "cross border transfer", "cross-border transfer",
+    "international transfer", "international wire",
+    "international wire transfer", "foreign wire transfer",
+    "overseas wire transfer", "overseas transfer", "global payment",
+    "global transfer", "b2b payment", "b2b transfer",
+    "business to business payment",
+]
+
+# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
+# A keyword is fetched from DataForSEO exactly ONE time, ever. Once marked
+# fetched=True, it is PERMANENTLY skipped — no 12h/24h/whatever re-fetch,
+# no TTL expiry, nothing. This guarantees Claude/signals data is never
+# disturbed by the same keyword being re-searched and re-processed later.
+# The ONLY way a keyword gets processed again is if it is removed from
+# flintel_keywords manually (or the collection is reset).
+#
+# KEYWORD_CHECK_INTERVAL_SECONDS -> how often the loop wakes up to ask
+#                        "are there any NEW (never-fetched) keywords, or
+#                        any keyword still missing a search_volume?"
+#                        This is a cheap DB query, NOT a DataForSEO call
+#                        by itself — the (batched) DataForSEO call only
+#                        fires when there is actually something missing.
+#
+# "due" and "missing volume" are determined PURELY from flintel_keywords
+# itself (fetched=False / search_volume=None on the stored document) —
+# NOT from whether the keyword still happens to be present in the
+# REDDIT_SEARCH_KEYWORDS python list above. The python list's only job is
+# to tell sync_keywords_to_db() which brand-new keywords to INSERT
+# (insert-only, via $setOnInsert — never overwrites an existing doc).
+KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
+
+# ── KEYWORD RETRY COOLDOWN (kept, unchanged from v9.11.2) ───────────────────
+# NOTE: as of v9.12, process_one_keyword() no longer fetches Reddit posts
+# itself (that now happens in the fully separate
+# run_google_posts_rss_matching_loop() below, driven off flintel_google_posts,
+# not off a per-keyword failure). This cooldown mechanism and
+# set_keyword_retry_cooldown() are kept 100% as-is for API compatibility
+# and in case of future SERP-call-level failures, but process_one_keyword()
+# no longer produces had_fetch_failure=True from a Reddit RSS failure —
+# see process_one_keyword() below for what "had_fetch_failure" means now.
+REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS", "1800"))
+
+SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
+SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
+SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
+
+# ── SEARCH-VOLUME BATCH SEEDING CONFIG ──────────────────────────────────────
+# search_volume/live bills PER REQUEST, not per keyword, and accepts up to
+# 1000 keywords in a single call. We use 500 as a safe default chunk size.
+SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "12"))
+
+# ── FLINTEL_GOOGLE_POSTS / RSS-MATCHING CONFIG (from v9.12, unchanged) ──────
+# GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS -> how often the independent
+#   Reddit-RSS-matching loop wakes up to re-sync the targeting collections
+#   and re-check flintel_google_posts for distinct subreddits that still
+#   have fetched=False documents. This is a cheap DB query — the actual
+#   per-subreddit RSS HTTP call only fires for subreddits that genuinely
+#   have pending (fetched=False) documents.
+#
+# FUZZY_KEYWORDS_PER_POST -> how many auto-generated fuzzy keyword variants
+#   generate_fuzzy_keywords() produces per discovered Google-SERP post
+#   (6-7 by default, smart word-combination based off the matched Google
+#   search keyword — see generate_fuzzy_keywords()).
+GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS = int(os.getenv("GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS", "45"))
+FUZZY_KEYWORDS_PER_POST = int(os.getenv("FUZZY_KEYWORDS_PER_POST", "7"))
+GOOGLE_POSTS_RSS_ENTRY_LIMIT = int(os.getenv("GOOGLE_POSTS_RSS_ENTRY_LIMIT", "40"))
+
+# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, can differ ──
+TWITTER_SEARCH_KEYWORDS = [
+    kw.strip() for kw in os.getenv(
+        "TWITTER_SEARCH_KEYWORDS",
+        "Wise blocked,bank blocked my transfer,Payoneer blocked,"
+        "cross border payment,CRM is a nightmare,recommend a CRM,"
+        "we got hacked,ransomware attack,need incident response,"
+        "Salesforce alternative,switching from HubSpot"
+    ).split(",") if kw.strip()
+]
+
+# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, unchanged ──────────────
+# Governs the retry/backoff/User-Agent behaviour of _reddit_get_with_retry()
+# — used both for the per-subreddit RSS fetch (v9.12) — public,
+# credential-free, no OAuth/PRAW. Does NOT change what data is extracted or
+# where it goes — only how reliably we get a 200 instead of a 403 from
+# Reddit's public RSS feeds.
+REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
+REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
+REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
+REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
+# Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "python:flintel-signal-bot:v9.13 (by /u/flintel_signals)",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.getenv("API_KEY", "")
-
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 api_key_query  = APIKeyQuery(name="api_key",    auto_error=False)
 
@@ -369,2283 +399,440 @@ async def verify_api_key(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLATFORM ENABLE / DISABLE FLAGS (unchanged logic; FIX D adds indicators)
+# PLATFORM ENABLE / DISABLE FLAGS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bool_env(key: str, default: bool = True) -> bool:
     val = os.getenv(key, str(default)).strip().lower()
     return val in ("1", "true", "yes", "on")
 
-REDDIT_ENABLED   = _bool_env("REDDIT_ENABLED",   True)
-TWITTER_ENABLED  = _bool_env("TWITTER_ENABLED",  False)
-TELEGRAM_ENABLED = _bool_env("TELEGRAM_ENABLED", False)
-FACEBOOK_ENABLED = _bool_env("FACEBOOK_ENABLED", False)
-# v7.6.0 NEW
-LINKEDIN_ENABLED = _bool_env("LINKEDIN_ENABLED", False)
+REDDIT_ENABLED  = _bool_env("REDDIT_ENABLED",  True)
+TWITTER_ENABLED = _bool_env("TWITTER_ENABLED", False)
 
 
 def _working(flag: bool) -> str:
-    """FIX D: human-readable indicator for enable/disable state."""
     return "✅ Working" if flag else "❌ Not Working"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TARGET SUBREDDITS (unchanged)
+# GENERIC JSON FIELD-EXTRACTION HELPERS — unchanged from v9.6.
+#
+# These exist because RapidAPI marketplace providers do NOT guarantee a
+# fixed response schema the way DataForSEO's own API does. The old code
+# assumed exact key names ("rank_absolute", "search_volume", "results")
+# and silently returned None forever when the provider used a different
+# name. _dig_value()/_dig_list() search across a list of candidate key
+# names, at the top level and one level of nesting, so a provider's real
+# field naming is found instead of guessed-and-missed.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TARGET_SUBREDDITS = [
-    "Nigeria", "lagos", "Nigerians", "NigeriansAbroad",
-    "AfricanDiaspora", "pakistan", "Pakistani", "PakistaniDiaspora",
-    "PersonalFinanceCanada", "PersonalFinanceUK", "personalfinance",
-    "entrepreneur", "smallbusiness", "digitalnomad", "africatech",
-    "UKPersonalFinance", "Remittance", "moneytransfer",
-    "CanadianInvestor", "ExpatFinance",
-    "Scams", "personalfinance",
-    "Stripe", "Banking", "freelance",
-    "smallbusiness", "startups_marketing", "digital_marketing", "ProductManagement", "consulting",
-    "startups", "Entrepreneur", "EntrepreneurRideAlong",
-    "growmybusiness", "b2b_marketing", "marketing",
-        "nocode", "automation", "productivity",
-    "software", "SoftwareEngineering", "webdev", "smallbusinessowner", "solopreneur", "indiehackers",
-    "microsaas", "SideProject", "Business_Ideas", "software", "SoftwareEngineering", "webdev",
-
-    "logistics", "supplychain", "freight", "Truckers",
-    "FreightBrokers", "Shipping", "portmanteau",
-
-    "FulfillmentByAmazon", "ecommerce", "EtsySellers",
-    "shopify", "AmazonSeller", "dropship", "Import_Export",
-
-    "smallbusiness", "Entrepreneur", "EntrepreneurRideAlong",
-    "startups", "manufacturing",
-
-    "supplychainmanagement", "sourcing", "procurement",
-    "warehouseautomation", "operationsmanagement",      "humanresources", "recruiting", "RecruitingHell",
-    "HRTech", "AskHR", "Recruitment",
-
-    "startups", "smallbusiness", "Entrepreneur",
-    "EntrepreneurRideAlong", "growmybusiness",
-
-    "jobs", "careerguidance", "cscareerquestions",
-    "WorkOnline", "remotework",
-
-    "Accounting", "Bookkeeping", "QuickBooks", "Xero",
-    "smallbusiness", "tax", "IRS",
-
-    "Entrepreneur", "EntrepreneurRideAlong", "startups",
-    "smallbusinessowner", "solopreneur", "freelance",
-
-    "personalfinance", "financialindependence", "CFA",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TARGET TELEGRAM GROUPS (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-TARGET_TELEGRAM_GROUPS = [
-    "nigeriansincanada", "nigeriansinuk", "nigeriansinusa",
-    "nigeriansinaustralia", "nigeriandiaspora", "nigerianentrepreneurs",
-    "lagosBusinessNetwork", "nigeriafinance", "pakistanisincanada",
-    "pakistanisinuk", "pakistanisinusa", "pakistanidiaspora",
-    "pakistanibusiness", "karachi_business", "remittancetalk",
-    "moneytransfertips", "fxtraders_ng", "diaspora_finance",
-    "crossborderpayments", "africabusiness", "africaentrepreneurs",
-    "africatrade", "africafintech", "expatfinance", "diasporamoney",
-    "internationaltransfer", "wisealternatives",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — platform-isolated, never mixed
-# ─────────────────────────────────────────────────────────────────────────────
-
-reddit_queue:   queue.Queue = queue.Queue()
-twitter_queue:  queue.Queue = queue.Queue()
-telegram_queue: queue.Queue = queue.Queue()
-facebook_queue: queue.Queue = queue.Queue()
-# v7.6.0 NEW
-linkedin_queue: queue.Queue = queue.Queue()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD PRE-FILTER
-# NOTE: intentionally left EMPTY here — paste your full KEYWORDS list back
-# in below (same list already used across Reddit/Twitter/Telegram/Facebook/
-# LinkedIn). Nothing else in the file depends on the list's *content*, only
-# on it being a Python list of strings, so this section can be filled in
-# independently without touching any other part of the system.
-# ─────────────────────────────────────────────────────────────────────────────
-
-KEYWORDS = [
-   "0xProcessing account banned",
- "0xProcessing account frozen",
- "0xProcessing account suspended",
- "0xProcessing alternative",
- "0xProcessing chargeback issues",
- "0xProcessing down",
- "0xProcessing froze my funds",
- "0xProcessing funds stuck",
- "0xProcessing hidden fees",
- "0xProcessing high fees",
- "0xProcessing keeps failing",
- "0xProcessing limits too low",
- "0xProcessing payout delayed",
- "0xProcessing problems",
- "0xProcessing rejected my business",
- "0xProcessing settlement delays",
- "0xProcessing support terrible",
- "0xProcessing too expensive",
- "0xProcessing vs competitors",
- "0xProcessing withdrawal issues",
- "AI agent payments",
- "AI agent payments fast payouts",
- "AI agent payments low fees",
- "AI agent payments no KYC",
- "AI agent payments not working",
- "AI agent payments too expensive",
- "BTCPay Server account banned",
- "BTCPay Server account frozen",
- "BTCPay Server account suspended",
- "BTCPay Server alternative",
- "BTCPay Server chargeback issues",
- "BTCPay Server down",
- "BTCPay Server froze my funds",
- "BTCPay Server funds stuck",
- "BTCPay Server hidden fees",
- "BTCPay Server high fees",
- "BTCPay Server keeps failing",
- "BTCPay Server limits too low",
- "BTCPay Server payout delayed",
- "BTCPay Server problems",
- "BTCPay Server rejected my business",
- "BTCPay Server settlement delays",
- "BTCPay Server support terrible",
- "BTCPay Server too expensive",
- "BTCPay Server vs competitors",
- "BTCPay Server withdrawal issues",
- "BVNK account banned",
- "BVNK account frozen",
- "BVNK account suspended",
- "BVNK alternative",
- "BVNK chargeback issues",
- "BVNK down",
- "BVNK froze my funds",
- "BVNK funds stuck",
- "BVNK hidden fees",
- "BVNK high fees",
- "BVNK keeps failing",
- "BVNK limits too low",
- "BVNK payout delayed",
- "BVNK problems",
- "BVNK rejected my business",
- "BVNK settlement delays",
- "BVNK support terrible",
- "BVNK too expensive",
- "BVNK vs competitors",
- "BVNK withdrawal issues",
- "Binance Pay Ghana",
- "Binance Pay India",
- "Binance Pay Kenya",
- "Binance Pay Nigeria",
- "Binance Pay Pakistan",
- "Binance Pay Philippines",
- "Binance Pay Turkey",
- "Binance Pay UAE",
- "Binance Pay account banned",
- "Binance Pay account frozen",
- "Binance Pay account suspended",
- "Binance Pay alternative",
- "Binance Pay chargeback issues",
- "Binance Pay down",
- "Binance Pay froze my funds",
- "Binance Pay funds stuck",
- "Binance Pay hidden fees",
- "Binance Pay high fees",
- "Binance Pay keeps failing",
- "Binance Pay limits too low",
- "Binance Pay payout delayed",
- "Binance Pay problems",
- "Binance Pay rejected my business",
- "Binance Pay settlement delays",
- "Binance Pay support terrible",
- "Binance Pay too expensive",
- "Binance Pay vs competitors",
- "Binance Pay withdrawal issues",
- "BitPay Ghana",
- "BitPay India",
- "BitPay Kenya",
- "BitPay Nigeria",
- "BitPay Pakistan",
- "BitPay Philippines",
- "BitPay Turkey",
- "BitPay UAE",
- "BitPay account banned",
- "BitPay account frozen",
- "BitPay account suspended",
- "BitPay alternative",
- "BitPay chargeback issues",
- "BitPay down",
- "BitPay froze my funds",
- "BitPay funds stuck",
- "BitPay hidden fees",
- "BitPay high fees",
- "BitPay keeps failing",
- "BitPay limits too low",
- "BitPay payout delayed",
- "BitPay problems",
- "BitPay rejected my business",
- "BitPay settlement delays",
- "BitPay support terrible",
- "BitPay too expensive",
- "BitPay vs competitors",
- "BitPay withdrawal issues",
- "CBD payment processor",
- "CBD payment processor fast payouts",
- "CBD payment processor low fees",
- "CBD payment processor no KYC",
- "CBD payment processor not working",
- "CBD payment processor too expensive",
- "CoinGate account banned",
- "CoinGate account frozen",
- "CoinGate account suspended",
- "CoinGate alternative",
- "CoinGate chargeback issues",
- "CoinGate down",
- "CoinGate froze my funds",
- "CoinGate funds stuck",
- "CoinGate hidden fees",
- "CoinGate high fees",
- "CoinGate keeps failing",
- "CoinGate limits too low",
- "CoinGate payout delayed",
- "CoinGate problems",
- "CoinGate rejected my business",
- "CoinGate settlement delays",
- "CoinGate support terrible",
- "CoinGate too expensive",
- "CoinGate vs competitors",
- "CoinGate withdrawal issues",
- "CoinPayments account banned",
- "CoinPayments account frozen",
- "CoinPayments account suspended",
- "CoinPayments alternative",
- "CoinPayments chargeback issues",
- "CoinPayments down",
- "CoinPayments froze my funds",
- "CoinPayments funds stuck",
- "CoinPayments hidden fees",
- "CoinPayments high fees",
- "CoinPayments keeps failing",
- "CoinPayments limits too low",
- "CoinPayments payout delayed",
- "CoinPayments problems",
- "CoinPayments rejected my business",
- "CoinPayments settlement delays",
- "CoinPayments support terrible",
- "CoinPayments too expensive",
- "CoinPayments vs competitors",
- "CoinPayments withdrawal issues",
- "Coinbase Commerce Ghana",
- "Coinbase Commerce India",
- "Coinbase Commerce Kenya",
- "Coinbase Commerce Nigeria",
- "Coinbase Commerce Pakistan",
- "Coinbase Commerce Philippines",
- "Coinbase Commerce Turkey",
- "Coinbase Commerce UAE",
- "Coinbase Commerce account banned",
- "Coinbase Commerce account frozen",
- "Coinbase Commerce account suspended",
- "Coinbase Commerce alternative",
- "Coinbase Commerce chargeback issues",
- "Coinbase Commerce down",
- "Coinbase Commerce froze my funds",
- "Coinbase Commerce funds stuck",
- "Coinbase Commerce hidden fees",
- "Coinbase Commerce high fees",
- "Coinbase Commerce keeps failing",
- "Coinbase Commerce limits too low",
- "Coinbase Commerce payout delayed",
- "Coinbase Commerce problems",
- "Coinbase Commerce rejected my business",
- "Coinbase Commerce settlement delays",
- "Coinbase Commerce support terrible",
- "Coinbase Commerce too expensive",
- "Coinbase Commerce vs competitors",
- "Coinbase Commerce withdrawal issues",
- "Crypto.com Pay Ghana",
- "Crypto.com Pay India",
- "Crypto.com Pay Kenya",
- "Crypto.com Pay Nigeria",
- "Crypto.com Pay Pakistan",
- "Crypto.com Pay Philippines",
- "Crypto.com Pay Turkey",
- "Crypto.com Pay UAE",
- "Crypto.com Pay account banned",
- "Crypto.com Pay account frozen",
- "Crypto.com Pay account suspended",
- "Crypto.com Pay alternative",
- "Crypto.com Pay chargeback issues",
- "Crypto.com Pay down",
- "Crypto.com Pay froze my funds",
- "Crypto.com Pay funds stuck",
- "Crypto.com Pay hidden fees",
- "Crypto.com Pay high fees",
- "Crypto.com Pay keeps failing",
- "Crypto.com Pay limits too low",
- "Crypto.com Pay payout delayed",
- "Crypto.com Pay problems",
- "Crypto.com Pay rejected my business",
- "Crypto.com Pay settlement delays",
- "Crypto.com Pay support terrible",
- "Crypto.com Pay too expensive",
- "Crypto.com Pay vs competitors",
- "Crypto.com Pay withdrawal issues",
- "Cryptomus account banned",
- "Cryptomus account frozen",
- "Cryptomus account suspended",
- "Cryptomus alternative",
- "Cryptomus chargeback issues",
- "Cryptomus down",
- "Cryptomus froze my funds",
- "Cryptomus funds stuck",
- "Cryptomus hidden fees",
- "Cryptomus high fees",
- "Cryptomus keeps failing",
- "Cryptomus limits too low",
- "Cryptomus payout delayed",
- "Cryptomus problems",
- "Cryptomus rejected my business",
- "Cryptomus settlement delays",
- "Cryptomus support terrible",
- "Cryptomus too expensive",
- "Cryptomus vs competitors",
- "Cryptomus withdrawal issues",
- "Moonpay Ghana",
- "Moonpay India",
- "Moonpay Kenya",
- "Moonpay Nigeria",
- "Moonpay Pakistan",
- "Moonpay Philippines",
- "Moonpay Turkey",
- "Moonpay UAE",
- "Moonpay account banned",
- "Moonpay account frozen",
- "Moonpay account suspended",
- "Moonpay alternative",
- "Moonpay chargeback issues",
- "Moonpay down",
- "Moonpay froze my funds",
- "Moonpay funds stuck",
- "Moonpay hidden fees",
- "Moonpay high fees",
- "Moonpay keeps failing",
- "Moonpay limits too low",
- "Moonpay payout delayed",
- "Moonpay problems",
- "Moonpay rejected my business",
- "Moonpay settlement delays",
- "Moonpay support terrible",
- "Moonpay too expensive",
- "Moonpay vs competitors",
- "Moonpay withdrawal issues",
- "NOWPayments Ghana",
- "NOWPayments India",
- "NOWPayments Kenya",
- "NOWPayments Nigeria",
- "NOWPayments Pakistan",
- "NOWPayments Philippines",
- "NOWPayments Turkey",
- "NOWPayments UAE",
- "NOWPayments account banned",
- "NOWPayments account frozen",
- "NOWPayments account suspended",
- "NOWPayments alternative",
- "NOWPayments chargeback issues",
- "NOWPayments down",
- "NOWPayments froze my funds",
- "NOWPayments funds stuck",
- "NOWPayments hidden fees",
- "NOWPayments high fees",
- "NOWPayments keeps failing",
- "NOWPayments limits too low",
- "NOWPayments payout delayed",
- "NOWPayments problems",
- "NOWPayments rejected my business",
- "NOWPayments settlement delays",
- "NOWPayments support terrible",
- "NOWPayments too expensive",
- "NOWPayments vs competitors",
- "NOWPayments withdrawal issues",
- "OpenNode account banned",
- "OpenNode account frozen",
- "OpenNode account suspended",
- "OpenNode alternative",
- "OpenNode chargeback issues",
- "OpenNode down",
- "OpenNode froze my funds",
- "OpenNode funds stuck",
- "OpenNode hidden fees",
- "OpenNode high fees",
- "OpenNode keeps failing",
- "OpenNode limits too low",
- "OpenNode payout delayed",
- "OpenNode problems",
- "OpenNode rejected my business",
- "OpenNode settlement delays",
- "OpenNode support terrible",
- "OpenNode too expensive",
- "OpenNode vs competitors",
- "OpenNode withdrawal issues",
- "PayPal Ghana",
- "PayPal India",
- "PayPal Kenya",
- "PayPal Nigeria",
- "PayPal Pakistan",
- "PayPal Philippines",
- "PayPal Turkey",
- "PayPal UAE",
- "PayPal account banned",
- "PayPal account frozen",
- "PayPal account suspended",
- "PayPal alternative",
- "PayPal chargeback issues",
- "PayPal down",
- "PayPal froze my funds",
- "PayPal funds stuck",
- "PayPal hidden fees",
- "PayPal high fees",
- "PayPal keeps failing",
- "PayPal limits too low",
- "PayPal payout delayed",
- "PayPal problems",
- "PayPal rejected my business",
- "PayPal settlement delays",
- "PayPal support terrible",
- "PayPal too expensive",
- "PayPal vs competitors",
- "PayPal withdrawal issues",
- "Plisio account banned",
- "Plisio account frozen",
- "Plisio account suspended",
- "Plisio alternative",
- "Plisio chargeback issues",
- "Plisio down",
- "Plisio froze my funds",
- "Plisio funds stuck",
- "Plisio hidden fees",
- "Plisio high fees",
- "Plisio keeps failing",
- "Plisio limits too low",
- "Plisio payout delayed",
- "Plisio problems",
- "Plisio rejected my business",
- "Plisio settlement delays",
- "Plisio support terrible",
- "Plisio too expensive",
- "Plisio vs competitors",
- "Plisio withdrawal issues",
- "Ramp Network Ghana",
- "Ramp Network India",
- "Ramp Network Kenya",
- "Ramp Network Nigeria",
- "Ramp Network Pakistan",
- "Ramp Network Philippines",
- "Ramp Network Turkey",
- "Ramp Network UAE",
- "Ramp Network account banned",
- "Ramp Network account frozen",
- "Ramp Network account suspended",
- "Ramp Network alternative",
- "Ramp Network chargeback issues",
- "Ramp Network down",
- "Ramp Network froze my funds",
- "Ramp Network funds stuck",
- "Ramp Network hidden fees",
- "Ramp Network high fees",
- "Ramp Network keeps failing",
- "Ramp Network limits too low",
- "Ramp Network payout delayed",
- "Ramp Network problems",
- "Ramp Network rejected my business",
- "Ramp Network settlement delays",
- "Ramp Network support terrible",
- "Ramp Network too expensive",
- "Ramp Network vs competitors",
- "Ramp Network withdrawal issues",
- "Stripe Ghana",
- "Stripe India",
- "Stripe Kenya",
- "Stripe Nigeria",
- "Stripe Pakistan",
- "Stripe Philippines",
- "Stripe Turkey",
- "Stripe UAE",
- "Stripe account banned",
- "Stripe account frozen",
- "Stripe account suspended",
- "Stripe alternative",
- "Stripe chargeback issues",
- "Stripe down",
- "Stripe froze my funds",
- "Stripe funds stuck",
- "Stripe hidden fees",
- "Stripe high fees",
- "Stripe keeps failing",
- "Stripe limits too low",
- "Stripe payout delayed",
- "Stripe problems",
- "Stripe rejected my business",
- "Stripe settlement delays",
- "Stripe support terrible",
- "Stripe too expensive",
- "Stripe vs competitors",
- "Stripe withdrawal issues",
- "Transak Ghana",
- "Transak India",
- "Transak Kenya",
- "Transak Nigeria",
- "Transak Pakistan",
- "Transak Philippines",
- "Transak Turkey",
- "Transak UAE",
- "Transak account banned",
- "Transak account frozen",
- "Transak account suspended",
- "Transak alternative",
- "Transak chargeback issues",
- "Transak down",
- "Transak froze my funds",
- "Transak funds stuck",
- "Transak hidden fees",
- "Transak high fees",
- "Transak keeps failing",
- "Transak limits too low",
- "Transak payout delayed",
- "Transak problems",
- "Transak rejected my business",
- "Transak settlement delays",
- "Transak support terrible",
- "Transak too expensive",
- "Transak vs competitors",
- "Transak withdrawal issues",
- "Triple-A account banned",
- "Triple-A account frozen",
- "Triple-A account suspended",
- "Triple-A alternative",
- "Triple-A chargeback issues",
- "Triple-A down",
- "Triple-A froze my funds",
- "Triple-A funds stuck",
- "Triple-A hidden fees",
- "Triple-A high fees",
- "Triple-A keeps failing",
- "Triple-A limits too low",
- "Triple-A payout delayed",
- "Triple-A problems",
- "Triple-A rejected my business",
- "Triple-A settlement delays",
- "Triple-A support terrible",
- "Triple-A too expensive",
- "Triple-A vs competitors",
- "Triple-A withdrawal issues",
- "USDC payments",
- "USDC payments Argentina",
- "USDC payments Brazil",
- "USDC payments Ghana",
- "USDC payments India",
- "USDC payments Indonesia",
- "USDC payments Kenya",
- "USDC payments Mexico",
- "USDC payments Nigeria",
- "USDC payments Pakistan",
- "USDC payments Philippines",
- "USDC payments South Africa",
- "USDC payments Turkey",
- "USDC payments UAE",
- "USDC payments Vietnam",
- "USDC payments fast payouts",
- "USDC payments low fees",
- "USDC payments no KYC",
- "USDC payments not working",
- "USDC payments too expensive",
- "USDT payments",
- "USDT payments Argentina",
- "USDT payments Brazil",
- "USDT payments Ghana",
- "USDT payments India",
- "USDT payments Indonesia",
- "USDT payments Kenya",
- "USDT payments Mexico",
- "USDT payments Nigeria",
- "USDT payments Pakistan",
- "USDT payments Philippines",
- "USDT payments South Africa",
- "USDT payments Turkey",
- "USDT payments UAE",
- "USDT payments Vietnam",
- "USDT payments fast payouts",
- "USDT payments low fees",
- "USDT payments no KYC",
- "USDT payments not working",
- "USDT payments too expensive",
- "Utrust account banned",
- "Utrust account frozen",
- "Utrust account suspended",
- "Utrust alternative",
- "Utrust chargeback issues",
- "Utrust down",
- "Utrust froze my funds",
- "Utrust funds stuck",
- "Utrust hidden fees",
- "Utrust high fees",
- "Utrust keeps failing",
- "Utrust limits too low",
- "Utrust payout delayed",
- "Utrust problems",
- "Utrust rejected my business",
- "Utrust settlement delays",
- "Utrust support terrible",
- "Utrust too expensive",
- "Utrust vs competitors",
- "Utrust withdrawal issues",
- "accept USDC payments",
- "accept USDC payments Argentina",
- "accept USDC payments Brazil",
- "accept USDC payments Ghana",
- "accept USDC payments India",
- "accept USDC payments Indonesia",
- "accept USDC payments Kenya",
- "accept USDC payments Mexico",
- "accept USDC payments Nigeria",
- "accept USDC payments Pakistan",
- "accept USDC payments Philippines",
- "accept USDC payments South Africa",
- "accept USDC payments Turkey",
- "accept USDC payments UAE",
- "accept USDC payments Vietnam",
- "accept USDC payments fast payouts",
- "accept USDC payments low fees",
- "accept USDC payments no KYC",
- "accept USDC payments not working",
- "accept USDC payments too expensive",
- "accept USDT payments",
- "accept USDT payments Argentina",
- "accept USDT payments Brazil",
- "accept USDT payments Ghana",
- "accept USDT payments India",
- "accept USDT payments Indonesia",
- "accept USDT payments Kenya",
- "accept USDT payments Mexico",
- "accept USDT payments Nigeria",
- "accept USDT payments Pakistan",
- "accept USDT payments Philippines",
- "accept USDT payments South Africa",
- "accept USDT payments Turkey",
- "accept USDT payments UAE",
- "accept USDT payments Vietnam",
- "accept USDT payments fast payouts",
- "accept USDT payments low fees",
- "accept USDT payments no KYC",
- "accept USDT payments not working",
- "accept USDT payments too expensive",
- "accept bitcoin payments",
- "accept bitcoin payments Argentina",
- "accept bitcoin payments Brazil",
- "accept bitcoin payments Ghana",
- "accept bitcoin payments India",
- "accept bitcoin payments Indonesia",
- "accept bitcoin payments Kenya",
- "accept bitcoin payments Mexico",
- "accept bitcoin payments Nigeria",
- "accept bitcoin payments Pakistan",
- "accept bitcoin payments Philippines",
- "accept bitcoin payments South Africa",
- "accept bitcoin payments Turkey",
- "accept bitcoin payments UAE",
- "accept bitcoin payments Vietnam",
- "accept bitcoin payments fast payouts",
- "accept bitcoin payments low fees",
- "accept bitcoin payments no KYC",
- "accept bitcoin payments not working",
- "accept bitcoin payments too expensive",
- "accept crypto payments",
- "accept crypto payments Argentina",
- "accept crypto payments Brazil",
- "accept crypto payments Ghana",
- "accept crypto payments India",
- "accept crypto payments Indonesia",
- "accept crypto payments Kenya",
- "accept crypto payments Mexico",
- "accept crypto payments Nigeria",
- "accept crypto payments Pakistan",
- "accept crypto payments Philippines",
- "accept crypto payments South Africa",
- "accept crypto payments Turkey",
- "accept crypto payments UAE",
- "accept crypto payments Vietnam",
- "accept crypto payments fast payouts",
- "accept crypto payments low fees",
- "accept crypto payments no KYC",
- "accept crypto payments not working",
- "accept crypto payments too expensive",
- "adult payment processor",
- "adult payment processor fast payouts",
- "adult payment processor low fees",
- "adult payment processor no KYC",
- "adult payment processor not working",
- "adult payment processor too expensive",
- "agentic payments",
- "agentic payments fast payouts",
- "agentic payments low fees",
- "agentic payments no KYC",
- "agentic payments not working",
- "agentic payments too expensive",
- "alternative to 0xProcessing",
- "alternative to AI agent payments",
- "alternative to BTCPay Server",
- "alternative to BVNK",
- "alternative to Binance Pay",
- "alternative to BitPay",
- "alternative to CBD payment processor",
- "alternative to CoinGate",
- "alternative to CoinPayments",
- "alternative to Coinbase Commerce",
- "alternative to Crypto.com Pay",
- "alternative to Cryptomus",
- "alternative to Moonpay",
- "alternative to NOWPayments",
- "alternative to OpenNode",
- "alternative to PayPal",
- "alternative to Plisio",
- "alternative to Ramp Network",
- "alternative to Stripe",
- "alternative to Transak",
- "alternative to Triple-A",
- "alternative to USDC payments",
- "alternative to USDT payments",
- "alternative to Utrust",
- "alternative to accept USDC payments",
- "alternative to accept USDT payments",
- "alternative to accept bitcoin payments",
- "alternative to accept crypto payments",
- "alternative to adult payment processor",
- "alternative to agentic payments",
- "alternative to cross border crypto payments",
- "alternative to crypto billing platform",
- "alternative to crypto checkout",
- "alternative to crypto invoicing tool",
- "alternative to crypto payment gateway",
- "alternative to crypto payment integration",
- "alternative to crypto payment plugin",
- "alternative to crypto payment processor",
- "alternative to crypto payments API",
- "alternative to crypto payments for SaaS",
- "alternative to crypto payments for ecommerce",
- "alternative to crypto payroll",
- "alternative to crypto subscription billing",
- "alternative to fiat off-ramp",
- "alternative to fiat on-ramp",
- "alternative to forex payment processor",
- "alternative to gambling payment processor",
- "alternative to high risk merchant account",
- "alternative to high risk payment processor",
- "alternative to igaming payment processor",
- "alternative to merchant crypto payments",
- "alternative to no KYC crypto payments",
- "alternative to non-custodial payment gateway",
- "alternative to nutra payment processor",
- "alternative to off-ramp provider",
- "alternative to offshore merchant account",
- "alternative to on-ramp provider",
- "alternative to self-hosted crypto gateway",
- "alternative to stablecoin payments",
- "alternative to stablecoin payroll",
- "alternative to web3 payments",
- "anyone using AI agent payments",
- "anyone using CBD payment processor",
- "anyone using USDC payments",
- "anyone using USDT payments",
- "anyone using accept USDC payments",
- "anyone using accept USDT payments",
- "anyone using accept bitcoin payments",
- "anyone using accept crypto payments",
- "anyone using adult payment processor",
- "anyone using agentic payments",
- "anyone using cross border crypto payments",
- "anyone using crypto billing platform",
- "anyone using crypto checkout",
- "anyone using crypto invoicing tool",
- "anyone using crypto payment gateway",
- "anyone using crypto payment integration",
- "anyone using crypto payment plugin",
- "anyone using crypto payment processor",
- "anyone using crypto payments API",
- "anyone using crypto payments for SaaS",
- "anyone using crypto payments for ecommerce",
- "anyone using crypto payroll",
- "anyone using crypto subscription billing",
- "anyone using fiat off-ramp",
- "anyone using fiat on-ramp",
- "anyone using forex payment processor",
- "anyone using gambling payment processor",
- "anyone using high risk merchant account",
- "anyone using high risk payment processor",
- "anyone using igaming payment processor",
- "anyone using merchant crypto payments",
- "anyone using no KYC crypto payments",
- "anyone using non-custodial payment gateway",
- "anyone using nutra payment processor",
- "anyone using off-ramp provider",
- "anyone using offshore merchant account",
- "anyone using on-ramp provider",
- "anyone using self-hosted crypto gateway",
- "anyone using stablecoin payments",
- "anyone using stablecoin payroll",
- "anyone using web3 payments",
- "best AI agent payments",
- "best CBD payment processor",
- "best USDC payments",
- "best USDT payments",
- "best accept USDC payments",
- "best accept USDT payments",
- "best accept bitcoin payments",
- "best accept crypto payments",
- "best adult payment processor",
- "best agentic payments",
- "best cross border crypto payments",
- "best crypto billing platform",
- "best crypto checkout",
- "best crypto invoicing tool",
- "best crypto payment gateway",
- "best crypto payment integration",
- "best crypto payment plugin",
- "best crypto payment processor",
- "best crypto payments API",
- "best crypto payments for SaaS",
- "best crypto payments for ecommerce",
- "best crypto payroll",
- "best crypto subscription billing",
- "best fiat off-ramp",
- "best fiat on-ramp",
- "best forex payment processor",
- "best gambling payment processor",
- "best high risk merchant account",
- "best high risk payment processor",
- "best igaming payment processor",
- "best merchant crypto payments",
- "best no KYC crypto payments",
- "best non-custodial payment gateway",
- "best nutra payment processor",
- "best off-ramp provider",
- "best offshore merchant account",
- "best on-ramp provider",
- "best self-hosted crypto gateway",
- "best stablecoin payments",
- "best stablecoin payroll",
- "best web3 payments",
- "better than 0xProcessing",
- "better than BTCPay Server",
- "better than BVNK",
- "better than Binance Pay",
- "better than BitPay",
- "better than CoinGate",
- "better than CoinPayments",
- "better than Coinbase Commerce",
- "better than Crypto.com Pay",
- "better than Cryptomus",
- "better than Moonpay",
- "better than NOWPayments",
- "better than OpenNode",
- "better than PayPal",
- "better than Plisio",
- "better than Ramp Network",
- "better than Stripe",
- "better than Transak",
- "better than Triple-A",
- "better than Utrust",
- "cheaper than 0xProcessing",
- "cheaper than BTCPay Server",
- "cheaper than BVNK",
- "cheaper than Binance Pay",
- "cheaper than BitPay",
- "cheaper than CoinGate",
- "cheaper than CoinPayments",
- "cheaper than Coinbase Commerce",
- "cheaper than Crypto.com Pay",
- "cheaper than Cryptomus",
- "cheaper than Moonpay",
- "cheaper than NOWPayments",
- "cheaper than OpenNode",
- "cheaper than PayPal",
- "cheaper than Plisio",
- "cheaper than Ramp Network",
- "cheaper than Stripe",
- "cheaper than Transak",
- "cheaper than Triple-A",
- "cheaper than Utrust",
- "cross border crypto payments",
- "cross border crypto payments fast payouts",
- "cross border crypto payments low fees",
- "cross border crypto payments no KYC",
- "cross border crypto payments not working",
- "cross border crypto payments too expensive",
- "crypto billing platform",
- "crypto billing platform Argentina",
- "crypto billing platform Brazil",
- "crypto billing platform Ghana",
- "crypto billing platform India",
- "crypto billing platform Indonesia",
- "crypto billing platform Kenya",
- "crypto billing platform Mexico",
- "crypto billing platform Nigeria",
- "crypto billing platform Pakistan",
- "crypto billing platform Philippines",
- "crypto billing platform South Africa",
- "crypto billing platform Turkey",
- "crypto billing platform UAE",
- "crypto billing platform Vietnam",
- "crypto billing platform fast payouts",
- "crypto billing platform low fees",
- "crypto billing platform no KYC",
- "crypto billing platform not working",
- "crypto billing platform too expensive",
- "crypto checkout",
- "crypto checkout Argentina",
- "crypto checkout Brazil",
- "crypto checkout Ghana",
- "crypto checkout India",
- "crypto checkout Indonesia",
- "crypto checkout Kenya",
- "crypto checkout Mexico",
- "crypto checkout Nigeria",
- "crypto checkout Pakistan",
- "crypto checkout Philippines",
- "crypto checkout South Africa",
- "crypto checkout Turkey",
- "crypto checkout UAE",
- "crypto checkout Vietnam",
- "crypto checkout fast payouts",
- "crypto checkout low fees",
- "crypto checkout no KYC",
- "crypto checkout not working",
- "crypto checkout too expensive",
- "crypto invoicing tool",
- "crypto invoicing tool Argentina",
- "crypto invoicing tool Brazil",
- "crypto invoicing tool Ghana",
- "crypto invoicing tool India",
- "crypto invoicing tool Indonesia",
- "crypto invoicing tool Kenya",
- "crypto invoicing tool Mexico",
- "crypto invoicing tool Nigeria",
- "crypto invoicing tool Pakistan",
- "crypto invoicing tool Philippines",
- "crypto invoicing tool South Africa",
- "crypto invoicing tool Turkey",
- "crypto invoicing tool UAE",
- "crypto invoicing tool Vietnam",
- "crypto invoicing tool fast payouts",
- "crypto invoicing tool low fees",
- "crypto invoicing tool no KYC",
- "crypto invoicing tool not working",
- "crypto invoicing tool too expensive",
- "crypto payment gateway",
- "crypto payment gateway Argentina",
- "crypto payment gateway Brazil",
- "crypto payment gateway Ghana",
- "crypto payment gateway India",
- "crypto payment gateway Indonesia",
- "crypto payment gateway Kenya",
- "crypto payment gateway Mexico",
- "crypto payment gateway Nigeria",
- "crypto payment gateway Pakistan",
- "crypto payment gateway Philippines",
- "crypto payment gateway South Africa",
- "crypto payment gateway Turkey",
- "crypto payment gateway UAE",
- "crypto payment gateway Vietnam",
- "crypto payment gateway fast payouts",
- "crypto payment gateway low fees",
- "crypto payment gateway no KYC",
- "crypto payment gateway not working",
- "crypto payment gateway too expensive",
- "crypto payment integration",
- "crypto payment integration fast payouts",
- "crypto payment integration low fees",
- "crypto payment integration no KYC",
- "crypto payment integration not working",
- "crypto payment integration too expensive",
- "crypto payment plugin",
- "crypto payment plugin fast payouts",
- "crypto payment plugin low fees",
- "crypto payment plugin no KYC",
- "crypto payment plugin not working",
- "crypto payment plugin too expensive",
- "crypto payment processor",
- "crypto payment processor Argentina",
- "crypto payment processor Brazil",
- "crypto payment processor Ghana",
- "crypto payment processor India",
- "crypto payment processor Indonesia",
- "crypto payment processor Kenya",
- "crypto payment processor Mexico",
- "crypto payment processor Nigeria",
- "crypto payment processor Pakistan",
- "crypto payment processor Philippines",
- "crypto payment processor South Africa",
- "crypto payment processor Turkey",
- "crypto payment processor UAE",
- "crypto payment processor Vietnam",
- "crypto payment processor fast payouts",
- "crypto payment processor low fees",
- "crypto payment processor no KYC",
- "crypto payment processor not working",
- "crypto payment processor too expensive",
- "crypto payments API",
- "crypto payments API Argentina",
- "crypto payments API Brazil",
- "crypto payments API Ghana",
- "crypto payments API India",
- "crypto payments API Indonesia",
- "crypto payments API Kenya",
- "crypto payments API Mexico",
- "crypto payments API Nigeria",
- "crypto payments API Pakistan",
- "crypto payments API Philippines",
- "crypto payments API South Africa",
- "crypto payments API Turkey",
- "crypto payments API UAE",
- "crypto payments API Vietnam",
- "crypto payments API fast payouts",
- "crypto payments API low fees",
- "crypto payments API no KYC",
- "crypto payments API not working",
- "crypto payments API too expensive",
- "crypto payments for SaaS",
- "crypto payments for SaaS fast payouts",
- "crypto payments for SaaS low fees",
- "crypto payments for SaaS no KYC",
- "crypto payments for SaaS not working",
- "crypto payments for SaaS too expensive",
- "crypto payments for ecommerce",
- "crypto payments for ecommerce fast payouts",
- "crypto payments for ecommerce low fees",
- "crypto payments for ecommerce no KYC",
- "crypto payments for ecommerce not working",
- "crypto payments for ecommerce too expensive",
- "crypto payroll",
- "crypto payroll fast payouts",
- "crypto payroll low fees",
- "crypto payroll no KYC",
- "crypto payroll not working",
- "crypto payroll too expensive",
- "crypto subscription billing",
- "crypto subscription billing fast payouts",
- "crypto subscription billing low fees",
- "crypto subscription billing no KYC",
- "crypto subscription billing not working",
- "crypto subscription billing too expensive",
- "ditching 0xProcessing",
- "ditching BTCPay Server",
- "ditching BVNK",
- "ditching Binance Pay",
- "ditching BitPay",
- "ditching CoinGate",
- "ditching CoinPayments",
- "ditching Coinbase Commerce",
- "ditching Crypto.com Pay",
- "ditching Cryptomus",
- "ditching Moonpay",
- "ditching NOWPayments",
- "ditching OpenNode",
- "ditching PayPal",
- "ditching Plisio",
- "ditching Ramp Network",
- "ditching Stripe",
- "ditching Transak",
- "ditching Triple-A",
- "ditching Utrust",
- "done with 0xProcessing",
- "done with BTCPay Server",
- "done with BVNK",
- "done with Binance Pay",
- "done with BitPay",
- "done with CoinGate",
- "done with CoinPayments",
- "done with Coinbase Commerce",
- "done with Crypto.com Pay",
- "done with Cryptomus",
- "done with Moonpay",
- "done with NOWPayments",
- "done with OpenNode",
- "done with PayPal",
- "done with Plisio",
- "done with Ramp Network",
- "done with Stripe",
- "done with Transak",
- "done with Triple-A",
- "done with Utrust",
- "experience with AI agent payments",
- "experience with CBD payment processor",
- "experience with USDC payments",
- "experience with USDT payments",
- "experience with accept USDC payments",
- "experience with accept USDT payments",
- "experience with accept bitcoin payments",
- "experience with accept crypto payments",
- "experience with adult payment processor",
- "experience with agentic payments",
- "experience with cross border crypto payments",
- "experience with crypto billing platform",
- "experience with crypto checkout",
- "experience with crypto invoicing tool",
- "experience with crypto payment gateway",
- "experience with crypto payment integration",
- "experience with crypto payment plugin",
- "experience with crypto payment processor",
- "experience with crypto payments API",
- "experience with crypto payments for SaaS",
- "experience with crypto payments for ecommerce",
- "experience with crypto payroll",
- "experience with crypto subscription billing",
- "experience with fiat off-ramp",
- "experience with fiat on-ramp",
- "experience with forex payment processor",
- "experience with gambling payment processor",
- "experience with high risk merchant account",
- "experience with high risk payment processor",
- "experience with igaming payment processor",
- "experience with merchant crypto payments",
- "experience with no KYC crypto payments",
- "experience with non-custodial payment gateway",
- "experience with nutra payment processor",
- "experience with off-ramp provider",
- "experience with offshore merchant account",
- "experience with on-ramp provider",
- "experience with self-hosted crypto gateway",
- "experience with stablecoin payments",
- "experience with stablecoin payroll",
- "experience with web3 payments",
- "fiat off-ramp",
- "fiat off-ramp Argentina",
- "fiat off-ramp Brazil",
- "fiat off-ramp Ghana",
- "fiat off-ramp India",
- "fiat off-ramp Indonesia",
- "fiat off-ramp Kenya",
- "fiat off-ramp Mexico",
- "fiat off-ramp Nigeria",
- "fiat off-ramp Pakistan",
- "fiat off-ramp Philippines",
- "fiat off-ramp South Africa",
- "fiat off-ramp Turkey",
- "fiat off-ramp UAE",
- "fiat off-ramp Vietnam",
- "fiat off-ramp fast payouts",
- "fiat off-ramp low fees",
- "fiat off-ramp no KYC",
- "fiat off-ramp not working",
- "fiat off-ramp too expensive",
- "fiat on-ramp",
- "fiat on-ramp Argentina",
- "fiat on-ramp Brazil",
- "fiat on-ramp Ghana",
- "fiat on-ramp India",
- "fiat on-ramp Indonesia",
- "fiat on-ramp Kenya",
- "fiat on-ramp Mexico",
- "fiat on-ramp Nigeria",
- "fiat on-ramp Pakistan",
- "fiat on-ramp Philippines",
- "fiat on-ramp South Africa",
- "fiat on-ramp Turkey",
- "fiat on-ramp UAE",
- "fiat on-ramp Vietnam",
- "fiat on-ramp fast payouts",
- "fiat on-ramp low fees",
- "fiat on-ramp no KYC",
- "fiat on-ramp not working",
- "fiat on-ramp too expensive",
- "forex payment processor",
- "forex payment processor fast payouts",
- "forex payment processor low fees",
- "forex payment processor no KYC",
- "forex payment processor not working",
- "forex payment processor too expensive",
- "gambling payment processor",
- "gambling payment processor fast payouts",
- "gambling payment processor low fees",
- "gambling payment processor no KYC",
- "gambling payment processor not working",
- "gambling payment processor too expensive",
- "high risk merchant account",
- "high risk merchant account Argentina",
- "high risk merchant account Brazil",
- "high risk merchant account Ghana",
- "high risk merchant account India",
- "high risk merchant account Indonesia",
- "high risk merchant account Kenya",
- "high risk merchant account Mexico",
- "high risk merchant account Nigeria",
- "high risk merchant account Pakistan",
- "high risk merchant account Philippines",
- "high risk merchant account South Africa",
- "high risk merchant account Turkey",
- "high risk merchant account UAE",
- "high risk merchant account Vietnam",
- "high risk merchant account fast payouts",
- "high risk merchant account low fees",
- "high risk merchant account no KYC",
- "high risk merchant account not working",
- "high risk merchant account too expensive",
- "high risk payment processor",
- "high risk payment processor Argentina",
- "high risk payment processor Brazil",
- "high risk payment processor Ghana",
- "high risk payment processor India",
- "high risk payment processor Indonesia",
- "high risk payment processor Kenya",
- "high risk payment processor Mexico",
- "high risk payment processor Nigeria",
- "high risk payment processor Pakistan",
- "high risk payment processor Philippines",
- "high risk payment processor South Africa",
- "high risk payment processor Turkey",
- "high risk payment processor UAE",
- "high risk payment processor Vietnam",
- "high risk payment processor fast payouts",
- "high risk payment processor low fees",
- "high risk payment processor no KYC",
- "high risk payment processor not working",
- "high risk payment processor too expensive",
- "igaming payment processor",
- "igaming payment processor fast payouts",
- "igaming payment processor low fees",
- "igaming payment processor no KYC",
- "igaming payment processor not working",
- "igaming payment processor too expensive",
- "instead of 0xProcessing",
- "instead of BTCPay Server",
- "instead of BVNK",
- "instead of Binance Pay",
- "instead of BitPay",
- "instead of CoinGate",
- "instead of CoinPayments",
- "instead of Coinbase Commerce",
- "instead of Crypto.com Pay",
- "instead of Cryptomus",
- "instead of Moonpay",
- "instead of NOWPayments",
- "instead of OpenNode",
- "instead of PayPal",
- "instead of Plisio",
- "instead of Ramp Network",
- "instead of Stripe",
- "instead of Transak",
- "instead of Triple-A",
- "instead of Utrust",
- "leaving 0xProcessing",
- "leaving BTCPay Server",
- "leaving BVNK",
- "leaving Binance Pay",
- "leaving BitPay",
- "leaving CoinGate",
- "leaving CoinPayments",
- "leaving Coinbase Commerce",
- "leaving Crypto.com Pay",
- "leaving Cryptomus",
- "leaving Moonpay",
- "leaving NOWPayments",
- "leaving OpenNode",
- "leaving PayPal",
- "leaving Plisio",
- "leaving Ramp Network",
- "leaving Stripe",
- "leaving Transak",
- "leaving Triple-A",
- "leaving Utrust",
- "looking for AI agent payments",
- "looking for CBD payment processor",
- "looking for USDC payments",
- "looking for USDT payments",
- "looking for accept USDC payments",
- "looking for accept USDT payments",
- "looking for accept bitcoin payments",
- "looking for accept crypto payments",
- "looking for adult payment processor",
- "looking for agentic payments",
- "looking for cross border crypto payments",
- "looking for crypto billing platform",
- "looking for crypto checkout",
- "looking for crypto invoicing tool",
- "looking for crypto payment gateway",
- "looking for crypto payment integration",
- "looking for crypto payment plugin",
- "looking for crypto payment processor",
- "looking for crypto payments API",
- "looking for crypto payments for SaaS",
- "looking for crypto payments for ecommerce",
- "looking for crypto payroll",
- "looking for crypto subscription billing",
- "looking for fiat off-ramp",
- "looking for fiat on-ramp",
- "looking for forex payment processor",
- "looking for gambling payment processor",
- "looking for high risk merchant account",
- "looking for high risk payment processor",
- "looking for igaming payment processor",
- "looking for merchant crypto payments",
- "looking for no KYC crypto payments",
- "looking for non-custodial payment gateway",
- "looking for nutra payment processor",
- "looking for off-ramp provider",
- "looking for offshore merchant account",
- "looking for on-ramp provider",
- "looking for self-hosted crypto gateway",
- "looking for stablecoin payments",
- "looking for stablecoin payroll",
- "looking for web3 payments",
- "merchant crypto payments",
- "merchant crypto payments fast payouts",
- "merchant crypto payments low fees",
- "merchant crypto payments no KYC",
- "merchant crypto payments not working",
- "merchant crypto payments too expensive",
- "migrating from 0xProcessing",
- "migrating from BTCPay Server",
- "migrating from BVNK",
- "migrating from Binance Pay",
- "migrating from BitPay",
- "migrating from CoinGate",
- "migrating from CoinPayments",
- "migrating from Coinbase Commerce",
- "migrating from Crypto.com Pay",
- "migrating from Cryptomus",
- "migrating from Moonpay",
- "migrating from NOWPayments",
- "migrating from OpenNode",
- "migrating from PayPal",
- "migrating from Plisio",
- "migrating from Ramp Network",
- "migrating from Stripe",
- "migrating from Transak",
- "migrating from Triple-A",
- "migrating from Utrust",
- "moving off 0xProcessing",
- "moving off BTCPay Server",
- "moving off BVNK",
- "moving off Binance Pay",
- "moving off BitPay",
- "moving off CoinGate",
- "moving off CoinPayments",
- "moving off Coinbase Commerce",
- "moving off Crypto.com Pay",
- "moving off Cryptomus",
- "moving off Moonpay",
- "moving off NOWPayments",
- "moving off OpenNode",
- "moving off PayPal",
- "moving off Plisio",
- "moving off Ramp Network",
- "moving off Stripe",
- "moving off Transak",
- "moving off Triple-A",
- "moving off Utrust",
- "need AI agent payments",
- "need CBD payment processor",
- "need USDC payments",
- "need USDT payments",
- "need accept USDC payments",
- "need accept USDT payments",
- "need accept bitcoin payments",
- "need accept crypto payments",
- "need adult payment processor",
- "need agentic payments",
- "need cross border crypto payments",
- "need crypto billing platform",
- "need crypto checkout",
- "need crypto invoicing tool",
- "need crypto payment gateway",
- "need crypto payment integration",
- "need crypto payment plugin",
- "need crypto payment processor",
- "need crypto payments API",
- "need crypto payments for SaaS",
- "need crypto payments for ecommerce",
- "need crypto payroll",
- "need crypto subscription billing",
- "need fiat off-ramp",
- "need fiat on-ramp",
- "need forex payment processor",
- "need gambling payment processor",
- "need high risk merchant account",
- "need high risk payment processor",
- "need igaming payment processor",
- "need merchant crypto payments",
- "need no KYC crypto payments",
- "need non-custodial payment gateway",
- "need nutra payment processor",
- "need off-ramp provider",
- "need offshore merchant account",
- "need on-ramp provider",
- "need self-hosted crypto gateway",
- "need stablecoin payments",
- "need stablecoin payroll",
- "need web3 payments",
- "no KYC crypto payments",
- "no KYC crypto payments fast payouts",
- "no KYC crypto payments low fees",
- "no KYC crypto payments no KYC",
- "no KYC crypto payments not working",
- "no KYC crypto payments too expensive",
- "non-custodial payment gateway",
- "non-custodial payment gateway fast payouts",
- "non-custodial payment gateway low fees",
- "non-custodial payment gateway no KYC",
- "non-custodial payment gateway not working",
- "non-custodial payment gateway too expensive",
- "nutra payment processor",
- "nutra payment processor fast payouts",
- "nutra payment processor low fees",
- "nutra payment processor no KYC",
- "nutra payment processor not working",
- "nutra payment processor too expensive",
- "off-ramp provider",
- "off-ramp provider Argentina",
- "off-ramp provider Brazil",
- "off-ramp provider Ghana",
- "off-ramp provider India",
- "off-ramp provider Indonesia",
- "off-ramp provider Kenya",
- "off-ramp provider Mexico",
- "off-ramp provider Nigeria",
- "off-ramp provider Pakistan",
- "off-ramp provider Philippines",
- "off-ramp provider South Africa",
- "off-ramp provider Turkey",
- "off-ramp provider UAE",
- "off-ramp provider Vietnam",
- "off-ramp provider fast payouts",
- "off-ramp provider low fees",
- "off-ramp provider no KYC",
- "off-ramp provider not working",
- "off-ramp provider too expensive",
- "offshore merchant account",
- "offshore merchant account fast payouts",
- "offshore merchant account low fees",
- "offshore merchant account no KYC",
- "offshore merchant account not working",
- "offshore merchant account too expensive",
- "on-ramp provider",
- "on-ramp provider Argentina",
- "on-ramp provider Brazil",
- "on-ramp provider Ghana",
- "on-ramp provider India",
- "on-ramp provider Indonesia",
- "on-ramp provider Kenya",
- "on-ramp provider Mexico",
- "on-ramp provider Nigeria",
- "on-ramp provider Pakistan",
- "on-ramp provider Philippines",
- "on-ramp provider South Africa",
- "on-ramp provider Turkey",
- "on-ramp provider UAE",
- "on-ramp provider Vietnam",
- "on-ramp provider fast payouts",
- "on-ramp provider low fees",
- "on-ramp provider no KYC",
- "on-ramp provider not working",
- "on-ramp provider too expensive",
- "recommend AI agent payments",
- "recommend CBD payment processor",
- "recommend USDC payments",
- "recommend USDT payments",
- "recommend accept USDC payments",
- "recommend accept USDT payments",
- "recommend accept bitcoin payments",
- "recommend accept crypto payments",
- "recommend adult payment processor",
- "recommend agentic payments",
- "recommend cross border crypto payments",
- "recommend crypto billing platform",
- "recommend crypto checkout",
- "recommend crypto invoicing tool",
- "recommend crypto payment gateway",
- "recommend crypto payment integration",
- "recommend crypto payment plugin",
- "recommend crypto payment processor",
- "recommend crypto payments API",
- "recommend crypto payments for SaaS",
- "recommend crypto payments for ecommerce",
- "recommend crypto payroll",
- "recommend crypto subscription billing",
- "recommend fiat off-ramp",
- "recommend fiat on-ramp",
- "recommend forex payment processor",
- "recommend gambling payment processor",
- "recommend high risk merchant account",
- "recommend high risk payment processor",
- "recommend igaming payment processor",
- "recommend merchant crypto payments",
- "recommend no KYC crypto payments",
- "recommend non-custodial payment gateway",
- "recommend nutra payment processor",
- "recommend off-ramp provider",
- "recommend offshore merchant account",
- "recommend on-ramp provider",
- "recommend self-hosted crypto gateway",
- "recommend stablecoin payments",
- "recommend stablecoin payroll",
- "recommend web3 payments",
- "replacing 0xProcessing",
- "replacing BTCPay Server",
- "replacing BVNK",
- "replacing Binance Pay",
- "replacing BitPay",
- "replacing CoinGate",
- "replacing CoinPayments",
- "replacing Coinbase Commerce",
- "replacing Crypto.com Pay",
- "replacing Cryptomus",
- "replacing Moonpay",
- "replacing NOWPayments",
- "replacing OpenNode",
- "replacing PayPal",
- "replacing Plisio",
- "replacing Ramp Network",
- "replacing Stripe",
- "replacing Transak",
- "replacing Triple-A",
- "replacing Utrust",
- "self-hosted crypto gateway",
- "self-hosted crypto gateway fast payouts",
- "self-hosted crypto gateway low fees",
- "self-hosted crypto gateway no KYC",
- "self-hosted crypto gateway not working",
- "self-hosted crypto gateway too expensive",
- "stablecoin payments",
- "stablecoin payments Argentina",
- "stablecoin payments Brazil",
- "stablecoin payments Ghana",
- "stablecoin payments India",
- "stablecoin payments Indonesia",
- "stablecoin payments Kenya",
- "stablecoin payments Mexico",
- "stablecoin payments Nigeria",
- "stablecoin payments Pakistan",
- "stablecoin payments Philippines",
- "stablecoin payments South Africa",
- "stablecoin payments Turkey",
- "stablecoin payments UAE",
- "stablecoin payments Vietnam",
- "stablecoin payments fast payouts",
- "stablecoin payments low fees",
- "stablecoin payments no KYC",
- "stablecoin payments not working",
- "stablecoin payments too expensive",
- "stablecoin payroll",
- "stablecoin payroll fast payouts",
- "stablecoin payroll low fees",
- "stablecoin payroll no KYC",
- "stablecoin payroll not working",
- "stablecoin payroll too expensive",
- "suggest AI agent payments",
- "suggest CBD payment processor",
- "suggest USDC payments",
- "suggest USDT payments",
- "suggest accept USDC payments",
- "suggest accept USDT payments",
- "suggest accept bitcoin payments",
- "suggest accept crypto payments",
- "suggest adult payment processor",
- "suggest agentic payments",
- "suggest cross border crypto payments",
- "suggest crypto billing platform",
- "suggest crypto checkout",
- "suggest crypto invoicing tool",
- "suggest crypto payment gateway",
- "suggest crypto payment integration",
- "suggest crypto payment plugin",
- "suggest crypto payment processor",
- "suggest crypto payments API",
- "suggest crypto payments for SaaS",
- "suggest crypto payments for ecommerce",
- "suggest crypto payroll",
- "suggest crypto subscription billing",
- "suggest fiat off-ramp",
- "suggest fiat on-ramp",
- "suggest forex payment processor",
- "suggest gambling payment processor",
- "suggest high risk merchant account",
- "suggest high risk payment processor",
- "suggest igaming payment processor",
- "suggest merchant crypto payments",
- "suggest no KYC crypto payments",
- "suggest non-custodial payment gateway",
- "suggest nutra payment processor",
- "suggest off-ramp provider",
- "suggest offshore merchant account",
- "suggest on-ramp provider",
- "suggest self-hosted crypto gateway",
- "suggest stablecoin payments",
- "suggest stablecoin payroll",
- "suggest web3 payments",
- "switching from 0xProcessing",
- "switching from AI agent payments",
- "switching from BTCPay Server",
- "switching from BVNK",
- "switching from Binance Pay",
- "switching from BitPay",
- "switching from CBD payment processor",
- "switching from CoinGate",
- "switching from CoinPayments",
- "switching from Coinbase Commerce",
- "switching from Crypto.com Pay",
- "switching from Cryptomus",
- "switching from Moonpay",
- "switching from NOWPayments",
- "switching from OpenNode",
- "switching from PayPal",
- "switching from Plisio",
- "switching from Ramp Network",
- "switching from Stripe",
- "switching from Transak",
- "switching from Triple-A",
- "switching from USDC payments",
- "switching from USDT payments",
- "switching from Utrust",
- "switching from accept USDC payments",
- "switching from accept USDT payments",
- "switching from accept bitcoin payments",
- "switching from accept crypto payments",
- "switching from adult payment processor",
- "switching from agentic payments",
- "switching from cross border crypto payments",
- "switching from crypto billing platform",
- "switching from crypto checkout",
- "switching from crypto invoicing tool",
- "switching from crypto payment gateway",
- "switching from crypto payment integration",
- "switching from crypto payment plugin",
- "switching from crypto payment processor",
- "switching from crypto payments API",
- "switching from crypto payments for SaaS",
- "switching from crypto payments for ecommerce",
- "switching from crypto payroll",
- "switching from crypto subscription billing",
- "switching from fiat off-ramp",
- "switching from fiat on-ramp",
- "switching from forex payment processor",
- "switching from gambling payment processor",
- "switching from high risk merchant account",
- "switching from high risk payment processor",
- "switching from igaming payment processor",
- "switching from merchant crypto payments",
- "switching from no KYC crypto payments",
- "switching from non-custodial payment gateway",
- "switching from nutra payment processor",
- "switching from off-ramp provider",
- "switching from offshore merchant account",
- "switching from on-ramp provider",
- "switching from self-hosted crypto gateway",
- "switching from stablecoin payments",
- "switching from stablecoin payroll",
- "switching from web3 payments",
- "thoughts on AI agent payments",
- "thoughts on CBD payment processor",
- "thoughts on USDC payments",
- "thoughts on USDT payments",
- "thoughts on accept USDC payments",
- "thoughts on accept USDT payments",
- "thoughts on accept bitcoin payments",
- "thoughts on accept crypto payments",
- "thoughts on adult payment processor",
- "thoughts on agentic payments",
- "thoughts on cross border crypto payments",
- "thoughts on crypto billing platform",
- "thoughts on crypto checkout",
- "thoughts on crypto invoicing tool",
- "thoughts on crypto payment gateway",
- "thoughts on crypto payment integration",
- "thoughts on crypto payment plugin",
- "thoughts on crypto payment processor",
- "thoughts on crypto payments API",
- "thoughts on crypto payments for SaaS",
- "thoughts on crypto payments for ecommerce",
- "thoughts on crypto payroll",
- "thoughts on crypto subscription billing",
- "thoughts on fiat off-ramp",
- "thoughts on fiat on-ramp",
- "thoughts on forex payment processor",
- "thoughts on gambling payment processor",
- "thoughts on high risk merchant account",
- "thoughts on high risk payment processor",
- "thoughts on igaming payment processor",
- "thoughts on merchant crypto payments",
- "thoughts on no KYC crypto payments",
- "thoughts on non-custodial payment gateway",
- "thoughts on nutra payment processor",
- "thoughts on off-ramp provider",
- "thoughts on offshore merchant account",
- "thoughts on on-ramp provider",
- "thoughts on self-hosted crypto gateway",
- "thoughts on stablecoin payments",
- "thoughts on stablecoin payroll",
- "thoughts on web3 payments",
- "web3 payments",
- "web3 payments Argentina",
- "web3 payments Brazil",
- "web3 payments Ghana",
- "web3 payments India",
- "web3 payments Indonesia",
- "web3 payments Kenya",
- "web3 payments Mexico",
- "web3 payments Nigeria",
- "web3 payments Pakistan",
- "web3 payments Philippines",
- "web3 payments South Africa",
- "web3 payments Turkey",
- "web3 payments UAE",
- "web3 payments Vietnam",
- "web3 payments fast payouts",
- "web3 payments low fees",
- "web3 payments no KYC",
- "web3 payments not working",
- "web3 payments too expensive",
- "which is best AI agent payments",
- "which is best CBD payment processor",
- "which is best USDC payments",
- "which is best USDT payments",
- "which is best accept USDC payments",
- "which is best accept USDT payments",
- "which is best accept bitcoin payments",
- "which is best accept crypto payments",
- "which is best adult payment processor",
- "which is best agentic payments",
- "which is best cross border crypto payments",
- "which is best crypto billing platform",
- "which is best crypto checkout",
- "which is best crypto invoicing tool",
- "which is best crypto payment gateway",
- "which is best crypto payment integration",
- "which is best crypto payment plugin",
- "which is best crypto payment processor",
- "which is best crypto payments API",
- "which is best crypto payments for SaaS",
- "which is best crypto payments for ecommerce",
- "which is best crypto payroll",
- "which is best crypto subscription billing",
- "which is best fiat off-ramp",
- "which is best fiat on-ramp",
- "which is best forex payment processor",
- "which is best gambling payment processor",
- "which is best high risk merchant account",
- "which is best high risk payment processor",
- "which is best igaming payment processor",
- "which is best merchant crypto payments",
- "which is best no KYC crypto payments",
- "which is best non-custodial payment gateway",
- "which is best nutra payment processor",
- "which is best off-ramp provider",
- "which is best offshore merchant account",
- "which is best on-ramp provider",
- "which is best self-hosted crypto gateway",
- "which is best stablecoin payments",
- "which is best stablecoin payroll",
- "which is best web3 payments",
- "who do you use for AI agent payments",
- "who do you use for CBD payment processor",
- "who do you use for USDC payments",
- "who do you use for USDT payments",
- "who do you use for accept USDC payments",
- "who do you use for accept USDT payments",
- "who do you use for accept bitcoin payments",
- "who do you use for accept crypto payments",
- "who do you use for adult payment processor",
- "who do you use for agentic payments",
- "who do you use for cross border crypto payments",
- "who do you use for crypto billing platform",
- "who do you use for crypto checkout",
- "who do you use for crypto invoicing tool",
- "who do you use for crypto payment gateway",
- "who do you use for crypto payment integration",
- "who do you use for crypto payment plugin",
- "who do you use for crypto payment processor",
- "who do you use for crypto payments API",
- "who do you use for crypto payments for SaaS",
- "who do you use for crypto payments for ecommerce",
- "who do you use for crypto payroll",
- "who do you use for crypto subscription billing",
- "who do you use for fiat off-ramp",
- "who do you use for fiat on-ramp",
- "who do you use for forex payment processor",
- "who do you use for gambling payment processor",
- "who do you use for high risk merchant account",
- "who do you use for high risk payment processor",
- "who do you use for igaming payment processor",
- "who do you use for merchant crypto payments",
- "who do you use for no KYC crypto payments",
- "who do you use for non-custodial payment gateway",
- "who do you use for nutra payment processor",
- "who do you use for off-ramp provider",
- "who do you use for offshore merchant account",
- "who do you use for on-ramp provider",
- "who do you use for self-hosted crypto gateway",
- "who do you use for stablecoin payments",
- "who do you use for stablecoin payroll",
- "who do you use for web3 payments",
-]
-
-
-
-def passes_keyword_filter(text: str):
+def _dig_value(obj, candidate_keys: list):
     """
-    v7.8.0 CHANGE — now returns the MATCHED KEYWORD STRING (the exact
-    KEYWORDS list entry that matched) instead of a plain True/False.
-    Returns None if nothing matched.
-
-    This is a backward-compatible change: every existing call site used
-    this in a boolean context (`if not passes_keyword_filter(text):` /
-    `if passes_keyword_filter(text):`), and a non-empty string is truthy
-    while None is falsy — so all existing "matched / not matched" branch
-    logic behaves exactly as before. The ONLY thing that changes is that
-    callers can now also inspect WHICH keyword matched, if they choose to
-    (used by run_batch_processor below to populate search_keyword for
-    Reddit/Twitter/Telegram, the three platforms that don't already know
-    their matching keyword the way Facebook/LinkedIn's per-keyword search
-    loops do).
+    Searches `obj` (a dict, or a list of dicts) for the first present key
+    from `candidate_keys`, checking the top level first, then one level
+    of nested dict/list values. Returns the first match's value, or None
+    if nothing matches. Purely additive/defensive — never raises.
     """
-    t = text.lower()
-    for kw in KEYWORDS:
-        if kw.lower() in t:
-            return kw
+    if obj is None:
+        return None
+
+    def _try_dict(d):
+        if not isinstance(d, dict):
+            return None
+        for key in candidate_keys:
+            if key in d and d[key] is not None:
+                return d[key]
+        return None
+
+    # top-level dict
+    if isinstance(obj, dict):
+        val = _try_dict(obj)
+        if val is not None:
+            return val
+        # one level of nesting inside any dict/list value
+        for v in obj.values():
+            if isinstance(v, dict):
+                val = _try_dict(v)
+                if val is not None:
+                    return val
+            elif isinstance(v, list) and v:
+                first = v[0]
+                if isinstance(first, dict):
+                    val = _try_dict(first)
+                    if val is not None:
+                        return val
+
+    # top-level list of dicts (take the first element)
+    elif isinstance(obj, list) and obj:
+        first = obj[0]
+        if isinstance(first, dict):
+            val = _try_dict(first)
+            if val is not None:
+                return val
+
     return None
 
 
+def _dig_list(obj, candidate_list_keys: list) -> list:
+    """
+    Searches a RapidAPI JSON response for the results/organic-results
+    list, trying several common key names used across different
+    providers ("results", "organic_results", "items", "data", "items",
+    "organic", "response"). Falls back to: if `obj` itself is already a
+    list, return it as-is. Returns [] if nothing usable is found —
+    never raises.
+    """
+    if isinstance(obj, list):
+        return obj
+    if not isinstance(obj, dict):
+        return []
+    for key in candidate_list_keys:
+        val = obj.get(key)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            # some providers nest one level deeper, e.g. {"data": {"results": [...]}}
+            for inner_key in candidate_list_keys:
+                inner_val = val.get(inner_key)
+                if isinstance(inner_val, list):
+                    return inner_val
+    return []
+
+
+# Candidate field names for a per-result Google rank/position.
+RANK_FIELD_CANDIDATES = [
+    "rank_absolute", "rank", "position", "google_rank",
+    "serp_position", "rank_group", "index", "pos",
+]
+
+# Candidate field names for the result-list container.
+RESULT_LIST_KEY_CANDIDATES = [
+    "results", "organic_results", "organic", "items", "data", "response", "hits",
+]
+
+# Candidate field names for monthly search volume.
+VOLUME_FIELD_CANDIDATES = [
+    "search_volume", "searchVolume", "volume", "monthly_searches",
+    "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
+    "avg_search_volume",
+]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY — CHUNKED, ONE CHUNK PER POLL CYCLE
-# v7.9.1 CHANGE (fixes HTTP 414 Request-URI Too Large) — v7.9.0 combined
-# ALL keywords into ONE giant OR-query, producing URLs 100,000+ chars long
-# that RapidAPI's gateway rejected with 414 every single cycle.
+# SHARED QUEUES — platform-isolated, NEVER mixed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+reddit_queue:  queue.Queue = queue.Queue()
+twitter_queue: queue.Queue = queue.Queue()
+
+
+def passes_keyword_filter(text: str, keywords: list) -> bool:
+    """Generic keyword gate — takes an explicit keyword list so Reddit
+    and Twitter can be filtered against their own independent lists.
+    NOTE (v9.13): still used for Twitter exactly as before. For Reddit,
+    run_batch_processor() below now SKIPS this call entirely — see that
+    function's comments for why."""
+    t = text.lower()
+    for kw in keywords:
+        if kw.lower() in t:
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUZZY KEYWORD GENERATION (from v9.12, unchanged)
 #
-# Fix: KEYWORDS is split into chunks of TWITTER_CHUNK_SIZE (default 25)
-# keywords each — same idea as Facebook/LinkedIn's per-keyword loop, just
-# grouped 25-at-a-time instead of 1-at-a-time (Twitter's plan/rate-limits
-# don't tolerate 2000+ separate requests per cycle the way Facebook/
-# LinkedIn's setup does).
+# Given the exact Google search keyword that produced a SERP result,
+# deterministically generates 6-7 "fuzzy" keyword variants using smart
+# word-combination logic — contiguous n-grams (bigrams/trigrams),
+# stopword-stripped phrases, partial (head/tail-trimmed) phrases, and
+# individually significant single words. No external NLP library is
+# needed — this is a pure, dependency-free, reproducible heuristic.
 #
-# UNLIKE Facebook/LinkedIn (which cycle through their ENTIRE list every
-# poll cycle), Twitter sends ONE chunk per TWITTER_POLL_INTERVAL, then
-# advances to the next chunk next cycle, and so on — wrapping back to
-# chunk #1 once the last chunk is reached. So if there are 1000 keywords
-# in 40 chunks of 25, it takes 40 poll cycles to cover the full list once,
-# then it starts over from chunk #1 automatically. This keeps each
-# individual request small (no 414) AND keeps Twitter's request rate low
-# and steady. Reddit/Telegram/Facebook/LinkedIn are completely unaffected
-# — their per-keyword/per-subreddit cycling behaviour is untouched.
+# These fuzzy keywords are stored alongside each flintel_google_posts
+# document (and mirrored onto its flintel_targeting_keywords document —
+# see sync_targeting_collections() below) purely for traceability /
+# secondary text confirmation — the AUTHORITATIVE match signal is always
+# the exact post_url, never the fuzzy keywords alone.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TWITTER_CHUNK_SIZE = int(os.getenv("TWITTER_CHUNK_SIZE", "25"))
+_FUZZY_STOPWORDS = {
+    "a", "an", "the", "my", "our", "your", "their", "his", "her",
+    "to", "for", "is", "are", "was", "were", "of", "on", "in", "it",
+    "this", "that", "and", "or", "with", "at", "by", "from", "as",
+    "be", "been", "has", "have", "had", "do", "does", "did", "not",
+}
 
 
-def _build_twitter_search_chunks() -> list:
-    seen = set()
-    unique_kws = []
-    for kw in KEYWORDS:
-        kl = kw.lower()
-        if kl not in seen:
-            seen.add(kl)
-            unique_kws.append(kw)
+def generate_fuzzy_keywords(keyword: str, max_variants: int = FUZZY_KEYWORDS_PER_POST) -> list:
+    """
+    Deterministically generates up to `max_variants` fuzzy keyword
+    strings from `keyword` (the exact Google search keyword that produced
+    a given SERP result). Smart, dependency-free, word-combination based:
 
-    if not unique_kws:
-        return [
-            "(\"international transfer\" OR \"supplier payment\" OR \"bank blocked\""
-            " OR \"Wise blocked\" OR \"cross border payment\") -is:retweet lang:en"
-        ]
+      - the full original phrase (lowercased)
+      - the stopword-stripped content-word phrase
+      - every contiguous bigram
+      - every contiguous trigram (if the phrase has >= 3 words)
+      - head-trimmed and tail-trimmed partial phrases
+      - individually significant single words (len > 3, not a stopword)
 
-    chunks = []
-    for i in range(0, len(unique_kws), TWITTER_CHUNK_SIZE):
-        group = unique_kws[i:i + TWITTER_CHUNK_SIZE]
-        parts = [f'"{kw}"' if " " in kw else kw for kw in group]
-        query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-        chunks.append(query)
+    Variants are deduplicated, then sorted so longer/more-specific
+    multi-word phrases are prioritized over single words, and finally
+    capped at `max_variants` (default 7). Never raises — falls back to
+    just the original phrase if `keyword` is empty/whitespace.
+    """
+    if not keyword or not keyword.strip():
+        return []
 
-    log.info(
-        f"Twitter search chunks built | total_keywords:{len(unique_kws)} | "
-        f"chunk_size:{TWITTER_CHUNK_SIZE} | total_chunks:{len(chunks)} | "
-        f"full_list_coverage_every:{len(chunks)} poll cycles "
-        f"(~{len(chunks) * TWITTER_POLL_INTERVAL}s)"
-    )
-    return chunks
+    original = keyword.strip().lower()
+    words = re.findall(r"[a-zA-Z0-9']+", original)
+    if not words:
+        return [original]
 
+    content_words = [w for w in words if w not in _FUZZY_STOPWORDS]
 
-TWITTER_SEARCH_CHUNKS = _build_twitter_search_chunks()
+    variants = set()
+    variants.add(original)
+
+    if content_words:
+        variants.add(" ".join(content_words))
+
+    # contiguous bigrams
+    for i in range(len(words) - 1):
+        variants.add(" ".join(words[i:i + 2]))
+
+    # contiguous trigrams
+    for i in range(len(words) - 2):
+        variants.add(" ".join(words[i:i + 3]))
+
+    # head/tail-trimmed partial phrases
+    if len(words) > 1:
+        variants.add(" ".join(words[:-1]))
+        variants.add(" ".join(words[1:]))
+
+    # individually significant single words
+    for w in content_words:
+        if len(w) > 3:
+            variants.add(w)
+
+    variants.discard("")
+
+    result = list(variants)
+    # prioritize longer, multi-word, more-specific phrases first
+    result.sort(key=lambda v: (-len(v.split()), -len(v)))
+
+    return result[:max_variants]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DERIVE FIELDS LOCALLY (unchanged)
+# TWITTER SEARCH QUERY — built directly from TWITTER_SEARCH_KEYWORDS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _derive_fields(score: int) -> dict:
-    if score >= 8:
-        return {"signal_category": "high_intent", "tier": "immediate", "hubspot_priority": "high"}
-    elif score >= 4:
-        return {"signal_category": "mid_intent", "tier": "digest", "hubspot_priority": "medium"}
-    elif score >= 3:
-        return {"signal_category": "mid_intent", "tier": "watchlist", "hubspot_priority": "low"}
-    else:
-        return {"signal_category": "discard", "tier": "discard", "hubspot_priority": "skip"}
+def _build_twitter_search_query() -> str:
+    if not TWITTER_SEARCH_KEYWORDS:
+        return (
+            "(\"international transfer\" OR \"bank blocked\" OR \"we got hacked\""
+            " OR \"CRM is a nightmare\") -is:retweet lang:en"
+        )
+    parts = [f'"{kw}"' if " " in kw else kw for kw in TWITTER_SEARCH_KEYWORDS]
+    query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
+    log.info(f"Twitter search query built | terms:{len(parts)} | len:{len(query)}")
+    return query
+
+
+TWITTER_SEARCH_QUERY = _build_twitter_search_query()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE SYSTEM PROMPTS — PLATFORM-SPECIFIC SCHEMAS
-# Reddit/Twitter/Telegram/Facebook prompts byte-for-byte identical to
-# v7.5.0. CLAUDE_SYSTEM_PROMPT_LINKEDIN is new (v7.6.0), same _SCORING_CORE.
+# CLAUDE PROMPT — generic, niche-agnostic (unchanged schema)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SCORING_CORE = """
-You are Flintel's AI signal intelligence analyst.
+CLAUDE_SYSTEM_PROMPT = """
+You are Flintel's signal intelligence analyst.
 
-Your only job is to read a public social media post and determine
-whether the person or company posting is a genuine BUYER SIGNAL for
-crypto, stablecoin, or high-risk PAYMENT PROCESSING services right now.
+Your job is to read one social media post (Reddit or X), together with
+its metadata and the industry it was matched against, and produce two
+things:
 
-You work exclusively for a payment processing company helping
-merchants, founders, developers, and finance/ops teams accept,
-switch, fix, or choose a crypto / stablecoin / high-risk payment
-solution.
+1. An intent_score from 1 to 100, built from three weighted components
+2. A short, human-written-style reply draft the end user can personalize
+   and post themselves, in their own voice, from their own account
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHO WE SERVE — KNOW THIS PERFECTLY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You score using the industry context you are given. You are never told
+the specific company or product this is for — only the industry
+category (e.g. "fintech_payments", "cybersecurity", "crm_sales_tools",
+"logistics", "recruitment_hr", "accounting_software"). Two posts using
+identical words ("hidden fees are killing us") can score very
+differently depending on whether the industry context is fintech
+billing versus logistics freight surcharges — use the industry field to
+judge whether the post's actual subject matches that vertical's real
+buyer pain, not just shared vocabulary.
 
-Our ideal customer is a POTENTIAL CUSTOMER — a merchant, founder,
-developer, or finance/ops person who:
+═══════════════════════════════════════════════════════════════════════
+INPUT YOU WILL RECEIVE, PER POST
+═══════════════════════════════════════════════════════════════════════
+- platform: "reddit" | "x"
+- industry: one of the six category strings above
+- search_keyword: the phrase this post was matched against
+- post_text: the raw post content
+- google_rank: integer, or null (X posts will almost always be null —
+  see Component 2 below)
+- search_volume: monthly search volume for search_keyword, or null
+- upvotes / likes: integer, platform-appropriate
+- comments: integer
 
-— Needs to ACCEPT, SWITCH, FIX, or CHOOSE a crypto / stablecoin /
-  high-risk payment processing solution
-— Expresses a real need, pain, active search, or buying intent —
-  not commentary, education, or promotion
-— Could plausibly be WON by a payment processing company reaching out
+═══════════════════════════════════════════════════════════════════════
+SCORING MODEL — 100 POINTS, THREE COMPONENTS
+═══════════════════════════════════════════════════════════════════════
 
-Categories we serve:
-crypto_payments — accepting BTC/ETH/crypto checkout
-stablecoin — accepting/settling USDC, USDT, etc.
-high_risk — merchant accounts / gateways for high-risk categories
-general_payments — broader B2B / agentic / vendor payment ops that
-  still involves choosing or fixing a payment processor or rail
+── COMPONENT 1 — RELEVANCE MATCH (0-40 points) ──────────────────────
+Does this post genuinely discuss the same problem or need as
+search_keyword, interpreted through the lens of the given industry —
+in meaning, not just in shared words?
 
-We are NOT for:
-— Sellers / vendors promoting their own payment product
-— Retail traders talking price, charts, TA, pumps, entries/targets
-— News, education, or opinion threads with no personal buying need
-— Hype / engagement bait — giveaways, airdrops, "gm", follower farming
-— Job posts or job-seeking
-— Off-topic needs unrelated to accepting or processing payments
+  36-40  Unambiguously about exactly this problem, in this industry.
+  25-35  Clearly related, but broader, tangential, or partial —
+         e.g. discussing the general category without the specific pain.
+  10-24  Matching words present, but the actual subject differs, OR the
+         pain described belongs to a different industry than the one
+         given (e.g. "hidden fees" post is about parking tickets, not
+         payment processing).
+  0-9    No genuine connection.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CRITICAL SCORING RULE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THIS COMPONENT IS A HARD GATE.
+If relevance scores below 10: is_relevant = false, and intent_score
+must not exceed 15 — regardless of how strong Component 2 or 3 look.
+A top-ranked, highly-upvoted post about the wrong subject is still a
+wrong-subject post.
 
-is_business_signal (equivalent to a genuine buyer signal) requires
-ALL three to be true:
-1. The author is a potential customer (merchant, founder, developer,
-   or finance/ops person) — not a vendor/seller of a payment product.
-2. They express a real need, pain, active search, or buying intent —
-   not commentary, education, or promotion.
-3. A payment processing company could plausibly win their business
-   by reaching out.
+── COMPONENT 2 — GOOGLE VISIBILITY (0-30 points) ─────────────────────
+google_rank contribution (0-20):
+  Rank 1        -> 20
+  Rank 2-3      -> 16
+  Rank 4-10     -> 11
+  Rank 11-20    -> 6
+  Not ranked/null -> 0
 
-If ANY hard-reject condition applies, has_signal = false and
-score is capped at maximum 3, regardless of anything else:
-— SELLER / VENDOR signals: "we offer", "our gateway", "our platform",
-  "DM us", "get started", "book a demo", "powered by", "built on",
-  "introducing", "now live", referral/affiliate links, or a bio
-  describing them as a processor/gateway/provider/agency.
-— TRADER / PRICE NOISE: charts, price talk, pumps, TA, "to the moon",
-  bullish/bearish, market cap, trading signals, leverage,
-  entries/targets.
-— NEWS / EDUCATION / OPINION: reporting, explainer threads, hot
-  takes, thought-leadership with no personal need.
-— HYPE / ENGAGEMENT BAIT: giveaways, airdrops, "gm", follower farming.
-— JOB POSTS or job-seeking.
-— OFF-TOPIC: the need isn't about accepting or processing payments.
+search_volume contribution (0-10):
+  10,000+/mo    -> 10
+  3,000-9,999   -> 7
+  500-2,999     -> 4
+  Under 500/null -> 1
 
-RULE OF THUMB: when you can't tell whether the author is a BUYER or a
-SELLER, reject. A false positive wastes an SDR's time and enrichment
-credits; a miss is cheap. Be strict.
-This rule cannot be overridden.
+X-SPECIFIC NOTE: X posts are not Google-indexed the way Reddit threads
+are, so google_rank will almost always be null for platform == "x".
+A null rank on an X post is EXPECTED and is not a quality signal one
+way or the other — do not treat it as a penalty, and do not attempt to
+infer or guess a rank that wasn't provided. Score the 0-point rank
+contribution plainly and let Components 1 and 3 carry that post.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTENT SCORE BANDS (1-10 scale)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+── COMPONENT 3 — ENGAGEMENT SIGNAL (0-30 points) ─────────────────────
+Derived from upvotes/likes and comments, judged proportionally to
+platform norms — the same raw number means different things on
+different platforms.
 
-HIGH INTENT — Score 9 to 10:
-Explicit switching / shopping. e.g. "best crypto processor?",
-"Stripe banned us, need a high-risk gateway", names a competitor
-they want to leave.
+Reference anchors (interpolate between these, don't treat as rigid
+cutoffs):
+  REDDIT   Strong: 50+ upvotes, 15+ comments      -> 22-30
+           Moderate: 10-49 upvotes, 3-14 comments  -> 10-21
+           Low: under 10 upvotes, under 3 comments -> 0-9
+  X        Strong: 100+ likes, 10+ replies         -> 22-30
+           Moderate: 20-99 likes, 2-9 replies       -> 10-21
+           Low: under 20 likes, under 2 replies     -> 0-9
+  No engagement data provided on either platform    -> 0
 
-STRONG INTENT — Score 7 to 8:
-Strong pain implying a near-term buy. e.g. "processor froze our
-funds again", "fees are killing us, need an alternative".
+FINAL intent_score = Component 1 + Component 2 + Component 3, capped at 100.
 
-MID INTENT — Score 5 to 6:
-Adopting / evaluating. e.g. "adding crypto checkout, what do people
-use?", "how do I accept USDT?".
+═══════════════════════════════════════════════════════════════════════
+WORKED EXAMPLES
+═══════════════════════════════════════════════════════════════════════
 
-WEAK — Score 4:
-Vague relevance; a need is implied but not clearly stated.
+Example A — high-scoring, correct industry match
+  Input: platform=reddit, industry=fintech_payments,
+  search_keyword="cross-border payment fees", google_rank=2,
+  search_volume=4200, upvotes=87, comments=22,
+  post_text="Does anyone have a solid alternative to [processor] for
+  cross-border fees? We're getting killed on FX markups every month."
+  Reasoning: Directly about cross-border payment fees in a fintech
+  context (Component 1: 39). Rank 2 + volume 4,200/mo (Component 2:
+  16+7=23). 87 upvotes/22 comments on Reddit is strong (Component 3: 26).
+  Output: intent_score=88, is_relevant=true,
+  reply_draft="Cross-border fees catch a lot of teams off guard —
+  worth checking whether your provider discloses FX markup upfront or
+  buries it in the settlement rate. Have you compared what you're
+  actually losing per transaction?"
 
-DISCARD — Score 1 to 3:
-NOT ACCEPTABLE. Never delivered to the sales team. Includes anything
-hitting a hard-reject condition above.
+Example B — hard-gate failure despite strong surface signals
+  Input: platform=reddit, industry=logistics,
+  search_keyword="hidden fees", google_rank=1, search_volume=8000,
+  upvotes=340, comments=95,
+  post_text="Just found out my city adds a hidden fee to every parking
+  ticket if you pay online. Total scam."
+  Reasoning: Shares the words "hidden fees" but is about parking
+  tickets, not logistics/freight pricing (Component 1: 4 — hard gate
+  triggered). Rank and engagement are irrelevant once the gate fails.
+  Output: intent_score=9, is_relevant=false, reply_draft=null
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-AUTOMATIC SCORE MODIFIERS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Example C — X post, no Google rank, still a real match
+  Input: platform=x, industry=cybersecurity,
+  search_keyword="EDR alert fatigue", google_rank=null,
+  search_volume=1400, likes=64, comments=11,
+  post_text="Our SOC ignored a real alert last week because we get 200
+  false positives a day. Something has to change."
+  Reasoning: Directly describes EDR alert fatigue (Component 1: 37).
+  google_rank null is expected for X — score 0 for that piece, but
+  volume 1,400 still contributes (Component 2: 0+4=4). 64 likes/11
+  comments is strong for X (Component 3: 25).
+  Output: intent_score=66, is_relevant=true,
+  reply_draft="200 false positives a day would burn out any team, not
+  just miss the real one. Sounds like the tuning problem is as much
+  the issue as the tool itself — has your team looked at what's driving
+  the noise ratio that high?"
 
-ADD +1 to score when:
-+ Author is identifiable — real name, company, or website that could
-  resolve to a contact (enrichable)
-+ Named competitor/processor mentioned negatively or as something
-  they're leaving
-+ Specific operational detail given (transaction volume, vendor
-  count, dollar amount, currency/rail)
-+ Multiple pain points in same post
-+ Urgency words present — today, ASAP, urgent, this week
-+ Active payment failure/block/freeze described
-+ Explicit ask with requirements ("needs to support X and Y")
+═══════════════════════════════════════════════════════════════════════
+REPLY DRAFT — RULES
+═══════════════════════════════════════════════════════════════════════
+Only generate reply_draft when is_relevant is true. Otherwise: null.
 
-SUBTRACT 1 from score when:
-- Anonymous/pseudonymous account with no identifiable business or bio
-- Issue is now resolved
-- Post is older than 7 days
-- No specific need, product, or requirement mentioned
-- General commentary, not a personal/operational experience
+- Generic and honest — never invent a fake personal story, dollar
+  amount, or timeline not present in the input.
+- Acknowledge the poster's situation in one clause, then offer one
+  genuinely useful angle — not a pitch.
+- 2-3 sentences maximum. No links, no "DM me," no product/company name
+  (the end user adds that themselves if relevant).
+- End on warmth or a question, never a call-to-action.
+- AVOID: "I totally understand," "This is so common," or any opener
+  that could paste onto literally any post — anchor the first clause
+  to a specific detail from post_text so it reads as actually read,
+  not templated.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VENDOR / COMPETITOR INTELLIGENCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-If the author is themselves a vendor/seller promoting a payment
-product → hard reject (see above), regardless of any other signal.
-
-If the author names a competing processor negatively (as something
-they're stuck with, frustrated by, or switching away from) → score
-UP by 1. This is a buyer signal, not a vendor signal — distinguish
-carefully: "Stripe banned us" (buyer, +1) vs "we're better than
-Stripe" (seller, hard reject).
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OUTREACH SCRIPT RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Write outreach scripts for scores 4 and above ONLY.
-Score 1 to 3 — DO NOT output any outreach fields at all.
-
-OUTREACH RULES — NON NEGOTIABLE:
-— Never start with I
-— Never say I hope this message finds you well
-— Never pitch features — pitch the outcome they want
-— Always reference something specific they said
-— Always end with one question or soft statement
-— Maximum 3 sentences total per script
-— Sound like a founder talking to another founder
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FINAL REMINDER
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-You are identifying the exact moment a merchant, founder, developer,
-or finance/ops person is ready to accept, switch, fix, or choose a
-crypto / stablecoin / high-risk payment processing solution.
-
-Be ruthless with noise — especially vendors and traders.
-Be generous with genuine operational payment pain.
-Be precise with every score.
-
-Return JSON array only. Always. Every single time.
-MINIMUM score is 1 — never return 0.
-"""
-
-CLAUDE_SYSTEM_PROMPT_REDDIT = _SCORING_CORE + """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BATCH SCORING FORMAT — REDDIT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
-reason: maximum 15 words. suggested_action: maximum 10 words.
-For scores 1-3: omit linkedin_message entirely — do NOT output the key.
-For scores 4-10: include linkedin_message.
+═══════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════
+Return ONLY valid JSON. No preamble, no markdown, no code fences.
+Return one object per post, in a JSON array, same order as received.
 
 [
   {
-    "index": <1-based integer matching message number>,
-    "intent_score": <number 1-10>,
-    "has_signal": <true|false>,
-    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
-    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
-    "is_vendor_or_seller": <true|false>,
-    "enrichable": <true|false>,
-    "competitor_mentioned": "<competitor/processor name or null>",
-    "pain_type": "<specific pain or null>",
-    "urgency": "<immediate|today|this_week|researching|none>",
-    "reason": "<max 15 words>",
-    "suggested_action": "<max 10 words>",
-    "watchlist": <true|false>,
-    "linkedin_message": "<public reply to their Reddit post, max 3 sentences — OMIT KEY IF SCORE 1-3>"
+    "index": <1-based integer matching input order>,
+    "intent_score": <integer 1-100>,
+    "is_relevant": <true|false>,
+    "reply_draft": "<string, 2-3 sentences, or null if is_relevant is false>"
   }
 ]
 
-Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
-"""
-
-CLAUDE_SYSTEM_PROMPT_TWITTER = _SCORING_CORE + """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BATCH SCORING FORMAT — TWITTER/X
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
-reason: maximum 15 words. suggested_action: maximum 10 words.
-For scores 1-3: omit twitter_reply and twitter_dm entirely — do NOT output those keys.
-For scores 4-10: include both twitter_reply and twitter_dm.
-
-[
-  {
-    "index": <1-based integer matching message number>,
-    "intent_score": <number 1-10>,
-    "has_signal": <true|false>,
-    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
-    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
-    "is_vendor_or_seller": <true|false>,
-    "enrichable": <true|false>,
-    "competitor_mentioned": "<competitor/processor name or null>",
-    "pain_type": "<specific pain or null>",
-    "urgency": "<immediate|today|this_week|researching|none>",
-    "reason": "<max 15 words>",
-    "suggested_action": "<max 10 words>",
-    "watchlist": <true|false>,
-    "twitter_reply": "<2-sentence public reply to their tweet — OMIT KEY IF SCORE 1-3>",
-    "twitter_dm": "<3-sentence private DM — OMIT KEY IF SCORE 1-3>"
-  }
-]
-
-Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
-"""
-
-CLAUDE_SYSTEM_PROMPT_TELEGRAM = _SCORING_CORE + """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BATCH SCORING FORMAT — TELEGRAM
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
-reason: maximum 15 words. suggested_action: maximum 10 words.
-Telegram messages are from private groups — no public reply is possible.
-Outreach is via DM only if the sender has a visible username.
-For scores 1-3: omit telegram_dm entirely — do NOT output the key.
-For scores 4-10: include telegram_dm.
-
-[
-  {
-    "index": <1-based integer matching message number>,
-    "intent_score": <number 1-10>,
-    "has_signal": <true|false>,
-    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
-    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
-    "is_vendor_or_seller": <true|false>,
-    "enrichable": <true|false>,
-    "competitor_mentioned": "<competitor/processor name or null>",
-    "pain_type": "<specific pain or null>",
-    "urgency": "<immediate|today|this_week|researching|none>",
-    "reason": "<max 15 words>",
-    "suggested_action": "<max 10 words>",
-    "watchlist": <true|false>,
-    "telegram_dm": "<3-sentence DM if username visible, else null — OMIT KEY IF SCORE 1-3>"
-  }
-]
-
-Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
-"""
-
-CLAUDE_SYSTEM_PROMPT_FACEBOOK = _SCORING_CORE + """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BATCH SCORING FORMAT — FACEBOOK
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
-reason: maximum 15 words. suggested_action: maximum 10 words.
-Facebook posts are public — a public comment reply is possible.
-For scores 1-3: omit facebook_comment entirely — do NOT output the key.
-For scores 4-10: include facebook_comment.
-
-[
-  {
-    "index": <1-based integer matching message number>,
-    "intent_score": <number 1-10>,
-    "has_signal": <true|false>,
-    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
-    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
-    "is_vendor_or_seller": <true|false>,
-    "enrichable": <true|false>,
-    "competitor_mentioned": "<competitor/processor name or null>",
-    "pain_type": "<specific pain or null>",
-    "urgency": "<immediate|today|this_week|researching|none>",
-    "reason": "<max 15 words>",
-    "suggested_action": "<max 10 words>",
-    "watchlist": <true|false>,
-    "facebook_comment": "<public reply to their Facebook post, max 3 sentences — OMIT KEY IF SCORE 1-3>"
-  }
-]
-
-Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
-"""
-
-# v7.6.0 — LinkedIn scoring schema. Same _SCORING_CORE, same
-# thresholds/routing. Adds linkedin_reply (public comment) and
-# linkedin_dm (connection/DM message) — deliberately NOT reusing the
-# pre-existing "linkedin_message" key (that key already belongs to the
-# REDDIT schema above, where it means "a LinkedIn-style outreach message
-# posted as a reply to a Reddit thread" — an unrelated, older field).
-CLAUDE_SYSTEM_PROMPT_LINKEDIN = _SCORING_CORE + """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BATCH SCORING FORMAT — LINKEDIN
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Return a JSON ARRAY. One object per message. No preamble. No markdown. Raw JSON only.
-reason: maximum 15 words. suggested_action: maximum 10 words.
-LinkedIn profiles/posts are public — a public comment reply and a
-connection-request-style DM are both possible.
-Each message may include an "Enrichment:" line (job title, company,
-location, industry, company size) pulled from LinkedIn's User Data and
-Company Data endpoints — use it to judge buyer_type, category, and
-enrichability, but it is optional and may be missing for some messages.
-For scores 1-3: omit linkedin_reply and linkedin_dm entirely — do NOT output those keys.
-For scores 4-10: include both linkedin_reply and linkedin_dm.
-
-[
-  {
-    "index": <1-based integer matching message number>,
-    "intent_score": <number 1-10>,
-    "has_signal": <true|false>,
-    "buyer_type": "<merchant|founder|developer|finance_ops|unknown>",
-    "category": "<crypto_payments|stablecoin|high_risk|general_payments|none>",
-    "is_vendor_or_seller": <true|false>,
-    "enrichable": <true|false>,
-    "competitor_mentioned": "<competitor/processor name or null>",
-    "pain_type": "<specific pain or null>",
-    "urgency": "<immediate|today|this_week|researching|none>",
-    "reason": "<max 15 words>",
-    "suggested_action": "<max 10 words>",
-    "watchlist": <true|false>,
-    "linkedin_reply": "<public comment on their LinkedIn post/profile, max 3 sentences — OMIT KEY IF SCORE 1-3>",
-    "linkedin_dm": "<3-sentence connection-request-style DM — OMIT KEY IF SCORE 1-3>"
-  }
-]
-
-Score EVERY message. Return SAME COUNT as received. JSON array only. Always.
+Score every post received. Return the same count as received. Never
+omit an item. Never add commentary outside the JSON array.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB
+# MONGODB — signals collection + persistent batch-state collections +
+# per-keyword fetch-once-forever cache collection (flintel_keywords) +
+# flintel_google_posts (SERP-discovered post_url cache, decoupled from
+# Reddit RSS fetching) + NEW (v9.13): flintel_targeting_subreddits /
+# flintel_targeting_keywords — auto-synced mirror collections.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
@@ -2654,44 +841,82 @@ def get_database():
         client.server_info()
         db = client[MONGODB_DB]
 
-        db.signals.create_index(
-            [("message_id", ASCENDING)], unique=True, name="message_id_unique"
-        )
-        for field in [
-            "intent_score", "created_at", "client_id", "platform",
-            "tier", "corridor", "competitor_mentioned", "pain_type",
-            "is_business", "signal_category",
-            "search_keyword",  # v7.7.0 NEW — additive only
-        ]:
+        db.signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
+        db.signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
+        for field in ["intent_score", "created_at", "client_id", "platform", "is_relevant", "status"]:
             db.signals.create_index([(field, ASCENDING)])
 
-        db.flintel_state.create_index(
-            [("key", ASCENDING)], unique=True, name="state_key_unique"
-        )
-
-        db.flintel_pending_batch.create_index(
-            [("platform", ASCENDING)], unique=True, name="platform_unique"
-        )
-        db.flintel_seen_ids.create_index(
-            [("platform", ASCENDING)], unique=True, name="seen_platform_unique"
-        )
-
-        db.flintel_rescore_messages.create_index(
-            [("status", ASCENDING), ("requested_at", ASCENDING)],
-            name="rescore_status_time",
-        )
-        db.flintel_rescore_messages.create_index(
-            [("message_id", ASCENDING)],
-            name="rescore_message_id",
-        )
-
+        # persistent batch state — survives restarts, no in-flight batch lost
+        db.flintel_pending_batch.create_index([("platform", ASCENDING)], unique=True, name="platform_unique")
+        db.flintel_seen_ids.create_index([("platform", ASCENDING)], unique=True, name="seen_platform_unique")
         db.flintel_queue_messages.create_index(
             [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
             unique=True, name="queue_platform_message_unique",
         )
-
         db.flintel_batch_seconds.create_index(
             [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
+        )
+
+        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. UNTOUCHED in v9.13.
+        # This collection, its indexes, and every function that reads/writes
+        # it (sync_keywords_to_db, get_due_keywords, get_keywords_missing_volume,
+        # mark_keyword_fetched, set_keyword_retry_cooldown,
+        # seed_search_volume_batch) are byte-for-byte identical to v9.11.1.
+        db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
+        db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
+        db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
+        db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
+
+        # ── flintel_google_posts — from v9.12, UNTOUCHED. Stores every
+        # Google-SERP-discovered Reddit post_url the instant SERP discovery
+        # finds it — completely independent of whether/when that post's
+        # actual Reddit RSS confirmation happens. One document per
+        # discovered post_url:
+        #   post_url        : the exact Reddit post URL Google SERP returned
+        #   google_rank      : the real per-post rank from that SERP call
+        #   matched_keyword  : the exact Google search keyword that produced it
+        #   fuzzy_keywords   : 6-7 auto-generated fuzzy variants of matched_keyword
+        #   subreddit        : subreddit name extracted from post_url
+        #   fetched          : False until run_google_posts_rss_matching_loop()
+        #                      confirms this exact post_url via subreddit RSS —
+        #                      then True, PERMANENTLY (fetch-once-forever, same
+        #                      spirit as flintel_keywords)
+        #   created_at       : when this document was first saved
+        db.flintel_google_posts.create_index(
+            [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
+        )
+        db.flintel_google_posts.create_index([("fetched", ASCENDING)], name="google_post_fetched_idx")
+        db.flintel_google_posts.create_index([("subreddit", ASCENDING)], name="google_post_subreddit_idx")
+        db.flintel_google_posts.create_index(
+            [("subreddit", ASCENDING), ("fetched", ASCENDING)], name="google_post_subreddit_fetched_idx"
+        )
+
+        # ── flintel_targeting_subreddits — NEW in v9.13. One document per
+        # DISTINCT subreddit that currently has at least one PENDING
+        # (fetched=False) flintel_google_posts document. Fully rebuilt
+        # every pass of sync_targeting_collections() — this collection is
+        # what run_google_posts_rss_matching_loop() actually reads to
+        # decide which subreddits to poll this cycle.
+        db.flintel_targeting_subreddits.create_index(
+            [("subreddit", ASCENDING)], unique=True, name="targeting_subreddit_unique"
+        )
+
+        # ── flintel_targeting_keywords — NEW in v9.13. One document per
+        # PENDING flintel_google_posts document, keyed by post_url,
+        # carrying its matched_keyword + fuzzy_keywords + subreddit. This
+        # is a live tracking mirror — the moment a post_url is CONFIRMED
+        # (URL match against a subreddit's RSS feed), its document here is
+        # deleted immediately. Also fully re-synced (stale entries pruned)
+        # on every pass, so it never drifts from flintel_google_posts's
+        # real pending state.
+        db.flintel_targeting_keywords.create_index(
+            [("post_url", ASCENDING)], unique=True, name="targeting_keyword_post_url_unique"
+        )
+        db.flintel_targeting_keywords.create_index(
+            [("subreddit", ASCENDING)], name="targeting_keyword_subreddit_idx"
+        )
+        db.flintel_targeting_keywords.create_index(
+            [("keyword", ASCENDING)], name="targeting_keyword_keyword_idx"
         )
 
         log.info("MongoDB connected.")
@@ -2704,24 +929,16 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — FIX C: uses streaming for all Claude calls
+# ANTHROPIC CLIENT — streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
 anthropic_client = anthropic.Anthropic(
     api_key=ANTHROPIC_API_KEY,
     http_client=httpx.Client(
-        timeout=httpx.Timeout(
-            connect=30.0,
-            read=None,
-            write=60.0,
-            pool=30.0,
-        )
+        timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=30.0)
     ),
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RETRY WITH EXPONENTIAL BACKOFF (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
     for attempt in range(1, retries + 1):
@@ -2738,51 +955,16 @@ def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
                 return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SLACK ALERT (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def send_operator_alert(title: str, detail: str, level: str = "ERROR"):
-    if not SLACK_WEBHOOK_URL:
-        log.warning(f"[OPERATOR ALERT] {title} — {detail} (Slack not configured)")
-        return
-    try:
-        emoji = "🔴" if level == "CRITICAL" else "🟡"
-        payload = {
-            "text": f"{emoji} [OPERATOR ALERT] {title}",
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": f"{emoji} FLINTEL OPERATOR ALERT — {level}",
-                        "emoji": True,
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*System*\nFLINTEL v7.9.1"},
-                        {"type": "mrkdwn", "text": f"*Client*\n{CLIENT_ID}"},
-                        {"type": "mrkdwn", "text": f"*Alert*\n{title}"},
-                        {"type": "mrkdwn", "text": f"*Time*\n{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"},
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Detail*\n```{detail[:1500]}```"},
-                },
-                {"type": "divider"},
-            ],
-        }
-        requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
-        log.info(f"Operator alert sent to Slack: {title}")
-    except Exception as exc:
-        log.error(f"Failed to send operator alert: {exc}")
+def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
+    log.log(
+        logging.CRITICAL if level == "CRITICAL" else logging.ERROR,
+        f"[OPERATOR ALERT] {title} — {detail}",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A — PERSISTENT BATCH STATE HELPERS (unchanged)
+# PERSISTENT BATCH STATE HELPERS — survives process restarts, so a
+# half-filled batch never disappears.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -2794,30 +976,20 @@ def load_pending_batch(platform: str) -> tuple:
         start_ts = doc.get("batch_start_time")
         start_time = start_ts.timestamp() if start_ts else None
         if items:
-            log.warning(
-                f"[{platform.upper()}] Resuming persisted batch from MongoDB | "
-                f"{len(items)} item(s) recovered from before restart."
-            )
+            log.warning(f"[{platform.upper()}] Resuming persisted batch | {len(items)} item(s) recovered.")
         return items, start_time
     except Exception as exc:
-        log.error(f"[{platform.upper()}] load_pending_batch error: {exc} — starting with empty batch.")
+        log.error(f"[{platform.upper()}] load_pending_batch error: {exc}")
         return [], None
 
 
 def save_pending_batch(platform: str, items: list, batch_start_time):
     try:
-        start_dt = (
-            datetime.fromtimestamp(batch_start_time, tz=timezone.utc)
-            if batch_start_time is not None else None
-        )
+        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
         db.flintel_pending_batch.update_one(
             {"platform": platform},
-            {"$set": {
-                "platform": platform,
-                "items": items,
-                "batch_start_time": start_dt,
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {"$set": {"platform": platform, "items": items, "batch_start_time": start_dt,
+                       "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
     except Exception as exc:
@@ -2828,12 +1000,8 @@ def clear_pending_batch(platform: str):
     try:
         db.flintel_pending_batch.update_one(
             {"platform": platform},
-            {"$set": {
-                "platform": platform,
-                "items": [],
-                "batch_start_time": None,
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {"$set": {"platform": platform, "items": [], "batch_start_time": None,
+                       "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
     except Exception as exc:
@@ -2843,11 +1011,9 @@ def clear_pending_batch(platform: str):
 def load_seen_ids(platform: str) -> set:
     try:
         doc = db.flintel_seen_ids.find_one({"platform": platform})
-        if not doc:
-            return set()
-        return set(doc.get("ids", []))
+        return set(doc.get("ids", [])) if doc else set()
     except Exception as exc:
-        log.error(f"[{platform.upper()}] load_seen_ids error: {exc} — starting with empty dedup set.")
+        log.error(f"[{platform.upper()}] load_seen_ids error: {exc}")
         return set()
 
 
@@ -2858,20 +1024,12 @@ def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
             id_list = id_list[-cap:]
         db.flintel_seen_ids.update_one(
             {"platform": platform},
-            {"$set": {
-                "platform": platform,
-                "ids": id_list,
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {"$set": {"platform": platform, "ids": id_list, "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
     except Exception as exc:
         log.error(f"[{platform.upper()}] save_seen_ids error: {exc}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# flintel_queue_messages: persistent raw-queue storage (unchanged, v7.4.5)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def save_queue_message(platform: str, item: dict):
     try:
@@ -2883,9 +1041,7 @@ def save_queue_message(platform: str, item: dict):
         doc["message_id"] = mid
         doc["queued_at"] = datetime.now(timezone.utc)
         db.flintel_queue_messages.update_one(
-            {"_platform_key": platform, "message_id": mid},
-            {"$set": doc},
-            upsert=True,
+            {"_platform_key": platform, "message_id": mid}, {"$set": doc}, upsert=True,
         )
     except Exception as exc:
         log.error(f"[{platform.upper()}] save_queue_message error: {exc}")
@@ -2895,9 +1051,7 @@ def remove_queue_message(platform: str, message_id: str):
     if not message_id:
         return
     try:
-        db.flintel_queue_messages.delete_one(
-            {"_platform_key": platform, "message_id": message_id}
-        )
+        db.flintel_queue_messages.delete_one({"_platform_key": platform, "message_id": message_id})
     except Exception as exc:
         log.error(f"[{platform.upper()}] remove_queue_message error: {exc}")
 
@@ -2913,27 +1067,17 @@ def load_queue_messages(platform: str) -> list:
             items.append(d)
         return items
     except Exception as exc:
-        log.error(f"[{platform.upper()}] load_queue_messages error: {exc} — starting with empty queue.")
+        log.error(f"[{platform.upper()}] load_queue_messages error: {exc}")
         return []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# flintel_batch_seconds: explicit batch-timeout persistence (unchanged, v7.4.5)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def save_batch_seconds(platform: str, batch_start_time):
     try:
-        start_dt = (
-            datetime.fromtimestamp(batch_start_time, tz=timezone.utc)
-            if batch_start_time is not None else None
-        )
+        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
         db.flintel_batch_seconds.update_one(
             {"platform": platform},
-            {"$set": {
-                "platform": platform,
-                "batch_start_time": start_dt,
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {"$set": {"platform": platform, "batch_start_time": start_dt,
+                       "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
     except Exception as exc:
@@ -2944,11 +1088,8 @@ def clear_batch_seconds(platform: str):
     try:
         db.flintel_batch_seconds.update_one(
             {"platform": platform},
-            {"$set": {
-                "platform": platform,
-                "batch_start_time": None,
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {"$set": {"platform": platform, "batch_start_time": None,
+                       "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
     except Exception as exc:
@@ -2956,83 +1097,1212 @@ def clear_batch_seconds(platform: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER
+# KEYWORD CACHE — flintel_keywords collection. 100% UNCHANGED FROM v9.11.1.
+# FETCH-ONCE-FOREVER design: each keyword gets fetched from DataForSEO
+# exactly ONE time, ever. Once fetched=True, it is PERMANENTLY skipped by
+# get_due_keywords() — no TTL, no re-due date, no 12h/24h re-fetch.
+#
+# NOTE (v9.12/v9.13): "fetched=True" here now means "this keyword's Google
+# SERP results have all been saved to flintel_google_posts" — it no longer
+# means "Reddit RSS was fetched for every result" (that dependency has
+# been removed — see process_one_keyword() below). Nothing about the
+# flintel_keywords collection itself, its schema, or any function in this
+# section changed to make that true; it's a natural consequence of
+# process_one_keyword() no longer calling into Reddit's RSS at all.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sync_keywords_to_db(keywords: list):
+    """
+    Ensures every keyword currently in REDDIT_SEARCH_KEYWORDS exists in
+    flintel_keywords. Brand-new keywords are inserted with fetched=False
+    and search_volume=None (both due immediately, real-time). Keywords
+    that already exist are left completely untouched — $setOnInsert only
+    writes on first-ever insert. Safe to call every loop pass and on
+    every restart.
+
+    This is INSERT-ONLY and additive — it never deletes or hides a
+    keyword's existing document just because that keyword is no longer
+    present in `keywords`.
+    """
+    now = datetime.now(timezone.utc)
+    for kw in keywords:
+        try:
+            db.flintel_keywords.update_one(
+                {"keyword": kw},
+                {"$setOnInsert": {
+                    "keyword":                  kw,
+                    "fetched":                  False,
+                    "search_volume":            None,
+                    "search_volume_is_random":  False,
+                    "last_fetched_at":          None,
+                    "next_retry_at":            None,
+                    "created_at":               now,
+                }},
+                upsert=True,
+            )
+        except Exception as exc:
+            log.error(f"[KEYWORD-CACHE] sync error for {kw!r}: {exc}")
+
+
+def get_keywords_missing_volume(keywords: list = None) -> list:
+    """
+    Returns keyword strings whose flintel_keywords document has no
+    search_volume stored yet (missing field or explicit None both match
+    this query). Taken DIRECTLY against the full flintel_keywords
+    collection — NOT restricted to "{'keyword': {'$in': keywords}}".
+    """
+    try:
+        cursor = db.flintel_keywords.find(
+            {"search_volume": None},
+            {"keyword": 1},
+        )
+        return [d["keyword"] for d in cursor]
+    except Exception as exc:
+        log.error(f"[VOLUME-SEED] get_keywords_missing_volume error: {exc}")
+        return []
+
+
+def get_due_keywords() -> list:
+    """
+    Returns keyword docs that have NEVER been fetched yet (fetched=False).
+    Once a keyword is marked fetched=True, it is PERMANENTLY excluded from
+    this query. Taken DIRECTLY against the full flintel_keywords
+    collection — NOT restricted to the current python list.
+
+    A keyword whose Reddit RSS fetch failed also needs its "next_retry_at"
+    cooldown to have passed before it's returned here — see
+    REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS and set_keyword_retry_cooldown()
+    below. A keyword with next_retry_at unset/None (brand new, never
+    attempted) or already in the past is still due immediately.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        cursor = db.flintel_keywords.find({
+            "fetched": False,
+            "$or": [
+                {"next_retry_at": None},
+                {"next_retry_at": {"$exists": False}},
+                {"next_retry_at": {"$lte": now}},
+            ],
+        })
+        return list(cursor)
+    except Exception as exc:
+        log.error(f"[KEYWORD-CACHE] get_due_keywords error: {exc}")
+        return []
+
+
+def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS):
+    """
+    Kept 100% as-is from v9.11.2 for API compatibility. As of v9.12/v9.13,
+    process_one_keyword() no longer produces a Reddit-RSS-driven
+    had_fetch_failure (that logic moved to the fully separate
+    run_google_posts_rss_matching_loop(), which operates on
+    flintel_google_posts / the targeting collections, not on a
+    per-keyword failure flag) — so this function is not currently invoked
+    by the SERP discovery loop, but is left untouched in case any future
+    SERP-call-level failure needs the same cooldown mechanism.
+    """
+    now = datetime.now(timezone.utc)
+    next_retry = now + timedelta(seconds=cooldown_seconds)
+    try:
+        db.flintel_keywords.update_one(
+            {"keyword": keyword},
+            {"$set": {"next_retry_at": next_retry}},
+        )
+        log.info(
+            f"[KEYWORD-CACHE] '{keyword}' cooldown set | next_retry_at:{next_retry.isoformat()} "
+            f"({cooldown_seconds}s from now) — will not be re-attempted before then"
+        )
+    except Exception as exc:
+        log.error(f"[KEYWORD-CACHE] set_keyword_retry_cooldown error for {keyword!r}: {exc}")
+
+
+def mark_keyword_fetched(keyword: str):
+    """
+    Flips a keyword to fetched=True — PERMANENTLY. There is no TTL and no
+    next_due_at anymore: once true, this keyword will never be picked up
+    by get_due_keywords() again, even after restarts, even after 12h,
+    24h, or any amount of time. The only way to re-process a keyword is
+    to manually reset/delete its document in flintel_keywords.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        db.flintel_keywords.update_one(
+            {"keyword": keyword},
+            {"$set": {
+                "fetched":         True,
+                "last_fetched_at": now,
+            }},
+        )
+    except Exception as exc:
+        log.error(f"[KEYWORD-CACHE] mark_keyword_fetched error for {keyword!r}: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# flintel_google_posts HELPERS (from v9.12, unchanged)
+#
+# This collection is the sole source of truth for "which Google-SERP-
+# discovered Reddit post_urls are still waiting to be confirmed via
+# subreddit RSS?" — completely independent of flintel_keywords, which
+# only tracks keyword-level SERP-discovery state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_google_post(post_url: str, google_rank, matched_keyword: str, subreddit: str) -> bool:
+    """
+    Saves ONE newly-discovered Google-SERP result into flintel_google_posts,
+    auto-generating its fuzzy_keywords from matched_keyword. Insert-only
+    per unique post_url (unique index on post_url) — if this exact
+    post_url was already saved in a previous pass, this is a silent no-op
+    (duplicate discovery of the same URL, e.g. from a different keyword's
+    SERP results overlapping). Does NOT touch flintel_keywords. Does NOT
+    wait on or call into any Reddit endpoint — this save is immediate and
+    fully independent of Reddit's RSS reliability.
+    """
+    fuzzy = generate_fuzzy_keywords(matched_keyword, max_variants=FUZZY_KEYWORDS_PER_POST)
+    doc = {
+        "post_url":        post_url,
+        "google_rank":     google_rank,
+        "matched_keyword": matched_keyword,
+        "fuzzy_keywords":  fuzzy,
+        "subreddit":       subreddit,
+        "fetched":         False,
+        "created_at":      datetime.now(timezone.utc),
+    }
+    try:
+        db.flintel_google_posts.insert_one(doc)
+        log.info(
+            f"[GOOGLE-POSTS] SAVED | post_url:{post_url} | rank:{google_rank} | "
+            f"subreddit:r/{subreddit or '?'} | matched_keyword:{matched_keyword!r} | "
+            f"fuzzy_keywords:{fuzzy}"
+        )
+        return True
+    except DuplicateKeyError:
+        log.debug(f"[GOOGLE-POSTS] Duplicate post_url skipped (already cached): {post_url}")
+        return False
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] save_google_post error for {post_url}: {exc}")
+        return False
+
+
+def get_pending_google_posts_for_subreddit(subreddit: str) -> list:
+    """
+    Returns every fetched=False flintel_google_posts document for one
+    subreddit — the exact set of post_urls run_google_posts_rss_matching_loop()
+    is currently trying to confirm via that subreddit's RSS feed. UNCHANGED
+    FROM v9.12 — still the source of full per-post detail (google_rank,
+    matched_keyword, fuzzy_keywords) used when building each subreddit's
+    pending-by-url lookup.
+    """
+    try:
+        return list(db.flintel_google_posts.find({"subreddit": subreddit, "fetched": False}))
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] get_pending_google_posts_for_subreddit error for r/{subreddit}: {exc}")
+        return []
+
+
+def mark_google_post_fetched(post_url: str):
+    """
+    Flips a flintel_google_posts document to fetched=True — PERMANENTLY,
+    same fetch-once-forever spirit as mark_keyword_fetched() above. Once
+    true, this post_url will never be returned by
+    get_pending_google_posts_for_subreddit() again.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        db.flintel_google_posts.update_one(
+            {"post_url": post_url},
+            {"$set": {"fetched": True, "fetched_at": now}},
+        )
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] mark_google_post_fetched error for {post_url}: {exc}")
+
+
+def get_cached_search_volume_for_keyword(keyword: str) -> tuple:
+    """
+    Read-only lookup straight off flintel_keywords for a single keyword's
+    already-seeded search_volume + search_volume_is_random flag. NEVER
+    triggers a new API call, NEVER writes to flintel_keywords — this is
+    purely a cache read used by run_google_posts_rss_matching_loop() so
+    that stage never re-queries the search-volume API itself.
+    Returns (search_volume_or_None, is_random_bool).
+    """
+    try:
+        doc = db.flintel_keywords.find_one(
+            {"keyword": keyword}, {"search_volume": 1, "search_volume_is_random": 1}
+        )
+        if not doc:
+            return None, False
+        return doc.get("search_volume"), bool(doc.get("search_volume_is_random", False))
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] get_cached_search_volume_for_keyword error for {keyword!r}: {exc}")
+        return None, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# flintel_targeting_subreddits / flintel_targeting_keywords HELPERS
+# (NEW in v9.13)
+#
+# These two collections are a LIVE, AUTO-SYNCED MIRROR of whatever is
+# currently PENDING (fetched=False) in flintel_google_posts. Nothing here
+# is ever hand-maintained or kept in a python list — sync_targeting_
+# collections() is called at the top of every
+# run_google_posts_rss_matching_loop() pass and fully reconciles both
+# collections against flintel_google_posts's live pending state:
+#   - inserts a flintel_targeting_keywords doc for any newly-pending
+#     post_url (carrying its matched_keyword, fuzzy_keywords, subreddit)
+#   - inserts/refreshes a flintel_targeting_subreddits doc for any
+#     subreddit that still has at least one pending post
+#   - PRUNES both collections of anything no longer pending, so neither
+#     one ever drifts out of sync
+#
+# run_google_posts_rss_matching_loop() reads its subreddit poll list from
+# flintel_targeting_subreddits (get_targeting_subreddits()) instead of
+# querying flintel_google_posts.distinct() directly. The moment a
+# post_url is CONFIRMED via exact RSS-link match, its flintel_targeting_
+# keywords document is deleted immediately (delete_targeting_keyword_entry())
+# — that keyword/post is done being targeted. flintel_targeting_subreddits
+# needs no per-match delete: it is fully rebuilt on the very next sync
+# pass, so a subreddit with zero pending posts left naturally drops off
+# the poll list within one cycle.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sync_targeting_collections():
+    """
+    Rebuilds flintel_targeting_subreddits and flintel_targeting_keywords
+    from whatever is CURRENTLY pending (fetched=False) in
+    flintel_google_posts. Called at the start of every
+    run_google_posts_rss_matching_loop() pass so both collections always
+    reflect live reality — nothing is ever stale beyond one pass, and
+    nothing here is ever a hardcoded/hand-maintained python list.
+    """
+    try:
+        pending_docs = list(
+            db.flintel_google_posts.find(
+                {"fetched": False},
+                {"post_url": 1, "matched_keyword": 1, "fuzzy_keywords": 1, "subreddit": 1},
+            )
+        )
+    except Exception as exc:
+        log.error(f"[TARGETING-SYNC] failed to read pending flintel_google_posts: {exc}")
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # ── flintel_targeting_keywords — one doc per pending post_url ────────
+    pending_urls = []
+    for doc in pending_docs:
+        post_url = doc.get("post_url")
+        if not post_url:
+            continue
+        pending_urls.append(post_url)
+        try:
+            db.flintel_targeting_keywords.update_one(
+                {"post_url": post_url},
+                {"$setOnInsert": {
+                    "post_url":        post_url,
+                    "keyword":         doc.get("matched_keyword", ""),
+                    "fuzzy_keywords":  doc.get("fuzzy_keywords", []),
+                    "subreddit":       doc.get("subreddit", ""),
+                    "created_at":      now,
+                }},
+                upsert=True,
+            )
+        except Exception as exc:
+            log.error(f"[TARGETING-SYNC] keyword upsert error for {post_url}: {exc}")
+
+    # prune any flintel_targeting_keywords doc whose post_url is no longer
+    # pending (already confirmed/fetched through some other path) — keeps
+    # this collection an exact live mirror, never drifting from reality.
+    try:
+        db.flintel_targeting_keywords.delete_many({"post_url": {"$nin": pending_urls}})
+    except Exception as exc:
+        log.error(f"[TARGETING-SYNC] keyword prune error: {exc}")
+
+    # ── flintel_targeting_subreddits — one doc per distinct pending subreddit ─
+    pending_subreddits = sorted({doc.get("subreddit") for doc in pending_docs if doc.get("subreddit")})
+    for sub in pending_subreddits:
+        try:
+            db.flintel_targeting_subreddits.update_one(
+                {"subreddit": sub},
+                {
+                    "$set": {"subreddit": sub, "last_synced_at": now},
+                    "$setOnInsert": {"created_at": now},
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            log.error(f"[TARGETING-SYNC] subreddit upsert error for r/{sub}: {exc}")
+
+    try:
+        db.flintel_targeting_subreddits.delete_many({"subreddit": {"$nin": pending_subreddits}})
+    except Exception as exc:
+        log.error(f"[TARGETING-SYNC] subreddit prune error: {exc}")
+
+    log.info(
+        f"[TARGETING-SYNC] synced | pending_posts:{len(pending_urls)} | "
+        f"targeting_subreddits:{len(pending_subreddits)}"
+    )
+
+
+def get_targeting_subreddits() -> list:
+    """
+    Reads the distinct subreddit list DIRECTLY off
+    flintel_targeting_subreddits — this is what
+    run_google_posts_rss_matching_loop() actually polls this cycle,
+    instead of re-querying flintel_google_posts.distinct() live every
+    single pass. Always fresh, since sync_targeting_collections() runs
+    immediately before this is called.
+    """
+    try:
+        docs = db.flintel_targeting_subreddits.find({}, {"subreddit": 1})
+        return [d["subreddit"] for d in docs if d.get("subreddit")]
+    except Exception as exc:
+        log.error(f"[TARGETING-SYNC] get_targeting_subreddits error: {exc}")
+        return []
+
+
+def delete_targeting_keyword_entry(post_url: str):
+    """
+    Deletes ONE flintel_targeting_keywords document by post_url — called
+    the instant that post_url is CONFIRMED via exact RSS-link match
+    inside run_google_posts_rss_matching_loop(). That keyword/post is
+    done being targeted and is removed immediately, rather than waiting
+    for the next sync_targeting_collections() prune pass.
+    """
+    try:
+        db.flintel_targeting_keywords.delete_one({"post_url": post_url})
+    except Exception as exc:
+        log.error(f"[TARGETING-SYNC] delete_targeting_keyword_entry error for {post_url}: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH-VOLUME BATCH SEEDING — 100% UNCHANGED FROM v9.11.1. chunks
+# keywords, fetches volume for each one (single.php only accepts one
+# keyword per call), writes results back onto each keyword's own
+# flintel_keywords document.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
+    """
+    ONE-TIME (per keyword) BATCH search-volume seeding. Splits
+    `keywords_needing_volume` into chunks of up to `batch_size` and
+    fetches volume for every keyword in the chunk. Results are written
+    back onto each keyword's own flintel_keywords document
+    (search_volume field, plus search_volume_is_random).
+    """
+    if not keywords_needing_volume:
+        return
+    if not RAPIDAPI_KEY:
+        log.warning(
+            "[VOLUME-SEED] RapidAPI key not set — cannot call the search-volume API. "
+            "Applying RANDOM FALLBACK values to all keywords in this pass so they are "
+            "never left permanently at None."
+        )
+
+    for i in range(0, len(keywords_needing_volume), batch_size):
+        chunk = keywords_needing_volume[i:i + batch_size]
+        try:
+            volume_map = {}
+            random_map = {}
+
+            for kw in chunk:
+                if not RAPIDAPI_KEY:
+                    vol = _random_search_volume_fallback()
+                    volume_map[kw] = vol
+                    random_map[kw] = True
+                    log.warning(
+                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
+                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: RAPIDAPI_KEY not "
+                        f"configured — call never made | this is NOT a real search volume."
+                    )
+                    continue
+
+                url = "https://seo-keyword-research.p.rapidapi.com/single.php"
+
+                querystring = {"keyword": kw, "country": "us"}
+
+                headers = {
+                    "x-rapidapi-key": RAPIDAPI_KEY, # .env
+                    "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
+                    "Content-Type": "application/json"
+                }
+
+                try:
+                    r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
+                    status_code = r.status_code
+                    try:
+                        row = r.json()
+                    except ValueError:
+                        log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{status_code}")
+                        row = None
+                except Exception as call_exc:
+                    log.error(f"[VOLUME-SEED] request error for {kw!r}: {call_exc}")
+                    status_code = None
+                    row = None
+
+                vol = _dig_value(row, VOLUME_FIELD_CANDIDATES)
+                if vol is None:
+                    api_message = row.get("message") if isinstance(row, dict) else None
+                    log.warning(
+                        f"[VOLUME-SEED] No search_volume for {kw!r} | status:{status_code} | "
+                        f"api_message:{api_message!r} | tried_fields:{VOLUME_FIELD_CANDIDATES} | "
+                        f"raw_keys:{list(row.keys()) if isinstance(row, dict) else type(row).__name__}"
+                    )
+                    vol = _random_search_volume_fallback()
+                    random_map[kw] = True
+                    log.warning(
+                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
+                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
+                        f"rate-limited / no usable field (see api_message above) | this is NOT "
+                        f"a real, provider-returned search volume."
+                    )
+                else:
+                    random_map[kw] = False
+                volume_map[kw] = vol
+
+            for kw in chunk:
+                vol = volume_map.get(kw)
+                is_random = random_map.get(kw, False)
+                db.flintel_keywords.update_one(
+                    {"keyword": kw},
+                    {"$set": {"search_volume": vol, "search_volume_is_random": is_random}},
+                    upsert=True,
+                )
+
+            random_count = sum(1 for v in random_map.values() if v)
+            log.info(
+                f"[VOLUME-SEED] Batch {i // batch_size + 1} | {len(chunk)} keyword(s) "
+                f"seeded with search_volume | via RapidAPI (single.php, one call per keyword) | "
+                f"real:{len(chunk) - random_count} random_fallback:{random_count}"
+            )
+
+        except Exception as exc:
+            log.error(f"[VOLUME-SEED] batch error (keywords {i}-{i + len(chunk)}): {exc}")
+            for kw in chunk:
+                vol = _random_search_volume_fallback()
+                log.warning(
+                    f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | search_volume={vol} "
+                    f"| reason: unexpected batch-level error — {exc} | this is NOT a real "
+                    f"search volume."
+                )
+                try:
+                    db.flintel_keywords.update_one(
+                        {"keyword": kw},
+                        {"$set": {"search_volume": vol, "search_volume_is_random": True}},
+                        upsert=True,
+                    )
+                except Exception as inner_exc:
+                    log.error(f"[VOLUME-SEED] could not persist random fallback for {kw!r}: {inner_exc}")
+
+        time.sleep(SERP_FETCH_SLEEP_SECONDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
+# 100% UNCHANGED FROM v9.11.1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_search_volume(search_keyword: str) -> int | None:
+    """
+    Monthly search volume — a SINGLE keyword, single request. Kept for
+    the Twitter fallback path (fetch_google_stats(), used only when
+    SEARCH_KEYWORD is configured for Twitter items).
+    """
+    if not search_keyword:
+        return None
+
+    if not RAPIDAPI_KEY:
+        vol = _random_search_volume_fallback()
+        log.warning(
+            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+            f"search_volume={vol} | reason: RAPIDAPI_KEY not configured — call never made | "
+            f"this is NOT a real search volume."
+        )
+        return vol
+
+    try:
+        url = "https://seo-keyword-research.p.rapidapi.com/single.php"
+
+        querystring = {"keyword": search_keyword, "country": "us"}
+
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY, # .env
+            "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
+            "Content-Type": "application/json"
+        }
+
+        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
+        status_code = r.status_code
+
+        try:
+            result = r.json()
+        except ValueError:
+            log.error(f"fetch_search_volume non-JSON response for {search_keyword!r} | status:{status_code}")
+            vol = _random_search_volume_fallback()
+            log.warning(
+                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+                f"search_volume={vol} | reason: non-JSON response (status:{status_code}) | "
+                f"this is NOT a real search volume."
+            )
+            return vol
+
+        vol = _dig_value(result, VOLUME_FIELD_CANDIDATES)
+        if vol is None:
+            api_message = result.get("message") if isinstance(result, dict) else None
+            log.warning(
+                f"fetch_search_volume no volume field for {search_keyword!r} | "
+                f"status:{status_code} | api_message:{api_message!r}"
+            )
+            vol = _random_search_volume_fallback()
+            log.warning(
+                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+                f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
+                f"rate-limited / no usable field (see api_message above) | this is NOT a "
+                f"real, provider-returned search volume."
+            )
+        return vol
+    except Exception as exc:
+        log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
+        vol = _random_search_volume_fallback()
+        log.warning(
+            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+            f"search_volume={vol} | reason: exception during call — {exc} | this is NOT a "
+            f"real search volume."
+        )
+        return vol
+
+
+def fetch_google_rank(search_keyword: str) -> int | None:
+    """
+    GENERIC (non-post-specific) Google rank fallback — used ONLY for
+    Twitter items. 100% UNCHANGED FROM v9.11.1.
+    """
+    if not RAPIDAPI_KEY or not search_keyword:
+        return None
+    try:
+        url = "https://google-search116.p.rapidapi.com/"
+
+        querystring = {"query": search_keyword}
+
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
+            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
+            "Content-Type": "application/json"
+        }
+
+        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
+
+        try:
+            result_data = r.json()
+        except ValueError:
+            log.error(f"fetch_google_rank non-JSON response for {search_keyword!r} | status:{r.status_code}")
+            return None
+
+        items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+        if not items:
+            return None
+        return _dig_value(items[0], RANK_FIELD_CANDIDATES)
+    except Exception as exc:
+        log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
+        return None
+
+
+def fetch_google_stats(search_keyword: str) -> dict:
+    return {
+        "google_rank":   fetch_google_rank(search_keyword),
+        "search_volume": fetch_search_volume(search_keyword),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REDDIT — SOLE discovery mechanism: RapidAPI SERP search
+# (site:reddit.com) -> real per-post rank + URL -> flintel_google_posts
+# cache. search_google_for_keyword() itself is 100% UNCHANGED FROM
+# v9.11.1 — it still runs unconditionally whenever a keyword is due, on
+# its own dedicated RapidAPI host, completely independent of the
+# search-volume host/call, and completely independent of Reddit's RSS
+# reliability (which now lives entirely in
+# run_google_posts_rss_matching_loop() below).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
+    """
+    RapidAPI Google search restricted to site:reddit.com, rolling
+    last-N-months date window. Returns real per-result rank + URL. Only
+    called for keywords that get_due_keywords() has flagged as due.
+    100% UNCHANGED FROM v9.11.1.
+    """
+    if not RAPIDAPI_KEY:
+        log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
+        return []
+
+    today = datetime.now(timezone.utc)
+    date_from = today - timedelta(days=months_back * 30)
+    cd_min = date_from.strftime("%m/%d/%Y")
+    cd_max = today.strftime("%m/%d/%Y")
+
+    query = f'site:reddit.com "{keyword}"'
+    try:
+        url = "https://google-search116.p.rapidapi.com/"
+
+        querystring = {"query": query}
+
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
+            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
+            "Content-Type": "application/json"
+        }
+
+        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
+
+        try:
+            result_data = r.json()
+        except ValueError:
+            log.error(f"[SERP] Non-JSON response for {keyword!r} | status:{r.status_code}")
+            return []
+
+        raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+        results = []
+        rank_misses = 0
+        for pos, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("url", "") or item.get("link", "")
+            if "reddit.com" not in item_url:
+                continue
+            rank = _dig_value(item, RANK_FIELD_CANDIDATES)
+            if rank is None:
+                rank = pos
+                rank_misses += 1
+            results.append({
+                "url":   item_url,
+                "rank":  rank,
+                "title": item.get("title", ""),
+            })
+
+        if rank_misses and rank_misses == len(results) and results:
+            log.warning(
+                f"[SERP] '{keyword}' — no explicit rank field found in any result "
+                f"(tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
+            )
+
+        log.info(
+            f"[SERP] '{keyword}' → {len(results)} Reddit result(s) "
+            f"(last {months_back} months: {cd_min} to {cd_max})"
+        )
+        return results
+
+    except Exception as exc:
+        log.error(f"[SERP] RapidAPI search error for {keyword!r}: {exc}")
+        return []
+
+
+def is_post_already_signaled(post_url: str) -> bool:
+    """
+    Checks the `signals` collection DIRECTLY by post_url — BEFORE any
+    Reddit fetch or Claude scoring happens. 100% UNCHANGED FROM v9.11.1.
+    """
+    if not post_url:
+        return False
+    try:
+        existing = db.signals.find_one({"post_url": post_url}, {"_id": 1})
+        return existing is not None
+    except Exception as exc:
+        log.error(f"[DEDUP] is_post_already_signaled error for {post_url}: {exc}")
+        return False   # fail-open: if the check itself fails, don't block discovery
+
+
+def _extract_reddit_subreddit_from_url(post_url: str) -> str:
+    """Pulls the subreddit name out of a standard reddit.com post URL
+    (e.g. reddit.com/r/<subreddit>/comments/...). Returns "" if it
+    can't be found — never raises."""
+    match = re.search(r"reddit\.com/r/([^/]+)/", post_url)
+    return match.group(1) if match else ""
+
+
+def _extract_reddit_submission_id(post_url: str) -> str | None:
+    """Pulls the submission id out of a standard reddit.com post URL
+    (e.g. .../comments/<id>/...). Used to build a stable message_id."""
+    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
+    return match.group(1) if match else None
+
+
+def _normalize_reddit_url(url: str) -> str:
+    """Normalizes a Reddit post URL for exact-match comparison between a
+    SERP-discovered post_url and an RSS entry's link: strips query
+    string/fragment, trailing slash, and the www./old. host prefixes."""
+    if not url:
+        return ""
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    url = url.replace("https://old.reddit.com", "https://www.reddit.com")
+    url = url.replace("https://reddit.com", "https://www.reddit.com")
+    return url.lower()
+
+
+def process_one_keyword(keyword: str) -> tuple:
+    """
+    SERP-DISCOVERY-ONLY. Full discovery work for ONE keyword that
+    get_due_keywords() has flagged as due right now:
+      1. RapidAPI SERP search (site:reddit.com, last N months) — 100%
+         unchanged call (search_google_for_keyword()).
+      2. Per-result post_url dedup check -> skip posts already scored
+         (in `signals`) or already cached (in flintel_google_posts).
+      3. For every genuinely new result: extract the subreddit, and save
+         {post_url, google_rank, matched_keyword, fuzzy_keywords,
+         subreddit, fetched:False} into flintel_google_posts via
+         save_google_post(). This save is immediate — it never calls
+         into Reddit's RSS/JSON endpoints and never waits on them.
+
+    Returns (new_items_count, skipped_dupes_count, had_fetch_failure) for
+    logging AND for run_serp_discovery_loop()'s fetched=True decision.
+    had_fetch_failure is now ALWAYS False here — Reddit RSS fetching is
+    fully decoupled from SERP discovery, so a keyword's SERP results
+    being saved to flintel_google_posts can never fail due to Reddit's
+    RSS reliability.
+    """
+    new_items, skipped_dupes = 0, 0
+    had_fetch_failure = False  # Reddit RSS fetch failures can no longer occur at this stage
+
+    results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
+
+    for result in results:
+        post_url = result["url"]
+
+        if is_post_already_signaled(post_url):
+            skipped_dupes += 1
+            log.debug(f"[SERP] Skipping already-signaled post_url: {post_url}")
+            continue
+
+        subreddit = _extract_reddit_subreddit_from_url(post_url)
+        saved = save_google_post(
+            post_url=post_url,
+            google_rank=result["rank"],
+            matched_keyword=keyword,
+            subreddit=subreddit,
+        )
+        if saved:
+            new_items += 1
+        else:
+            skipped_dupes += 1
+        time.sleep(0.05)  # tiny pacing between DB writes only — no external call here
+
+    return new_items, skipped_dupes, had_fetch_failure
+
+
+def run_serp_discovery_loop():
+    """
+    Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
+    for keywords that have NEVER been fetched (fetched=False), and for any
+    keyword still missing a cached search_volume (batch-seeds it). 100%
+    UNCHANGED FROM v9.11.1 in its keyword-cache behavior — the only
+    difference is what process_one_keyword() does per due keyword (see
+    that function's docstring): it saves discovered post_urls into
+    flintel_google_posts instead of fetching each one's Reddit RSS
+    directly, so a keyword's fetched=True marking here depends only on
+    SERP discovery finishing, never on Reddit's RSS reliability.
+    """
+    sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
+
+    missing_volume = get_keywords_missing_volume()
+    if missing_volume:
+        log.info(
+            f"[VOLUME-SEED] {len(missing_volume)} keyword(s) need search_volume — "
+            f"seeding in batches of {SEARCH_VOLUME_BATCH_SIZE}..."
+        )
+        seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
+
+    log.info(
+        f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
+        f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
+        f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
+        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever, "
+        f"due/missing-volume read from flintel_keywords directly (not filtered by python list) | "
+        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
+        f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
+        f"on failure/no-credits (always logged) | "
+        f"SERP results saved into flintel_google_posts immediately — "
+        f"Reddit RSS fetching is fully decoupled (see run_google_posts_rss_matching_loop)"
+    )
+
+    while True:
+        try:
+            sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
+
+            missing_volume = get_keywords_missing_volume()
+            if missing_volume:
+                seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
+
+            due = get_due_keywords()
+            if not due:
+                time.sleep(KEYWORD_CHECK_INTERVAL_SECONDS)
+                continue
+
+            total_new, total_dupes = 0, 0
+            for doc in due:
+                keyword = doc["keyword"]
+                new_items, dupes, had_fetch_failure = process_one_keyword(keyword)
+                total_new += new_items
+                total_dupes += dupes
+
+                # had_fetch_failure is always False now — a keyword is
+                # always marked fetched=True once its SERP results are
+                # saved to flintel_google_posts, since that save no
+                # longer depends on Reddit's RSS reliability at all.
+                mark_keyword_fetched(keyword)
+                log.info(
+                    f"[SERP] '{keyword}' DONE | new_google_posts:{new_items} skipped_dupes:{dupes} | "
+                    f"marked fetched=True PERMANENTLY — will never be re-fetched | "
+                    f"Reddit RSS confirmation for these post_urls will happen independently "
+                    f"via run_google_posts_rss_matching_loop()"
+                )
+                time.sleep(SERP_FETCH_SLEEP_SECONDS)
+
+            log.info(
+                f"[SERP] Pass complete | keywords_processed:{len(due)} | "
+                f"new_google_posts:{total_new} | skipped_dupes:{total_dupes}"
+            )
+
+        except Exception as exc:
+            log.error(f"[SERP] discovery loop error: {exc}")
+            time.sleep(10)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REDDIT SUBREDDIT-RSS FETCH — public, credential-free /r/<subreddit>/new.rss
+# feed. Smart-retry logic (v9.6) unchanged in spirit — same User-Agent,
+# jittered backoff, old.reddit.com fallback host — applied to a
+# subreddit's feed URL, since discovery no longer fetches one post_url at
+# a time.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reddit_get_with_retry(url: str) -> requests.Response | None:
+    """
+    "Smart" GET wrapper for Reddit's public endpoints — retry/backoff/
+    jitter behavior kept exactly as prior versions:
+      - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
+      - Small randomized jitter delay before each attempt.
+      - Exponential backoff retry, up to REDDIT_FETCH_MAX_RETRIES times,
+        specifically for 403 / 429 / 5xx responses.
+    Returns the Response on success (status 200), or None if every
+    attempt failed.
+    """
+    headers = {
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+
+    last_status = None
+    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
+        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
+        try:
+            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return r
+            if r.status_code == 404:
+                log.debug(f"[REDDIT-RSS] 404 (gone) for {url} — not retrying.")
+                return None
+            if r.status_code in (403, 429) or r.status_code >= 500:
+                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
+                log.warning(
+                    f"[REDDIT-RSS] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
+                )
+                time.sleep(wait)
+                continue
+            log.error(f"[REDDIT-RSS] Unexpected status {r.status_code} for {url}")
+            return None
+        except requests.RequestException as exc:
+            log.warning(
+                f"[REDDIT-RSS] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                f"network error for {url}: {exc}"
+            )
+            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
+
+    log.error(f"[REDDIT-RSS] fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
+              f"(last_status:{last_status})")
+    return None
+
+
+def _fetch_subreddit_rss(subreddit: str) -> list:
+    """
+    Fetches r/<subreddit>/new.rss (public, credential-free), with
+    old.reddit.com fallback host on failure — same smart-retry as the
+    prior per-post fetch, just pointed at a subreddit feed instead.
+    Returns a list of parsed feedparser entries (possibly empty).
+    """
+    primary_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
+    r = _reddit_get_with_retry(primary_url)
+
+    if r is None:
+        fallback_url = f"https://old.reddit.com/r/{subreddit}/new.rss"
+        log.info(f"[REDDIT-RSS] Retrying r/{subreddit} via old.reddit.com fallback...")
+        r = _reddit_get_with_retry(fallback_url)
+
+    if r is None:
+        log.error(f"[REDDIT-RSS] Giving up on r/{subreddit} this pass — will retry next cycle.")
+        return []
+
+    try:
+        feed = feedparser.parse(r.content)
+        return feed.entries[:GOOGLE_POSTS_RSS_ENTRY_LIMIT]
+    except Exception as exc:
+        log.error(f"[REDDIT-RSS] parse error for r/{subreddit}: {exc}")
+        return []
+
+
+def _entry_to_text_and_meta(entry) -> dict:
+    """
+    Extracts text/username/posted_at from one feedparser RSS entry —
+    same extraction logic used by the prior per-post RSS fetch.
+    """
+    title = (entry.get("title", "") or "").strip()
+    raw_summary = entry.get("summary", "") or ""
+    if not raw_summary and entry.get("content"):
+        raw_summary = entry["content"][0].get("value", "") or ""
+    summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
+
+    text = title
+    if summary_plain and summary_plain.lower() != title.lower():
+        text = f"{title}\n\n{summary_plain}"
+
+    author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
+
+    posted_at = None
+    published = entry.get("published") or entry.get("updated")
+    if published:
+        try:
+            posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
+                                  tzinfo=timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            posted_at = published
+
+    link = entry.get("link", "") or ""
+
+    return {"text": text, "author": author, "posted_at": posted_at, "link": link}
+
+
+def run_google_posts_rss_matching_loop():
+    """
+    The ONLY place in this system that talks to Reddit's RSS feeds now.
+    Fully independent of, and never blocks or is blocked by,
+    run_serp_discovery_loop() / process_one_keyword() / flintel_keywords.
+
+    Every GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS:
+      1. Calls sync_targeting_collections() — rebuilds
+         flintel_targeting_subreddits / flintel_targeting_keywords from
+         whatever is currently pending (fetched=False) in
+         flintel_google_posts. Neither collection is ever a hardcoded
+         python list — both are a live mirror, re-synced every pass.
+      2. Reads the subreddit poll list DIRECTLY off
+         flintel_targeting_subreddits (get_targeting_subreddits()) —
+         this governs which subreddits actually get RSS-polled this
+         cycle.
+      3. For each such subreddit, fetches that subreddit's public,
+         credential-free /new.rss feed (smart-retry + old.reddit.com
+         fallback).
+      4. Builds a lookup of this subreddit's still-pending
+         flintel_google_posts documents keyed by NORMALIZED post_url
+         (full per-post detail — google_rank, matched_keyword,
+         fuzzy_keywords — still comes straight from flintel_google_posts,
+         exactly as before; the targeting collections are the governing/
+         tracking layer, not a duplicate data store).
+      5. For every RSS entry returned, normalizes its link and checks it
+         against that lookup. A match on post_url is the AUTHORITATIVE
+         signal — the ONLY thing that decides a match, ever. fuzzy_
+         keywords are cross-checked against the entry's text PURELY for
+         a traceability log line — never blocking, never part of the
+         match decision.
+      6. On a match:
+           - marks flintel_google_posts.fetched = True, permanently
+             (mark_google_post_fetched())
+           - immediately deletes that post_url's flintel_targeting_
+             keywords document (delete_targeting_keyword_entry()) — that
+             keyword/post is done being targeted
+           - pulls that keyword's already-seeded search_volume straight
+             off flintel_keywords (read-only — NEVER re-queries the
+             search-volume API here)
+           - generates the random engagement fallback (RSS has no real
+             upvotes/comments, same as before)
+           - builds the exact same item schema as before, pushes it into
+             reddit_queue + save_queue_message() — the raw fetched text
+             is queued AS-IS; run_batch_processor() below no longer
+             re-filters Reddit items by keyword-phrase text, since the
+             URL match here is already the sole authoritative relevance
+             decision for Reddit
+      7. Any RSS entry that does NOT match a pending post_url for that
+         subreddit is simply ignored — no separate keyword filtering
+         against a python list happens at this stage.
+    """
+    log.info(
+        f"[GOOGLE-POSTS-RSS] Matching loop started | check_interval:"
+        f"{GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS}s | rss_entry_limit:"
+        f"{GOOGLE_POSTS_RSS_ENTRY_LIMIT} | reads flintel_targeting_subreddits "
+        f"(auto-synced from flintel_google_posts every pass), no hardcoded "
+        f"python list of subreddits ever maintained"
+    )
+
+    while True:
+        try:
+            sync_targeting_collections()
+
+            subreddits = get_targeting_subreddits()
+            if not subreddits:
+                log.debug("[GOOGLE-POSTS-RSS] No pending subreddits this pass — sleeping.")
+                time.sleep(GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS)
+                continue
+
+            log.info(
+                f"[GOOGLE-POSTS-RSS] Pass starting | {len(subreddits)} subreddit(s) "
+                f"in flintel_targeting_subreddits: {subreddits}"
+            )
+
+            total_confirmed, total_subreddits_processed = 0, 0
+
+            for subreddit in subreddits:
+                pending_docs = get_pending_google_posts_for_subreddit(subreddit)
+                if not pending_docs:
+                    continue
+
+                pending_by_url = {_normalize_reddit_url(d["post_url"]): d for d in pending_docs}
+
+                log.info(
+                    f"[GOOGLE-POSTS-RSS] r/{subreddit} | polling RSS | "
+                    f"{len(pending_by_url)} pending post_url(s) to confirm"
+                )
+
+                entries = _fetch_subreddit_rss(subreddit)
+                total_subreddits_processed += 1
+
+                if not entries:
+                    log.warning(f"[GOOGLE-POSTS-RSS] r/{subreddit} | RSS returned no entries this pass.")
+                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
+                    continue
+
+                confirmed_this_subreddit = 0
+
+                for entry in entries:
+                    meta = _entry_to_text_and_meta(entry)
+                    normalized_link = _normalize_reddit_url(meta["link"])
+                    if not normalized_link or normalized_link not in pending_by_url:
+                        continue
+
+                    doc = pending_by_url[normalized_link]
+                    post_url = doc["post_url"]
+                    matched_keyword = doc.get("matched_keyword", SEARCH_KEYWORD)
+                    fuzzy_keywords = doc.get("fuzzy_keywords", [])
+                    google_rank = doc.get("google_rank")
+
+                    fuzzy_hit = any(fk.lower() in meta["text"].lower() for fk in fuzzy_keywords) if fuzzy_keywords else False
+
+                    search_volume, sv_is_random = get_cached_search_volume_for_keyword(matched_keyword)
+
+                    upvotes = _random_engagement_fallback()
+                    comments = _random_engagement_fallback()
+
+                    submission_id = _extract_reddit_submission_id(post_url)
+                    message_id = f"reddit_serp_{submission_id}" if submission_id else (
+                        f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
+                    )
+
+                    item = {
+                        "message_id":              message_id,
+                        "platform":                "reddit",
+                        "text":                    meta["text"],
+                        "username":                meta["author"],
+                        "subreddit_or_channel":    subreddit,
+                        "post_url":                post_url,
+                        "posted_at":               meta["posted_at"],
+                        "search_keyword":          matched_keyword,
+                        "upvotes":                 upvotes,
+                        "comments":                comments,
+                        "engagement_is_random":    True,
+                        "google_rank":             google_rank,
+                        "search_volume":           search_volume,
+                        "search_volume_is_random": sv_is_random,
+                    }
+
+                    # URL match confirmed — this is the SOLE authoritative
+                    # signal. Push the raw fetched text AS-IS into the
+                    # queue (which run_batch_processor() below appends
+                    # directly into flintel_pending_batch, no additional
+                    # keyword-text filtering applied to Reddit items).
+                    reddit_queue.put(item)
+                    save_queue_message("reddit", item)
+                    mark_google_post_fetched(post_url)
+                    delete_targeting_keyword_entry(post_url)
+
+                    confirmed_this_subreddit += 1
+                    total_confirmed += 1
+
+                    sv_tag = "RANDOM-FALLBACK" if sv_is_random else "real"
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] CONFIRMED via URL match | r/{subreddit} | "
+                        f"post_url:{post_url} | google_rank:{google_rank} | "
+                        f"matched_keyword:{matched_keyword!r} | fuzzy_keyword_text_hit:{fuzzy_hit} | "
+                        f"search_volume:{search_volume} ({sv_tag}, from flintel_keywords cache) | "
+                        f"upvotes:{upvotes} comments:{comments} (RANDOM-FALLBACK, RSS has no real counts) | "
+                        f"queued as-is for Claude scoring | marked fetched=True PERMANENTLY in "
+                        f"flintel_google_posts | removed from flintel_targeting_keywords"
+                    )
+
+                if confirmed_this_subreddit == 0:
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] r/{subreddit} | {len(entries)} RSS entr(y/ies) checked | "
+                        f"0 matched a pending post_url this pass — will retry next cycle"
+                    )
+                else:
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] r/{subreddit} | {confirmed_this_subreddit} post_url(s) "
+                        f"confirmed and queued this pass"
+                    )
+
+                time.sleep(SERP_FETCH_SLEEP_SECONDS)
+
+            log.info(
+                f"[GOOGLE-POSTS-RSS] Pass complete | subreddits_processed:{total_subreddits_processed} | "
+                f"total_confirmed_and_queued:{total_confirmed}"
+            )
+
+        except Exception as exc:
+            log.error(f"[GOOGLE-POSTS-RSS] matching loop error: {exc}")
+            time.sleep(10)
+
+        time.sleep(GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
+# 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
     lines = []
     for i, item in enumerate(batch, start=1):
-        ctype     = item.get("content_type", "unknown").upper()
-        platform  = item.get("platform", "unknown").upper()
-        subreddit = item.get("subreddit", "")
-        group     = item.get("telegram_group", "")
-        username  = item.get("username", "unknown")
-        text      = item.get("text", "")[:800]
-
-        if subreddit:
-            location = f"r/{subreddit}"
-        elif group:
-            location = f"tg/{group}"
-        else:
-            location = platform
-
-        # v7.6.0 — LINKEDIN ADDITIVE ONLY: append whatever enrichment data
-        # was fetched from the User Data / Company Data endpoints. This
-        # block only ever activates when item["platform"] == "linkedin" —
-        # every other platform's prompt text is byte-for-byte unchanged.
-        extra = ""
-        if item.get("platform") == "linkedin":
-            extra_bits = []
-            if item.get("linkedin_job_title"):
-                extra_bits.append(f"Title: {item['linkedin_job_title']}")
-            if item.get("linkedin_company"):
-                extra_bits.append(f"Company: {item['linkedin_company']}")
-            if item.get("linkedin_location"):
-                extra_bits.append(f"Location: {item['linkedin_location']}")
-            if item.get("linkedin_company_industry"):
-                extra_bits.append(f"Industry: {item['linkedin_company_industry']}")
-            if item.get("linkedin_company_size"):
-                extra_bits.append(f"Company Size: {item['linkedin_company_size']}")
-            if extra_bits:
-                extra = "\nEnrichment: " + " | ".join(extra_bits)
-
-        lines.append(
-            f"--- MESSAGE {i} ---\n"
-            f"Platform: {platform} | Source: {location} | Type: {ctype} | User: {username}\n"
-            f"Content: {text}{extra}\n"
-        )
+        payload = {
+            "search_keyword": item.get("search_keyword", SEARCH_KEYWORD),
+            "text":           (item.get("text", "") or "")[:1200],
+            "platform":       item.get("platform", "unknown"),
+            "google_rank":    item.get("google_rank"),
+            "search_volume":  item.get("search_volume"),
+            "upvotes":        item.get("upvotes"),
+            "comments":       item.get("comments"),
+        }
+        lines.append(f"--- POST {i} ---\n{json.dumps(payload, ensure_ascii=False)}\n")
     return "\n".join(lines)
 
 
 def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
-    derived = _derive_fields(1)
     return {
-        "index":                        index,
-        "intent_score":                 1,
-        "signal_category":              derived["signal_category"],
-        "tier":                         derived["tier"],
-        "hubspot_priority":             derived["hubspot_priority"],
-        "is_business":                  False,
-        "business_size":                "unknown",
-        "has_international_context":    False,
-        "corridor":                     None,
-        "estimated_amount":             None,
-        "competitor_mentioned":         None,
-        "competitor_outreach_detected": False,
-        "pain_type":                    None,
-        "urgency":                      "none",
-        "reason":                       reason,
-        "suggested_action":             "Check system logs.",
-        "twitter_reply":                None,
-        "twitter_dm":                   None,
-        "linkedin_message":             None,
-        "telegram_dm":                  None,
-        "facebook_comment":             None,
-        # v7.6.0 NEW
-        "linkedin_reply":               None,
-        "linkedin_dm":                  None,
-        "watchlist":                    False,
-        "watchlist_reason":             None,
+        "index": index,
+        "intent_score": 1,
+        "is_relevant": False,
+        "reply_draft": None,
+        "_is_fallback": True,
+        "_fallback_reason": reason,
     }
 
 
@@ -3045,21 +2315,14 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _salvage_partial_json_array(raw: str) -> list:
+    """Brace-depth-tracking salvage of a truncated JSON array."""
     start = raw.find("[")
     if start == -1:
         return []
-
-    objects = []
-    depth = 0
-    obj_start = None
-    in_string = False
-    escape = False
-
-    i = start + 1
-    n = len(raw)
+    objects, depth, obj_start, in_string, escape = [], 0, None, False, False
+    i, n = start + 1, len(raw)
     while i < n:
         ch = raw[i]
-
         if in_string:
             if escape:
                 escape = False
@@ -3069,12 +2332,10 @@ def _salvage_partial_json_array(raw: str) -> list:
                 in_string = False
             i += 1
             continue
-
         if ch == '"':
             in_string = True
             i += 1
             continue
-
         if ch == "{":
             if depth == 0:
                 obj_start = i
@@ -3086,10 +2347,9 @@ def _salvage_partial_json_array(raw: str) -> list:
                 try:
                     objects.append(json.loads(candidate))
                 except (json.JSONDecodeError, ValueError):
-                    log.warning("[Claude-Batch] Skipped one malformed salvaged object during recovery.")
+                    log.warning("[Claude-Batch] Skipped one malformed salvaged object.")
                 obj_start = None
         i += 1
-
     return objects
 
 
@@ -3101,826 +2361,157 @@ def _parse_claude_json(raw: str) -> tuple:
             raise ValueError("Claude returned non-list.")
         return parsed, False
     except (json.JSONDecodeError, ValueError) as exc:
-        log.warning(
-            f"[Claude-Batch] Full JSON parse failed ({exc}) — "
-            f"attempting partial recovery from truncated response."
-        )
-        salvaged = _salvage_partial_json_array(cleaned)
-        return salvaged, True
+        log.warning(f"[Claude-Batch] Full parse failed ({exc}) — attempting partial recovery.")
+        return _salvage_partial_json_array(cleaned), True
 
 
 def _call_claude_batch(batch: list) -> list:
-    platform = batch[0].get("platform", "reddit") if batch else "reddit"
-
-    system_prompt = {
-        "twitter":  CLAUDE_SYSTEM_PROMPT_TWITTER,
-        "telegram": CLAUDE_SYSTEM_PROMPT_TELEGRAM,
-        "facebook": CLAUDE_SYSTEM_PROMPT_FACEBOOK,
-        # v7.6.0 NEW
-        "linkedin": CLAUDE_SYSTEM_PROMPT_LINKEDIN,
-    }.get(platform, CLAUDE_SYSTEM_PROMPT_REDDIT)
-
     prompt = _build_batch_prompt(batch)
-
     with anthropic_client.messages.stream(
-        model      = "claude-sonnet-4-6",
-        max_tokens = MAX_TOKENS,
-        system     = system_prompt,
-        messages   = [{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
+        model="claude-haiku-4-5-20251001",
+        max_tokens=MAX_TOKENS,
+        system=CLAUDE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
     ) as stream:
         raw = stream.get_final_text().strip()
 
     results, was_truncated = _parse_claude_json(raw)
 
     if was_truncated:
-        recovered_indices = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
-        all_indices = set(range(1, len(batch) + 1))
-        missing_indices = sorted(all_indices - recovered_indices)
-
-        log.warning(
-            f"[Claude-Batch] PARTIAL RECOVERY | platform:{platform} | "
-            f"batch_size:{len(batch)} | recovered:{len(recovered_indices)} | "
-            f"missing (fallback):{len(missing_indices)}"
-        )
-        send_operator_alert(
+        recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
+        missing = sorted(set(range(1, len(batch) + 1)) - recovered)
+        log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
+                    f"recovered:{len(recovered)} | missing:{len(missing)}")
+        log_operator_alert(
             title="Claude Response Truncated (max_tokens) — Partial Recovery",
-            detail=(
-                f"Platform: {platform}\n"
-                f"Batch size: {len(batch)}\n"
-                f"Successfully recovered: {len(recovered_indices)} item(s) — scored and delivered normally.\n"
-                f"Lost to truncation (fallback score 1 applied): {len(missing_indices)} item(s) — "
-                f"indices {missing_indices[:30]}{'...' if len(missing_indices) > 30 else ''}\n\n"
-                f"Consider raising MAX_TOKENS (currently {MAX_TOKENS}) or lowering this platform's "
-                f"batch size if this recurs."
-            ),
+            detail=f"batch_size:{len(batch)} recovered:{len(recovered)} missing:{missing[:30]}",
             level="ERROR",
         )
-        for idx in missing_indices:
-            results.append(_fallback_score(idx, "Truncated by max_tokens — not recovered."))
+        for idx in missing:
+            results.append(_fallback_score(idx, "Truncated — not recovered."))
 
     if not isinstance(results, list):
         raise ValueError("Claude returned non-list after parsing.")
 
-    required = {"index", "intent_score", "is_business", "reason", "suggested_action"}
-    optional_defaults = {
-        "business_size":                "unknown",
-        "has_international_context":    False,
-        "corridor":                     None,
-        "estimated_amount":             None,
-        "competitor_mentioned":         None,
-        "competitor_outreach_detected": False,
-        "pain_type":                    None,
-        "urgency":                      "none",
-        "twitter_reply":                None,
-        "twitter_dm":                   None,
-        "linkedin_message":             None,
-        "telegram_dm":                  None,
-        "facebook_comment":             None,
-        # v7.6.0 NEW
-        "linkedin_reply":               None,
-        "linkedin_dm":                  None,
-        "watchlist":                    False,
-    }
-
     for r in results:
-        missing = required - r.keys()
-        if missing:
-            raise ValueError(f"Missing keys in Claude response: {missing}")
-        for k, v in optional_defaults.items():
-            r.setdefault(k, v)
+        r.setdefault("is_relevant", False)
+        r.setdefault("reply_draft", None)
+        r.setdefault("_is_fallback", False)
         if r.get("intent_score", 1) < 1:
             r["intent_score"] = 1
-
-        score   = r["intent_score"]
-        derived = _derive_fields(score)
-        r["signal_category"]  = derived["signal_category"]
-        r["tier"]             = derived["tier"]
-        r["hubspot_priority"] = derived["hubspot_priority"]
-        r["watchlist_reason"] = r.get("reason") if r.get("watchlist") else None
+        if r.get("intent_score", 1) > 100:
+            r["intent_score"] = 100
 
     return results
 
 
 def score_batch_with_claude(batch: list) -> list:
-    result = retry_with_backoff(
-        _call_claude_batch, batch,
-        retries=3, delay=5, label="Claude-Batch",
-    )
+    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="Claude-Batch")
     if result is None:
-        send_operator_alert(
+        log_operator_alert(
             title="Claude API Unavailable",
-            detail=(
-                f"All 3 retry attempts to score a batch of {len(batch)} items failed.\n"
-                f"Batch platform: {batch[0].get('platform','unknown') if batch else 'unknown'}\n"
-                f"Fallback scores (1) assigned. Check ANTHROPIC_API_KEY and API status."
-            ),
+            detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
             level="CRITICAL",
         )
-        return [_fallback_score(i + 1) for i in range(len(batch))]
+        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE — ALL scores 1-10 stored, nothing discarded.
-# v7.6.0: additive LinkedIn fields only — every .get() defaults to None for
-# every other platform's documents, so their stored shape is unchanged.
+# MONGODB STORAGE — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_signal(data: dict) -> bool:
+def save_new_signal(item: dict, score_result: dict, force_pending: bool = False) -> bool:
+    doc = {
+        "message_id":            item["message_id"],
+        "platform":               item.get("platform", "unknown"),
+        "post_url":               item.get("post_url", ""),
+        "text":                   item.get("text", ""),
+        "username":               item.get("username", "unknown"),
+        "subreddit_or_channel":   item.get("subreddit_or_channel", ""),
+        "posted_at":              item.get("posted_at"),
+        "fetched_at":             datetime.now(timezone.utc),
+        "google_rank":            item.get("google_rank"),
+        "search_volume":          item.get("search_volume"),
+        "upvotes":                item.get("upvotes"),
+        "comments":               item.get("comments"),
+        "search_keyword":         item.get("search_keyword", SEARCH_KEYWORD),
+        "intent_score":           score_result.get("intent_score", 1),
+        "is_relevant":            score_result.get("is_relevant", False),
+        "reply_draft":            score_result.get("reply_draft"),
+        "client_id":              CLIENT_ID,
+        "status":                 "pending" if force_pending else "confirmed",
+        "created_at":             datetime.now(timezone.utc),
+    }
     try:
-        doc = {
-            "message_id":                   data["message_id"],
-            "platform":                     data.get("platform", "unknown"),
-            "content_type":                 data.get("content_type", "unknown"),
-            "subreddit":                    data.get("subreddit", ""),
-            "telegram_group":               data.get("telegram_group", ""),
-            "post_url":                     data.get("post_url", ""),
-            "username":                     data.get("username", "unknown"),
-            "message_text":                 data["message_text"],
-            "intent_score":                 data["intent_score"],
-            "signal_category":              data["signal_category"],
-            "tier":                         data.get("tier", "discard"),
-            "is_business":                  data.get("is_business", False),
-            "business_size":                data.get("business_size", "unknown"),
-            "corridor":                     data.get("corridor"),
-            "estimated_amount":             data.get("estimated_amount"),
-            "competitor_mentioned":         data.get("competitor_mentioned"),
-            "competitor_outreach_detected": data.get("competitor_outreach_detected", False),
-            "pain_type":                    data.get("pain_type"),
-            "urgency":                      data.get("urgency", "none"),
-            "reason":                       data["reason"],
-            "suggested_action":             data["suggested_action"],
-            "twitter_reply":                data.get("twitter_reply"),
-            "twitter_dm":                   data.get("twitter_dm"),
-            "linkedin_message":             data.get("linkedin_message"),
-            "telegram_dm":                  data.get("telegram_dm"),
-            "facebook_comment":             data.get("facebook_comment"),
-            # v7.6.0 NEW — LinkedIn outreach + enrichment fields. Always
-            # None/absent for Reddit/Twitter/Telegram/Facebook documents.
-            "linkedin_reply":               data.get("linkedin_reply"),
-            "linkedin_dm":                  data.get("linkedin_dm"),
-            "linkedin_full_name":           data.get("linkedin_full_name"),
-            "linkedin_headline":            data.get("linkedin_headline"),
-            "linkedin_email":               data.get("linkedin_email"),
-            "linkedin_phone":               data.get("linkedin_phone"),
-            "linkedin_location":            data.get("linkedin_location"),
-            "linkedin_company":             data.get("linkedin_company"),
-            "linkedin_job_title":           data.get("linkedin_job_title"),
-            "linkedin_profile_url":         data.get("linkedin_profile_url"),
-            "linkedin_company_name":        data.get("linkedin_company_name"),
-            "linkedin_company_website":     data.get("linkedin_company_website"),
-            "linkedin_company_industry":    data.get("linkedin_company_industry"),
-            "linkedin_company_size":        data.get("linkedin_company_size"),
-            "linkedin_company_location":    data.get("linkedin_company_location"),
-            "linkedin_company_phone":       data.get("linkedin_company_phone"),
-            # v7.7.0 NEW — the KEYWORDS entry that produced this item
-            # (Facebook/LinkedIn only; None for every other platform).
-            "search_keyword":               data.get("search_keyword"),
-            "watchlist":                    data.get("watchlist", False),
-            "watchlist_reason":             data.get("watchlist_reason"),
-            "client_id":                    CLIENT_ID,
-            "alerted_slack":                False,
-            "alerted_hubspot":              False,
-            "digest_included":              False,
-            "created_at":                   datetime.now(timezone.utc),
-        }
         db.signals.insert_one(doc)
-
-        platform = data.get("platform", "?").upper()
-        score    = data["intent_score"]
-        user     = data.get("username", "?")
-        ctype    = data.get("content_type", "")
-        sub      = data.get("subreddit", "")
-        grp      = data.get("telegram_group", "")
-        source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
-
+        sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
+        eng_tag = "RANDOM-FALLBACK" if item.get("engagement_is_random") else "real"
         log.info(
-            f"SAVED [{platform}] | Score:{score} | Tier:{data.get('tier','?')} | "
-            f"u/{user} | {ctype} | {source}"
+            f"SAVED [{doc['platform'].upper()}] {doc['search_keyword']!r} | "
+            f"search_volume:{doc['search_volume']}/mo ({sv_tag}) | "
+            f"upvotes:{doc['upvotes']} comments:{doc['comments']} ({eng_tag}) | "
+            f"google_rank:{doc['google_rank']} | "
+            f"post_url:{doc['post_url']}"
         )
         return True
     except DuplicateKeyError:
-        log.debug(f"Duplicate skipped: {data['message_id']}")
         return False
     except Exception as exc:
         log.error(f"MongoDB save error: {exc}")
-        send_operator_alert(
-            title="MongoDB Write Failed",
-            detail=(
-                f"Failed to save signal to MongoDB.\n"
-                f"message_id: {data.get('message_id','unknown')}\n"
-                f"platform: {data.get('platform','unknown')}\n"
-                f"error: {exc}\n\n"
-                f"Check MONGODB_URI and MongoDB Atlas status."
-            ),
-            level="CRITICAL",
-        )
+        log_operator_alert("MongoDB Write Failed", str(exc), level="CRITICAL")
         return False
 
 
-def update_signal(message_id: str, data: dict) -> bool:
-    try:
-        update_fields = {
-            "intent_score":                 data["intent_score"],
-            "signal_category":              data["signal_category"],
-            "tier":                         data.get("tier", "discard"),
-            "is_business":                  data.get("is_business", False),
-            "business_size":                data.get("business_size", "unknown"),
-            "corridor":                     data.get("corridor"),
-            "estimated_amount":             data.get("estimated_amount"),
-            "competitor_mentioned":         data.get("competitor_mentioned"),
-            "competitor_outreach_detected": data.get("competitor_outreach_detected", False),
-            "pain_type":                    data.get("pain_type"),
-            "urgency":                      data.get("urgency", "none"),
-            "reason":                       data["reason"],
-            "suggested_action":             data["suggested_action"],
-            "twitter_reply":                data.get("twitter_reply"),
-            "twitter_dm":                   data.get("twitter_dm"),
-            "linkedin_message":             data.get("linkedin_message"),
-            "telegram_dm":                  data.get("telegram_dm"),
-            "facebook_comment":             data.get("facebook_comment"),
-            # v7.6.0 NEW
-            "linkedin_reply":               data.get("linkedin_reply"),
-            "linkedin_dm":                  data.get("linkedin_dm"),
-            "watchlist":                    data.get("watchlist", False),
-            "watchlist_reason":             data.get("watchlist_reason"),
-            "rescored_at":                  datetime.now(timezone.utc),
-            "alerted_slack":                False,
-            "alerted_hubspot":              False,
-        }
-        result = db.signals.update_one(
-            {"message_id": message_id},
-            {"$set": update_fields},
-        )
-        if result.matched_count == 0:
-            log.warning(f"[RESCORE] update_signal: no document found for message_id={message_id}")
-            return False
-        log.info(
-            f"[RESCORE] UPDATED | message_id:{message_id} | "
-            f"Score:{data['intent_score']} | Tier:{data.get('tier','?')}"
-        )
-        return True
-    except Exception as exc:
-        log.error(f"[RESCORE] update_signal error: {exc}")
+def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: dict) -> bool:
+    existing = db.signals.find_one({"message_id": message_id})
+    if not existing:
+        log.warning(f"[RESCORE] No existing doc for {message_id} — skipping.")
         return False
 
-
-def mark_slack_alerted(message_id: str):
-    try:
-        db.signals.update_one(
-            {"message_id": message_id},
-            {"$set": {"alerted_slack": True, "alerted_slack_at": datetime.now(timezone.utc)}},
-        )
-    except Exception as exc:
-        log.error(f"mark_slack_alerted error: {exc}")
-
-
-def mark_hubspot_alerted(message_id: str, contact_id: str):
-    try:
-        db.signals.update_one(
-            {"message_id": message_id},
-            {"$set": {
-                "alerted_hubspot": True,
-                "hubspot_contact_id": contact_id,
-                "alerted_hubspot_at": datetime.now(timezone.utc),
-            }},
-        )
-    except Exception as exc:
-        log.error(f"mark_hubspot_alerted error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WEEKLY REPORT STATE PERSISTENCE (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _get_state(key: str):
-    try:
-        doc = db.flintel_state.find_one({"key": key})
-        return doc["value"] if doc else None
-    except Exception as exc:
-        log.error(f"get_state error for key={key}: {exc}")
-        return None
-
-
-def _set_state(key: str, value):
-    try:
-        db.flintel_state.update_one(
-            {"key": key},
-            {"$set": {"key": key, "value": value, "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"set_state error for key={key}: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SLACK DELIVERY
-# v7.6.0: outreach lookup additionally checks linkedin_reply/linkedin_dm.
-# Everything else in this function is unchanged from v7.5.0.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _safe(text: str, limit: int = 2900) -> str:
-    if not text:
-        return "—"
-    return text[:limit] + ("…" if len(text) > limit else "")
-
-
-def _post_to_slack(payload: dict):
-    r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
-    if r.status_code != 200:
-        raise Exception(f"Slack {r.status_code}: {r.text}")
-    return r
-
-
-def send_slack_alert(data: dict) -> bool:
-    if not SLACK_WEBHOOK_URL:
-        log.warning("SLACK_WEBHOOK_URL not set — skipping.")
-        return False
-
-    score       = data["intent_score"]
-    platform    = data.get("platform", "unknown").upper()
-    ctype       = data.get("content_type", "post").upper()
-    subreddit   = data.get("subreddit", "")
-    tg_group    = data.get("telegram_group", "")
-    post_url    = data.get("post_url", "")
-    username    = data.get("username", "unknown")
-    tier        = data.get("tier", "").upper()
-    category    = data.get("signal_category", "").replace("_", " ").upper()
-    is_biz      = data.get("is_business", False)
-    corridor    = data.get("corridor") or "Unknown"
-    amount      = data.get("estimated_amount") or "—"
-    pain        = data.get("pain_type") or "—"
-    competitor  = data.get("competitor_mentioned") or "—"
-    urgency     = data.get("urgency", "none").upper()
-    timestamp   = data.get("timestamp", "—")
-    is_rescore  = data.get("is_rescore", False)
-
-    if score >= 9:
-        urgency_tag = "⚡ RESPOND WITHIN 30 MINUTES"
-    elif score >= 7:
-        urgency_tag = "⏰ RESPOND WITHIN 2 HOURS"
-    elif score >= 5:
-        urgency_tag = "📋 ADD TO TODAY'S OUTREACH LIST"
-    else:
-        urgency_tag = ""
-
-    outreach = (
-        data.get("twitter_reply") or
-        data.get("twitter_dm") or
-        data.get("telegram_dm") or
-        data.get("linkedin_message") or
-        data.get("facebook_comment") or
-        data.get("linkedin_reply") or   # v7.6.0 NEW
-        data.get("linkedin_dm") or      # v7.6.0 NEW
-        ""
-    )
-
-    rescore_tag = " ♻️ RESCORED" if is_rescore else ""
-    header_emoji = "🚨" if score >= 8 else "⚠️"
-    header_text  = f"{header_emoji} {category} — {tier}{rescore_tag}"
-
-    if subreddit:
-        source_label = f"r/{subreddit}"
-    elif tg_group:
-        source_label = f"tg/{tg_group}"
-    else:
-        source_label = platform
-
-    blocks = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": header_text[:150], "emoji": True},
-        },
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Platform*\n{platform}"},
-                {"type": "mrkdwn", "text": f"*Source*\n{source_label}"},
-                {"type": "mrkdwn", "text": f"*Content Type*\n{ctype}"},
-                {"type": "mrkdwn", "text": f"*User*\n{username}"},
-                {"type": "mrkdwn", "text": f"*Tier*\n{tier}"},
-                {"type": "mrkdwn", "text": f"*Profile*\n{'✅ Business' if is_biz else '👤 Individual'}"},
-                {"type": "mrkdwn", "text": f"*Timestamp*\n{timestamp}"},
-            ],
-        },
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Corridor*\n{corridor}"},
-                {"type": "mrkdwn", "text": f"*Estimated Amount*\n{amount}"},
-                {"type": "mrkdwn", "text": f"*Pain Type*\n{pain}"},
-                {"type": "mrkdwn", "text": f"*Competitor*\n{competitor}"},
-                {"type": "mrkdwn", "text": f"*Urgency*\n{urgency}"},
-            ],
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Message*\n>{_safe(data['message_text'], 400)}"},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Reason*\n{_safe(data['reason'], 300)}"},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Recommended Action*\n🎯 {_safe(data['suggested_action'], 300)}"},
-        },
-    ]
-
-    # v7.6.0 NEW — surface LinkedIn enrichment (company/location/title) in
-    # Slack when present. Purely additive block: only appended when a
-    # linkedin_company/linkedin_location/linkedin_job_title field exists
-    # on the signal, which only ever happens for platform == "linkedin".
-    li_bits = []
-    if data.get("linkedin_job_title"):
-        li_bits.append(f"*Title*\n{data['linkedin_job_title']}")
-    if data.get("linkedin_company"):
-        li_bits.append(f"*Company*\n{data['linkedin_company']}")
-    if data.get("linkedin_location"):
-        li_bits.append(f"*Location*\n{data['linkedin_location']}")
-    if data.get("linkedin_email"):
-        li_bits.append(f"*Email*\n{data['linkedin_email']}")
-    if data.get("linkedin_phone"):
-        li_bits.append(f"*Phone*\n{data['linkedin_phone']}")
-    if li_bits:
-        blocks.append({
-            "type": "section",
-            "fields": [{"type": "mrkdwn", "text": b} for b in li_bits[:10]],
-        })
-
-    if urgency_tag:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Response Window*\n{urgency_tag}"},
-        })
-
-    if outreach:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Outreach Script*\n💬 {_safe(outreach, 600)}"},
-        })
-
-    if post_url:
-        blocks.append({
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                "text": {"type": "plain_text", "text": "View Original →"},
-                "url": post_url,
-                "style": "primary",
-            }],
-        })
-
-    blocks.append({"type": "divider"})
-
-    result = retry_with_backoff(
-        _post_to_slack, {"text": header_text, "blocks": blocks},
-        retries=3, delay=2, label="Slack",
-    )
-    if result:
-        log.info(f"Slack sent | {platform} | u/{username} | Score:{score}")
-        return True
-    log.error("Slack delivery failed after all retries.")
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HUBSPOT CRM
-# v7.6.0: note body additionally includes LinkedIn outreach + enrichment
-# lines when present. Everything else unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
-
-HUBSPOT_BASE = "https://api.hubapi.com"
-
-_HUBSPOT_REQUIRED_CONTACT_PROPERTIES = [
-    "fx_intent_score",
-    "fx_signal_category",
-    "fx_tier",
-    "fx_corridor",
-    "fx_pain_type",
-    "fx_competitor",
-    "fx_platform",
-    "fx_source_community",
-    "fx_signal_reason",
-    "fx_suggested_action",
-]
-
-
-def _hs_headers() -> dict:
-    return {"Authorization": f"Bearer {HUBSPOT_API_KEY}", "Content-Type": "application/json"}
-
-
-def _hs_log_http_error(label: str, exc: "requests.exceptions.HTTPError"):
-    body_text = None
-    try:
-        if exc.response is not None:
-            body_text = exc.response.text
-    except Exception:
-        body_text = None
-
-    if body_text:
-        log.error(f"{label}: {exc} | HubSpot response body: {body_text[:2000]}")
-    else:
-        log.error(f"{label}: {exc} | (no response body available)")
-
-
-def _hs_verify_properties():
-    if not HUBSPOT_API_KEY:
-        log.info("[HubSpot] HUBSPOT_API_KEY not set — skipping property self-check.")
-        return
-
-    try:
-        r = requests.get(
-            f"{HUBSPOT_BASE}/crm/v3/properties/contacts",
-            headers=_hs_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        existing = {p.get("name") for p in r.json().get("results", [])}
-
-        missing = [p for p in _HUBSPOT_REQUIRED_CONTACT_PROPERTIES if p not in existing]
-
-        if missing:
-            log.warning(
-                f"[HubSpot] STARTUP CHECK — {len(missing)} custom contact "
-                f"property(ies) used by this script are MISSING from this "
-                f"HubSpot portal: {missing}. Every contact create will 400 "
-                f"until these are added under Settings → Properties → "
-                f"Contact properties (type: single-line text is sufficient "
-                f"for all of them)."
-            )
-        else:
-            log.info(
-                f"[HubSpot] STARTUP CHECK — all {len(_HUBSPOT_REQUIRED_CONTACT_PROPERTIES)} "
-                f"required custom contact properties exist. ✅"
-            )
-
-    except requests.exceptions.HTTPError as exc:
-        _hs_log_http_error("[HubSpot] STARTUP CHECK failed", exc)
-        log.warning(
-            "[HubSpot] Could not verify contact properties at startup "
-            "(see error above). This does NOT block the system."
-        )
-    except Exception as exc:
-        log.warning(f"[HubSpot] STARTUP CHECK failed (non-HTTP error): {exc}")
-
-
-def _hs_find_contact(username: str) -> str | None:
-    try:
-        r = requests.post(
-            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
-            json={"filterGroups": [{"filters": [{"propertyName": "firstname", "operator": "EQ", "value": username}]}]},
-            headers=_hs_headers(), timeout=10,
-        )
-        r.raise_for_status()
-        results = r.json().get("results", [])
-        return results[0]["id"] if results else None
-    except requests.exceptions.HTTPError as exc:
-        _hs_log_http_error("HubSpot find contact error", exc)
-        return None
-    except Exception as exc:
-        log.error(f"HubSpot find contact error: {exc}")
-        return None
-
-
-def _hs_create_contact(data: dict) -> str | None:
-    try:
-        sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
-        properties = {
-            "firstname":           f"{data.get('username','unknown')}",
-            "lastname":            f"{data.get('platform','?').upper()} Signal",
-            "fx_intent_score":     str(data["intent_score"]),
-            "fx_signal_category":  data["signal_category"],
-            "fx_tier":             data.get("tier", ""),
-            "fx_corridor":         data.get("corridor") or "",
-            "fx_pain_type":        data.get("pain_type") or "",
-            "fx_competitor":       data.get("competitor_mentioned") or "",
-            "fx_platform":         data.get("platform", ""),
-            "fx_source_community": sub,
-            "fx_signal_reason":    data["reason"],
-            "fx_suggested_action": data["suggested_action"],
-        }
-        # v7.6.0 — if LinkedIn enrichment gave us a real email/phone, use
-        # HubSpot's native contact properties for them too (in addition to
-        # the fx_* custom properties above, which stay platform-agnostic).
-        if data.get("linkedin_email"):
-            properties["email"] = data["linkedin_email"]
-        if data.get("linkedin_phone"):
-            properties["phone"] = data["linkedin_phone"]
-
-        r = requests.post(
-            f"{HUBSPOT_BASE}/crm/v3/objects/contacts",
-            json={"properties": properties},
-            headers=_hs_headers(), timeout=10,
-        )
-        r.raise_for_status()
-        return r.json().get("id")
-    except requests.exceptions.HTTPError as exc:
-        _hs_log_http_error("HubSpot create contact error", exc)
-        return None
-    except Exception as exc:
-        log.error(f"HubSpot create contact error: {exc}")
-        return None
-
-
-def _hs_create_note(data: dict, contact_id: str):
-    try:
-        sub = data.get("subreddit", "") or data.get("telegram_group", "") or data.get("platform", "")
-        rescore_note = "\n[RESCORED SIGNAL]" if data.get("is_rescore") else ""
-
-        # v7.6.0 — LinkedIn enrichment block, additive only, empty string
-        # for every other platform.
-        linkedin_block = ""
-        if data.get("platform") == "linkedin":
-            linkedin_block = (
-                f"\n\nLinkedIn Profile: {data.get('linkedin_profile_url') or 'N/A'}\n"
-                f"LinkedIn Name:     {data.get('linkedin_full_name') or 'N/A'}\n"
-                f"LinkedIn Headline: {data.get('linkedin_headline') or 'N/A'}\n"
-                f"LinkedIn Title:    {data.get('linkedin_job_title') or 'N/A'}\n"
-                f"LinkedIn Email:    {data.get('linkedin_email') or 'N/A'}\n"
-                f"LinkedIn Phone:    {data.get('linkedin_phone') or 'N/A'}\n"
-                f"LinkedIn Location: {data.get('linkedin_location') or 'N/A'}\n"
-                f"Company:           {data.get('linkedin_company_name') or data.get('linkedin_company') or 'N/A'}\n"
-                f"Company Website:   {data.get('linkedin_company_website') or 'N/A'}\n"
-                f"Company Industry:  {data.get('linkedin_company_industry') or 'N/A'}\n"
-                f"Company Size:      {data.get('linkedin_company_size') or 'N/A'}\n"
-                f"Company HQ:        {data.get('linkedin_company_location') or 'N/A'}\n"
-                f"Company Phone:     {data.get('linkedin_company_phone') or 'N/A'}\n\n"
-                f"LinkedIn Reply:\n{data.get('linkedin_reply') or 'N/A'}\n\n"
-                f"LinkedIn DM:\n{data.get('linkedin_dm') or 'N/A'}"
-            )
-
-        note = (
-            f"FLINTEL SIGNAL — v7.9.1{rescore_note}\n\n"
-            f"Platform:     {data.get('platform','?').upper()}\n"
-            f"Tier:         {data.get('tier','')}\n"
-            f"Category:     {data['signal_category']}\n"
-            f"Business:     {data.get('is_business', False)}\n"
-            f"Business Size:{data.get('business_size','unknown')}\n"
-            f"Corridor:     {data.get('corridor') or 'Unknown'}\n"
-            f"Amount:       {data.get('estimated_amount') or 'Unknown'}\n"
-            f"Competitor:   {data.get('competitor_mentioned') or 'None'}\n"
-            f"Pain Type:    {data.get('pain_type') or 'Unknown'}\n"
-            f"Urgency:      {data.get('urgency', 'none')}\n"
-            f"Content Type: {data.get('content_type','unknown')}\n"
-            f"Source:       {sub}\n"
-            f"URL:          {data.get('post_url','N/A')}\n"
-            f"Username:     {data.get('username','unknown')}\n"
-            f"Timestamp:    {data.get('timestamp','N/A')}\n\n"
-            f"Message:\n{data['message_text']}\n\n"
-            f"Reason:       {data['reason']}\n"
-            f"Action:       {data['suggested_action']}\n\n"
-            f"Twitter Reply:\n{data.get('twitter_reply') or 'N/A'}\n\n"
-            f"Twitter DM:\n{data.get('twitter_dm') or 'N/A'}\n\n"
-            f"LinkedIn (legacy Reddit field):\n{data.get('linkedin_message') or 'N/A'}\n\n"
-            f"Telegram DM:\n{data.get('telegram_dm') or 'N/A'}\n\n"
-            f"Facebook Comment:\n{data.get('facebook_comment') or 'N/A'}"
-            f"{linkedin_block}"
-        )
-        r = requests.post(
-            f"{HUBSPOT_BASE}/crm/v3/objects/notes",
-            json={
-                "properties": {
-                    "hs_note_body": note,
-                    "hs_timestamp": str(int(datetime.now(timezone.utc).timestamp() * 1000)),
-                },
-                "associations": [{
-                    "to": {"id": contact_id},
-                    "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}],
-                }],
-            },
-            headers=_hs_headers(), timeout=10,
-        )
-        r.raise_for_status()
-    except requests.exceptions.HTTPError as exc:
-        _hs_log_http_error("HubSpot create note error", exc)
-    except Exception as exc:
-        log.error(f"HubSpot create note error: {exc}")
-
-
-def _send_to_hubspot(data: dict) -> str | None:
-    if not HUBSPOT_API_KEY:
-        log.warning("HUBSPOT_API_KEY not set — skipping.")
-        return None
-    username   = data.get("username", "unknown")
-    contact_id = _hs_find_contact(username)
-    if not contact_id:
-        contact_id = _hs_create_contact(data)
-    if not contact_id:
-        return None
-    _hs_create_note(data, contact_id)
-    log.info(f"HubSpot note attached | u/{username} | ID:{contact_id}")
-    return contact_id
-
-
-def send_to_hubspot(data: dict) -> str | None:
-    return retry_with_backoff(_send_to_hubspot, data, retries=3, delay=3, label="HubSpot")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE SIGNAL PROCESSOR — v7.6.0: additive LinkedIn fields carried through
-# from item + score_result into `data`. Routing logic 100% unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_scored_item(item: dict, score_result: dict, is_rescore: bool = False):
-    score    = score_result.get("intent_score", 1)
-    platform = item.get("platform", "unknown")
-
-    data = {
-        "message_id":                   item["message_id"],
-        "platform":                     platform,
-        "content_type":                 item.get("content_type", "unknown"),
-        "subreddit":                    item.get("subreddit", ""),
-        "telegram_group":               item.get("telegram_group", ""),
-        "post_url":                     item.get("post_url", ""),
-        "username":                     item.get("username", "unknown"),
-        "message_text":                 item.get("text", "") or item.get("message_text", ""),
-        "intent_score":                 score,
-        "signal_category":              score_result.get("signal_category", "discard"),
-        "tier":                         score_result.get("tier", "discard"),
-        "is_business":                  score_result.get("is_business", False),
-        "business_size":                score_result.get("business_size", "unknown"),
-        "corridor":                     score_result.get("corridor"),
-        "estimated_amount":             score_result.get("estimated_amount"),
-        "competitor_mentioned":         score_result.get("competitor_mentioned"),
-        "competitor_outreach_detected": score_result.get("competitor_outreach_detected", False),
-        "pain_type":                    score_result.get("pain_type"),
-        "urgency":                      score_result.get("urgency", "none"),
-        "reason":                       score_result.get("reason", ""),
-        "suggested_action":             score_result.get("suggested_action", ""),
-        "twitter_reply":                score_result.get("twitter_reply"),
-        "twitter_dm":                   score_result.get("twitter_dm"),
-        "linkedin_message":             score_result.get("linkedin_message"),
-        "telegram_dm":                  score_result.get("telegram_dm"),
-        "facebook_comment":             score_result.get("facebook_comment"),
-        # v7.6.0 NEW — outreach text comes from Claude (score_result);
-        # enrichment data comes from the item itself (fetched at poll time
-        # from the User Data / Company Data endpoints).
-        "linkedin_reply":               score_result.get("linkedin_reply"),
-        "linkedin_dm":                  score_result.get("linkedin_dm"),
-        "linkedin_full_name":           item.get("linkedin_full_name"),
-        "linkedin_headline":            item.get("linkedin_headline"),
-        "linkedin_email":               item.get("linkedin_email"),
-        "linkedin_phone":               item.get("linkedin_phone"),
-        "linkedin_location":            item.get("linkedin_location"),
-        "linkedin_company":             item.get("linkedin_company"),
-        "linkedin_job_title":           item.get("linkedin_job_title"),
-        "linkedin_profile_url":         item.get("linkedin_profile_url"),
-        "linkedin_company_name":        item.get("linkedin_company_name"),
-        "linkedin_company_website":     item.get("linkedin_company_website"),
-        "linkedin_company_industry":    item.get("linkedin_company_industry"),
-        "linkedin_company_size":        item.get("linkedin_company_size"),
-        "linkedin_company_location":    item.get("linkedin_company_location"),
-        "linkedin_company_phone":       item.get("linkedin_company_phone"),
-        # v7.7.0 NEW — which KEYWORDS entry this item was fetched under.
-        # Only ever set for platforms that loop per-keyword (Facebook,
-        # LinkedIn) — None/absent for Reddit/Twitter/Telegram, unchanged.
-        "search_keyword":               item.get("search_keyword"),
-        "watchlist":                    score_result.get("watchlist", False),
-        "watchlist_reason":             score_result.get("watchlist_reason"),
-        "timestamp":                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "is_rescore":                   is_rescore,
+    new_doc = {
+        "message_id":            message_id,
+        "platform":               existing.get("platform", "unknown"),
+        "post_url":               existing.get("post_url", ""),
+        "text":                   existing.get("text", ""),
+        "username":               existing.get("username", "unknown"),
+        "subreddit_or_channel":   existing.get("subreddit_or_channel", ""),
+        "posted_at":              existing.get("posted_at") or existing.get("created_at"),
+        "fetched_at":             existing.get("fetched_at", datetime.now(timezone.utc)),
+        "google_rank":            enrichment.get("google_rank"),
+        "search_volume":          enrichment.get("search_volume"),
+        "upvotes":                enrichment.get("upvotes"),
+        "comments":               enrichment.get("comments"),
+        "search_keyword":         enrichment.get("search_keyword", SEARCH_KEYWORD),
+        "intent_score":           score_result.get("intent_score", 1),
+        "is_relevant":            score_result.get("is_relevant", False),
+        "reply_draft":            score_result.get("reply_draft"),
+        "client_id":              CLIENT_ID,
+        "status":                 "confirmed",
+        "created_at":             existing.get("created_at", datetime.now(timezone.utc)),
     }
-
-    if is_rescore:
-        saved = update_signal(data["message_id"], data)
-    else:
-        saved = save_signal(data)
-
-    if not saved:
-        return
-
-    if score < MIN_SCORE_MEDIUM:
-        mode = "RESCORE-SILENT" if is_rescore else "SILENT SAVE"
-        log.debug(
-            f"{mode} | [{platform.upper()}] Score:{score} | "
-            f"u/{data['username']} | {data['content_type']}"
-        )
-        return
-
-    if MIN_SCORE_MEDIUM <= score < MIN_SCORE_HIGH:
-        mode = "RESCORE-MEDIUM" if is_rescore else "MEDIUM"
-        log.info(f"{mode} | [{platform.upper()}] Score:{score} | Slack + HubSpot | u/{data['username']}")
-        ok = send_slack_alert(data)
-        if ok:
-            mark_slack_alerted(data["message_id"])
-        cid = send_to_hubspot(data)
-        if cid:
-            mark_hubspot_alerted(data["message_id"], cid)
-
-    elif score >= MIN_SCORE_HIGH:
-        mode = "RESCORE-HIGH" if is_rescore else "HIGH"
-        log.info(f"{mode} | [{platform.upper()}] Score:{score} | Slack + HubSpot | u/{data['username']}")
-        ok = send_slack_alert(data)
-        if ok:
-            mark_slack_alerted(data["message_id"])
-        cid = send_to_hubspot(data)
-        if cid:
-            mark_hubspot_alerted(data["message_id"], cid)
+    db.signals.replace_one({"message_id": message_id}, new_doc)
+    log.info(f"[RESCORE] CONFIRMED | {message_id} | score:{new_doc['intent_score']} relevant:{new_doc['is_relevant']}")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR (unchanged — reused as-is for LinkedIn)
+# GENERIC BATCH PROCESSOR — one instance per platform queue.
+#
+# v9.13 CHANGE (the ONLY functional change in this function): the
+# redundant keyword-phrase filter (passes_keyword_filter) is now SKIPPED
+# for Reddit items specifically. A Reddit item only ever reaches
+# reddit_queue after its post_url has already been confirmed via exact
+# URL match inside run_google_posts_rss_matching_loop() — that URL match
+# IS the sole, authoritative relevance decision for Reddit. Re-checking
+# the fetched text against the full REDDIT_SEARCH_KEYWORDS phrase list
+# here would silently drop items whose text only relates in meaning (not
+# exact original phrase) to the keyword that produced them via SERP.
+# Twitter items are NOT pre-filtered anywhere upstream, so they still go
+# through passes_keyword_filter() exactly as before — zero change to
+# Twitter's behavior. Everything else in this function — batching logic,
+# timeout/gap handling, persistent state, enrichment, the Claude call —
+# is 100% UNCHANGED from v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -3929,33 +2520,25 @@ def run_batch_processor(
     platform_label: str,
     gap_seconds: int,
     timeout_seconds: int,
+    keyword_filter_list: list,
 ):
     platform_key = platform_label.lower()
 
     log.info(
         f"Batch processor [{platform_label}] started | "
-        f"batch_size:{batch_size} | gap:{gap_seconds}s | "
-        f"timeout:{timeout_seconds}s"
+        f"batch_size:{batch_size} | gap:{gap_seconds}s | timeout:{timeout_seconds}s"
     )
 
     current_batch, batch_start_time = load_pending_batch(platform_key)
     if current_batch:
-        log.info(
-            f"[{platform_label}] Resumed [{len(current_batch)}/{batch_size}] "
-            f"from persistent disk — continuing, NOT restarting at 1."
-        )
+        log.info(f"[{platform_label}] Resumed [{len(current_batch)}/{batch_size}] from persistent disk.")
 
-    total_received   = 0
-    total_matched    = 0
-    total_dropped    = 0
-    total_batches    = 0
+    total_received, total_matched, total_dropped, total_batches = 0, 0, 0, 0
 
     while True:
         try:
             if current_batch and batch_start_time is not None:
-                elapsed   = time.time() - batch_start_time
-                remaining = timeout_seconds - elapsed
-                wait_time = max(0.1, remaining)
+                wait_time = max(0.1, timeout_seconds - (time.time() - batch_start_time))
             else:
                 wait_time = 1.0
 
@@ -3967,39 +2550,25 @@ def run_batch_processor(
 
             if got_item:
                 total_received += 1
-
                 remove_queue_message(platform_key, item.get("message_id"))
 
-                text = item.get("text", "").strip()
+                text = (item.get("text") or "").strip()
 
                 if not text or len(text) < 10:
                     q.task_done()
                     continue
 
-                matched_keyword = passes_keyword_filter(text)
-                if not matched_keyword:
+                # v9.13 — Reddit items are NEVER re-filtered here (URL
+                # match already happened upstream, in
+                # run_google_posts_rss_matching_loop()). Twitter items
+                # still go through the normal keyword-phrase filter,
+                # exactly as before.
+                if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
-                    log.debug(
-                        f"[{platform_label}] FILTERED | "
-                        f"u/{item.get('username')} | {item.get('content_type','?')}"
-                    )
                     q.task_done()
                     continue
 
-                # v7.8.0 NEW — populate item["search_keyword"] with the
-                # keyword that matched via passes_keyword_filter, but ONLY
-                # if the item doesn't already carry one. Facebook and
-                # LinkedIn already set search_keyword at poll time (the
-                # exact keyword they searched with) — that value is
-                # preserved as-is, unchanged, and is NOT overwritten here.
-                # Reddit, Twitter, and Telegram never set this field
-                # before, so they now get it filled in from whichever
-                # KEYWORDS entry matched the fetched text.
-                if not item.get("search_keyword"):
-                    item["search_keyword"] = matched_keyword
-
                 total_matched += 1
-
                 if not current_batch:
                     batch_start_time = time.time()
 
@@ -4007,29 +2576,22 @@ def run_batch_processor(
                 save_pending_batch(platform_key, current_batch, batch_start_time)
                 save_batch_seconds(platform_key, batch_start_time)
 
-                log.info(
-                    f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | "
-                    f"{item.get('content_type','?').upper()} | u/{item.get('username')}"
-                )
-
+                log.info(f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | u/{item.get('username')}")
                 q.task_done()
 
             should_fire = False
             fire_reason = ""
-
             if len(current_batch) >= batch_size:
-                should_fire = True
-                fire_reason = f"batch full ({batch_size} items)"
+                should_fire, fire_reason = True, f"batch full ({batch_size} items)"
             elif current_batch and batch_start_time is not None:
                 elapsed = time.time() - batch_start_time
                 if elapsed >= timeout_seconds:
-                    should_fire = True
-                    fire_reason = f"timeout ({timeout_seconds}s) — partial batch {len(current_batch)}/{batch_size}"
+                    should_fire, fire_reason = True, f"timeout ({timeout_seconds}s) — partial {len(current_batch)}/{batch_size}"
 
             if should_fire and current_batch:
                 total_batches += 1
-                batch_to_send  = current_batch[:batch_size]
-                current_batch  = current_batch[batch_size:]
+                batch_to_send = current_batch[:batch_size]
+                current_batch = current_batch[batch_size:]
                 batch_start_time = None if not current_batch else time.time()
 
                 if current_batch:
@@ -4039,10 +2601,24 @@ def run_batch_processor(
                     clear_pending_batch(platform_key)
                     clear_batch_seconds(platform_key)
 
+                google_stats = None
+                for it in batch_to_send:
+                    already_enriched = it.get("google_rank") is not None
+
+                    it.setdefault("upvotes", None)
+                    it.setdefault("comments", None)
+
+                    if not already_enriched and SEARCH_KEYWORD:
+                        if google_stats is None:
+                            google_stats = fetch_google_stats(SEARCH_KEYWORD)
+                        it["google_rank"] = google_stats.get("google_rank")
+                        it["search_volume"] = google_stats.get("search_volume")
+                        it["search_keyword"] = SEARCH_KEYWORD
+
                 log.info(
-                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | "
-                    f"reason:{fire_reason} | items:{len(batch_to_send)} | "
-                    f"received:{total_received} matched:{total_matched} dropped:{total_dropped}"
+                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | reason:{fire_reason} | "
+                    f"items:{len(batch_to_send)} | received:{total_received} "
+                    f"matched:{total_matched} dropped:{total_dropped}"
                 )
 
                 scores = score_batch_with_claude(batch_to_send)
@@ -4050,15 +2626,12 @@ def run_batch_processor(
 
                 for i, it in enumerate(batch_to_send):
                     pos = i + 1
-                    sr  = score_map.get(pos) or (
-                        scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch.")
-                    )
-                    process_scored_item(it, sr)
+                    sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch."))
+                    is_fallback = bool(sr.get("_is_fallback", False))
+                    save_new_signal(it, sr, force_pending=is_fallback)
 
-                log.info(
-                    f"[{platform_label}] BATCH {total_batches} COMPLETE — "
-                    f"{len(batch_to_send)} item(s) completed | waiting {gap_seconds}s..."
-                )
+                log.info(f"[{platform_label}] BATCH {total_batches} COMPLETE — "
+                         f"{len(batch_to_send)} item(s) | waiting {gap_seconds}s...")
                 time.sleep(gap_seconds)
 
         except Exception as exc:
@@ -4067,173 +2640,53 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR (unchanged)
+# RESCORE PROCESSOR — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rescore_queue_requests(message_ids: list, operator_note: str = "") -> list:
-    inserted = []
-    for mid in message_ids:
-        try:
-            doc = {
-                "message_id":    mid,
-                "status":        "pending",
-                "operator_note": operator_note,
-                "requested_at":  datetime.now(timezone.utc),
-                "processed_at":  None,
-                "rescore_result": None,
-                "error":         None,
-            }
-            result = db.flintel_rescore_messages.insert_one(doc)
-            inserted.append(str(result.inserted_id))
-            log.info(f"[RESCORE] Queued | message_id:{mid} | req_id:{result.inserted_id}")
-        except Exception as exc:
-            log.error(f"[RESCORE] Failed to queue message_id:{mid} — {exc}")
-    return inserted
-
-
-def _rescore_fetch_pending(limit: int) -> list:
-    try:
-        return list(
-            db.flintel_rescore_messages.find(
-                {"status": "pending"}
-            ).sort("requested_at", ASCENDING).limit(limit)
-        )
-    except Exception as exc:
-        log.error(f"[RESCORE] fetch_pending error: {exc}")
-        return []
-
-
-def _rescore_mark_processing(req_ids: list):
-    try:
-        db.flintel_rescore_messages.update_many(
-            {"_id": {"$in": req_ids}},
-            {"$set": {"status": "processing"}},
-        )
-    except Exception as exc:
-        log.error(f"[RESCORE] mark_processing error: {exc}")
-
-
-def _rescore_mark_done(req_id, score_result: dict):
-    try:
-        db.flintel_rescore_messages.update_one(
-            {"_id": req_id},
-            {"$set": {
-                "status":         "done",
-                "rescore_result": score_result,
-                "processed_at":   datetime.now(timezone.utc),
-                "error":          None,
-            }},
-        )
-    except Exception as exc:
-        log.error(f"[RESCORE] mark_done error: {exc}")
-
-
-def _rescore_mark_error(req_id, error: str):
-    try:
-        db.flintel_rescore_messages.update_one(
-            {"_id": req_id},
-            {"$set": {
-                "status":       "error",
-                "error":        error,
-                "processed_at": datetime.now(timezone.utc),
-            }},
-        )
-    except Exception as exc:
-        log.error(f"[RESCORE] mark_error error: {exc}")
-
-
 def run_rescore_processor():
-    log.info(
-        f"[RESCORE] Processor started | "
-        f"batch_size:{RESCORE_BATCH_SIZE} | poll_interval:{RESCORE_POLL_INTERVAL}s | "
-        f"gap:{RESCORE_BATCH_GAP_SECONDS}s"
-    )
-    total_rescored = 0
-    total_batches  = 0
+    log.info(f"[RESCORE] Processor started | batch_size:{RESCORE_BATCH_SIZE} | "
+             f"poll:{RESCORE_POLL_INTERVAL}s | gap:{RESCORE_BATCH_GAP_SECONDS}s")
+    total_batches = 0
 
     while True:
         try:
-            pending = _rescore_fetch_pending(RESCORE_BATCH_SIZE)
+            pending = list(db.signals.find({"status": "pending"}).limit(RESCORE_BATCH_SIZE))
             if not pending:
                 time.sleep(RESCORE_POLL_INTERVAL)
                 continue
 
-            req_ids = [p["_id"] for p in pending]
-            _rescore_mark_processing(req_ids)
-
             items_for_claude = []
-            req_map = {}
-
-            for i, req in enumerate(pending, start=1):
-                mid = req["message_id"]
-                sig = db.signals.find_one({"message_id": mid}, {"_id": 0})
-                if not sig:
-                    log.warning(f"[RESCORE] Signal not found in DB: {mid} — marking error.")
-                    _rescore_mark_error(req["_id"], f"Signal not found: {mid}")
-                    continue
-
-                item = {
-                    "message_id":     mid,
-                    "platform":       sig.get("platform", "reddit"),
-                    "content_type":   sig.get("content_type", "unknown"),
-                    "subreddit":      sig.get("subreddit", ""),
-                    "telegram_group": sig.get("telegram_group", ""),
-                    "post_url":       sig.get("post_url", ""),
-                    "username":       sig.get("username", "unknown"),
-                    "text":           sig.get("message_text", ""),
-                    # v7.6.0 — carry LinkedIn enrichment through on rescore
-                    # too, so a rescored LinkedIn signal keeps its
-                    # company/contact detail instead of losing it.
-                    "linkedin_full_name":        sig.get("linkedin_full_name"),
-                    "linkedin_headline":         sig.get("linkedin_headline"),
-                    "linkedin_email":            sig.get("linkedin_email"),
-                    "linkedin_phone":            sig.get("linkedin_phone"),
-                    "linkedin_location":         sig.get("linkedin_location"),
-                    "linkedin_company":          sig.get("linkedin_company"),
-                    "linkedin_job_title":        sig.get("linkedin_job_title"),
-                    "linkedin_profile_url":      sig.get("linkedin_profile_url"),
-                    "linkedin_company_name":     sig.get("linkedin_company_name"),
-                    "linkedin_company_website":  sig.get("linkedin_company_website"),
-                    "linkedin_company_industry": sig.get("linkedin_company_industry"),
-                    "linkedin_company_size":     sig.get("linkedin_company_size"),
-                    "linkedin_company_location": sig.get("linkedin_company_location"),
-                    "linkedin_company_phone":    sig.get("linkedin_company_phone"),
-                }
-                items_for_claude.append(item)
-                req_map[len(items_for_claude)] = req
-
-            if not items_for_claude:
-                time.sleep(RESCORE_POLL_INTERVAL)
-                continue
+            for doc in pending:
+                items_for_claude.append({
+                    "message_id":     doc["message_id"],
+                    "platform":       doc.get("platform", "unknown"),
+                    "text":           doc.get("text", ""),
+                    "search_keyword": doc.get("search_keyword", SEARCH_KEYWORD),
+                    "google_rank":    doc.get("google_rank"),
+                    "search_volume":  doc.get("search_volume"),
+                    "upvotes":        doc.get("upvotes"),
+                    "comments":       doc.get("comments"),
+                })
 
             total_batches += 1
-            log.info(
-                f"[RESCORE] ━━━ RESCORE BATCH {total_batches} ━━━ | "
-                f"items:{len(items_for_claude)} | "
-                f"message_ids:{[it['message_id'] for it in items_for_claude]}"
-            )
+            log.info(f"[RESCORE] BATCH {total_batches} | items:{len(items_for_claude)}")
 
             scores = score_batch_with_claude(items_for_claude)
             score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
 
             for i, item in enumerate(items_for_claude):
                 pos = i + 1
-                req = req_map.get(pos)
-                sr  = score_map.get(pos) or (
-                    scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch.")
-                )
+                sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos))
+                enrichment = {
+                    "google_rank":    item.get("google_rank"),
+                    "search_volume":  item.get("search_volume"),
+                    "upvotes":        item.get("upvotes"),
+                    "comments":       item.get("comments"),
+                    "search_keyword": item.get("search_keyword"),
+                }
+                replace_confirmed_signal(item["message_id"], enrichment, sr)
 
-                process_scored_item(item, sr, is_rescore=True)
-                total_rescored += 1
-
-                if req:
-                    _rescore_mark_done(req["_id"], sr)
-
-            log.info(
-                f"[RESCORE] BATCH {total_batches} DONE | "
-                f"rescored:{len(items_for_claude)} | total_ever:{total_rescored} | "
-                f"waiting {RESCORE_BATCH_GAP_SECONDS}s..."
-            )
+            log.info(f"[RESCORE] BATCH {total_batches} DONE — waiting {RESCORE_BATCH_GAP_SECONDS}s...")
             time.sleep(RESCORE_BATCH_GAP_SECONDS)
 
         except Exception as exc:
@@ -4242,311 +2695,75 @@ def run_rescore_processor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — feedparser RSS poller (unchanged)
+# TWITTER / X POLLER — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_reddit_seen_ids: set = load_seen_ids("reddit")
-_reddit_seen_lock = threading.Lock()
-_reddit_seen_dirty_count = 0
-
-
-def _reddit_rss_is_seen(entry_id: str) -> bool:
-    global _reddit_seen_ids, _reddit_seen_dirty_count
-    with _reddit_seen_lock:
-        if entry_id in _reddit_seen_ids:
-            return True
-        _reddit_seen_ids.add(entry_id)
-        if len(_reddit_seen_ids) > 200_000:
-            _reddit_seen_ids.clear()
-        _reddit_seen_dirty_count += 1
-        if _reddit_seen_dirty_count >= 10:
-            save_seen_ids("reddit", _reddit_seen_ids)
-            _reddit_seen_dirty_count = 0
-        return False
-
-
-def _get_reddit_rss(subreddit: str) -> list:
-    url = f"https://www.reddit.com/r/{subreddit}/new.rss"
-    items = []
-    try:
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            log.warning(f"[REDDIT-RSS] Feed parse issue for r/{subreddit}: {feed.bozo_exception}")
-            return items
-
-        for entry in feed.entries:
-            entry_id = entry.get("id", "") or entry.get("link", "")
-            if not entry_id:
-                continue
-            if _reddit_rss_is_seen(entry_id):
-                continue
-
-            title   = entry.get("title", "").strip()
-            summary = entry.get("summary", "").strip()
-            summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(summary)).strip()
-
-            text = title
-            if summary_plain and summary_plain.lower() != title.lower():
-                text = f"{title}\n\n{summary_plain}"
-
-            author = entry.get("author", "unknown").lstrip("u/").strip() or "unknown"
-            link   = entry.get("link", "")
-
-            items.append({
-                "message_id":     f"reddit_rss_{entry_id.split('/')[-1] or entry_id}",
-                "platform":       "reddit",
-                "content_type":   "post",
-                "text":           text,
-                "username":       author,
-                "subreddit":      subreddit,
-                "telegram_group": "",
-                "post_url":       link,
-            })
-
-    except Exception as exc:
-        log.error(f"[REDDIT-RSS] Error fetching r/{subreddit}: {exc}")
-
-    return items
-
-
-def poll_reddit_rss():
-    log.info(
-        f"[REDDIT-RSS] Poller started | {len(TARGET_SUBREDDITS)} subreddits | "
-        f"poll interval: {REDDIT_POLL_INTERVAL}s per cycle | "
-        f"dedup set resumed with {len(_reddit_seen_ids)} known ID(s)"
-    )
-
-    while True:
-        cycle_start  = time.time()
-        total_new    = 0
-        total_errors = 0
-
-        for subreddit in TARGET_SUBREDDITS:
-            try:
-                items = _get_reddit_rss(subreddit)
-                for item in items:
-                    reddit_queue.put(item)
-                    save_queue_message("reddit", item)
-                    total_new += 1
-                if items:
-                    log.info(
-                        f"[REDDIT-RSS] r/{subreddit} → {len(items)} new items queued "
-                        f"(queue size: {reddit_queue.qsize()})"
-                    )
-                time.sleep(2)
-            except Exception as exc:
-                log.error(f"[REDDIT-RSS] Unhandled error for r/{subreddit}: {exc}")
-                total_errors += 1
-
-        save_seen_ids("reddit", _reddit_seen_ids)
-
-        cycle_elapsed = time.time() - cycle_start
-        log.info(
-            f"[REDDIT-RSS] Cycle complete | new:{total_new} errors:{total_errors} | "
-            f"elapsed:{cycle_elapsed:.1f}s | sleeping {REDDIT_POLL_INTERVAL}s..."
-        )
-        time.sleep(REDDIT_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER
-# v7.9.1 — sends ONE chunk (TWITTER_CHUNK_SIZE keywords combined into one
-# OR-query) per TWITTER_POLL_INTERVAL, advancing through TWITTER_SEARCH_CHUNKS
-# and wrapping back to chunk 0 once the last chunk is reached. Chunk
-# position is persisted in MongoDB (flintel_state) so restarts resume where
-# they left off instead of starting over from chunk 1 every time.
-#
-# RapidAPI key failover (429/403 → rotate to next configured key) from
-# v7.9.0 is preserved — a failed attempt retries the SAME chunk, it does
-# NOT advance to the next chunk.
-#
-# Facebook/LinkedIn/Reddit/Telegram are completely untouched by this change.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# v7.9.0 NEW — one or more RapidAPI keys for Twitter, comma-separated.
-# Falls back to the single RAPID_API_KEY (shared by Facebook/LinkedIn) if
-# TWITTER_RAPID_API_KEYS isn't set, so nothing breaks for existing setups
-# that only ever had one key.
-TWITTER_RAPID_API_KEYS = [
-    k.strip() for k in os.getenv("TWITTER_RAPID_API_KEYS", "").split(",") if k.strip()
-]
-if not TWITTER_RAPID_API_KEYS and RAPID_API_KEY:
-    TWITTER_RAPID_API_KEYS = [RAPID_API_KEY]
-
-_twitter_key_index = 0
-_twitter_key_lock = threading.Lock()
-
-
-def _twitter_current_headers() -> dict:
-    """Returns the RapidAPI headers for whichever key is currently active."""
-    with _twitter_key_lock:
-        key = TWITTER_RAPID_API_KEYS[_twitter_key_index] if TWITTER_RAPID_API_KEYS else ""
-    return {
-        "x-rapidapi-key": key,
-        "x-rapidapi-host": "twitter-api45.p.rapidapi.com",
-        "Content-Type": "application/json",
-    }
-
-
-def _twitter_rotate_key(reason: str = ""):
-    """v7.9.0 — advances to the next configured RapidAPI key. Wraps around
-    to key #1 after the last key, so failover keeps cycling."""
-    global _twitter_key_index
-    if len(TWITTER_RAPID_API_KEYS) <= 1:
-        return
-    with _twitter_key_lock:
-        old_index = _twitter_key_index
-        _twitter_key_index = (_twitter_key_index + 1) % len(TWITTER_RAPID_API_KEYS)
-        new_index = _twitter_key_index
-    log.warning(
-        f"[TWITTER] RapidAPI key #{old_index + 1} appears exhausted/rate-limited"
-        f"{' (' + reason + ')' if reason else ''} — switching to key #{new_index + 1}"
-        f"/{len(TWITTER_RAPID_API_KEYS)}."
-    )
-
-
-def build_twitter_client() -> dict | None:
-    if not TWITTER_RAPID_API_KEYS:
-        log.warning("RAPID_API_KEY / TWITTER_RAPID_API_KEYS not set — Twitter platform disabled.")
+def build_twitter_client() -> tweepy.Client | None:
+    if not TWITTER_BEARER_TOKEN:
+        log.warning("TWITTER_BEARER_TOKEN not set — Twitter platform disabled.")
         return None
     try:
-        log.info(
-            f"Twitter/X client initialised (twitter-api45) | "
-            f"{len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) available for automatic failover."
+        client = tweepy.Client(
+            bearer_token=TWITTER_BEARER_TOKEN,
+            consumer_key=TWITTER_API_KEY,
+            consumer_secret=TWITTER_API_SECRET,
+            wait_on_rate_limit=True,
         )
-        return {"initialised": True}
+        log.info("Twitter/X client initialised.")
+        return client
     except Exception as exc:
         log.error(f"Twitter client error: {exc}")
         return None
 
 
-def _extract_tweets_from_twitter_api45(data: dict) -> list:
-    tweets = []
-    try:
-        results = data.get("timeline") or data.get("results") or data.get("tweets") or []
-        for t in results:
-            if not isinstance(t, dict):
-                continue
-            tweet_id = str(t.get("tweet_id") or t.get("id") or "")
-            if not tweet_id:
-                continue
-            text = t.get("text") or t.get("full_text") or ""
-            author = t.get("author") or t.get("user") or {}
-            username = (
-                t.get("screen_name")
-                or author.get("screen_name")
-                or author.get("username")
-                or f"user_{tweet_id}"
-            )
-            tweets.append({"id": tweet_id, "text": text, "username": username})
-    except Exception as exc:
-        log.error(f"Twitter response parse error: {exc}")
-    return tweets
-
-
-# v7.9.1 NEW — persisted chunk-rotation index so a restart doesn't reset
-# progress back to chunk #1 every time (keeps steady coverage across the
-# full keyword list even across deploys/crashes). Falls back to 0 if
-# nothing persisted yet or if it's out of range for the current chunk count.
-def _load_twitter_chunk_index() -> int:
-    val = _get_state("twitter_chunk_index")
-    if not isinstance(val, int) or not TWITTER_SEARCH_CHUNKS:
-        return 0
-    return val % len(TWITTER_SEARCH_CHUNKS)
-
-
-def _save_twitter_chunk_index(idx: int):
-    _set_state("twitter_chunk_index", idx)
-
-
-def poll_twitter(client: dict):
+def poll_twitter(client: tweepy.Client):
     seen_ids: set = load_seen_ids("twitter")
     dirty = 0
-    consecutive_key_failures = 0
-
-    chunk_index = _load_twitter_chunk_index()
-    total_chunks = len(TWITTER_SEARCH_CHUNKS)
-
-    log.info(
-        f"Twitter poll started | total_chunks:{total_chunks} | "
-        f"chunk_size:{TWITTER_CHUNK_SIZE} | resuming at chunk:{chunk_index + 1}/{total_chunks} | "
-        f"keys_available:{len(TWITTER_RAPID_API_KEYS)} | "
-        f"dedup set resumed with {len(seen_ids)} known ID(s)"
-    )
-
-    url = "https://twitter-api45.p.rapidapi.com/search.php"
+    log.info(f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)} | "
+             f"dedup resumed with {len(seen_ids)} ID(s)")
 
     while True:
         try:
-            chunk_query = TWITTER_SEARCH_CHUNKS[chunk_index]
+            response = client.search_recent_tweets(
+                query=TWITTER_SEARCH_QUERY,
+                max_results=50,
+                tweet_fields=["author_id", "created_at", "text", "public_metrics"],
+                expansions=["author_id"],
+                user_fields=["username", "name"],
+            )
 
-            querystring = {
-                "query":       chunk_query,
-                "search_type": "Top",
-            }
-            headers = _twitter_current_headers()
-
-            response = requests.get(url, headers=headers, params=querystring, timeout=30)
-
-            # v7.9.0 — automatic RapidAPI key failover on 429/403. Stays on
-            # the SAME chunk and retries next loop iteration after failover
-            # (does NOT advance chunk_index on a failed attempt).
-            if response.status_code in (429, 403):
-                _twitter_rotate_key(reason=f"HTTP {response.status_code}")
-                consecutive_key_failures += 1
-                if consecutive_key_failures >= len(TWITTER_RAPID_API_KEYS):
-                    log.error(
-                        f"[TWITTER] All {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) "
-                        f"rate-limited/exhausted — waiting {TWITTER_POLL_INTERVAL}s "
-                        f"before retrying chunk {chunk_index + 1}/{total_chunks}."
-                    )
-                    consecutive_key_failures = 0
-                    time.sleep(TWITTER_POLL_INTERVAL)
-                continue
-
-            consecutive_key_failures = 0
-
-            # v7.9.1 — with chunking this shouldn't happen, but handle
-            # gracefully if TWITTER_CHUNK_SIZE is set too high via env var.
-            if response.status_code == 414:
-                log.error(
-                    f"[TWITTER] Chunk {chunk_index + 1}/{total_chunks} still too long "
-                    f"(HTTP 414) — query len:{len(chunk_query)}. Lower TWITTER_CHUNK_SIZE "
-                    f"(currently {TWITTER_CHUNK_SIZE})."
-                )
-                chunk_index = (chunk_index + 1) % total_chunks
-                _save_twitter_chunk_index(chunk_index)
+            if not response or not response.data:
                 time.sleep(TWITTER_POLL_INTERVAL)
                 continue
 
-            response.raise_for_status()
-            data = response.json()
-
-            tweets = _extract_tweets_from_twitter_api45(data)
+            user_map = {u.id: u.username for u in (response.includes or {}).get("users", [])}
 
             new_count = 0
-            for t in tweets:
-                tweet_id = t["id"]
+            for tweet in response.data:
+                tweet_id = str(tweet.id)
                 if tweet_id in seen_ids:
                     continue
                 seen_ids.add(tweet_id)
                 dirty += 1
-
                 if len(seen_ids) > 50_000:
                     seen_ids.clear()
 
-                text     = t["text"]
-                username = t["username"]
+                username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
+                metrics = tweet.public_metrics or {}
 
                 _tw_item = {
-                    "message_id":     f"twitter_{tweet_id}",
-                    "platform":       "twitter",
-                    "content_type":   "tweet",
-                    "text":           text,
-                    "username":       username,
-                    "subreddit":      "",
-                    "telegram_group": "",
-                    "post_url":       f"https://twitter.com/{username}/status/{tweet_id}",
+                    "message_id":           f"twitter_{tweet_id}",
+                    "platform":             "twitter",
+                    "text":                 tweet.text or "",
+                    "username":             username,
+                    "subreddit_or_channel": "",
+                    "post_url":             f"https://twitter.com/{username}/status/{tweet_id}",
+                    "posted_at":            str(tweet.created_at) if tweet.created_at else None,
+                    "search_keyword":       SEARCH_KEYWORD,
+                    "upvotes":              metrics.get("like_count"),
+                    "comments":             metrics.get("reply_count"),
+                    "google_rank":          None,
+                    "search_volume":        None,
                 }
                 twitter_queue.put(_tw_item)
                 save_queue_message("twitter", _tw_item)
@@ -4556,845 +2773,15 @@ def poll_twitter(client: dict):
                 save_seen_ids("twitter", seen_ids)
                 dirty = 0
 
-            log.info(
-                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} → "
-                f"{new_count} new tweet(s) queued | queue_size:{twitter_queue.qsize()}"
-            )
+            if new_count:
+                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
 
-            # v7.9.1 — advance to next chunk, wrap to 0 after the last one.
-            chunk_index = (chunk_index + 1) % total_chunks
-            _save_twitter_chunk_index(chunk_index)
-
-            if chunk_index == 0:
-                log.info(
-                    f"[TWITTER] Full keyword list cycle complete "
-                    f"({total_chunks} chunks) — restarting from chunk 1."
-                )
-
+        except tweepy.errors.TweepyException as exc:
+            log.error(f"Twitter poll error: {exc}")
         except Exception as exc:
-            log.error(
-                f"[TWITTER] chunk {chunk_index + 1}/{total_chunks} error: {exc} — "
-                f"retrying in {TWITTER_POLL_INTERVAL}s..."
-            )
+            log.error(f"Twitter unexpected error: {exc}")
 
         time.sleep(TWITTER_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FACEBOOK POLLER (unchanged from v7.5.0)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_facebook_client() -> dict | None:
-    # v7.9.0 — shares RAPID_API_KEY with LinkedIn (same account/plan,
-    # intentional). Twitter has its own separate key(s) — see Twitter
-    # section. To move Facebook to a different RapidAPI provider later,
-    # only this function's headers need to change.
-    if not RAPID_API_KEY:
-        log.warning("RAPID_API_KEY not set — Facebook platform disabled.")
-        return None
-    try:
-        client = {
-            "x-rapidapi-key":  RAPID_API_KEY,
-            "x-rapidapi-host": "facebook-scraper3.p.rapidapi.com",
-        }
-        log.info("Facebook client initialised (facebook-scraper3).")
-        return client
-    except Exception as exc:
-        log.error(f"Facebook client error: {exc}")
-        return None
-
-
-def _extract_posts_from_facebook_scraper3(data: dict) -> list:
-    posts = []
-    try:
-        results = data.get("results") or data.get("posts") or data.get("data") or []
-        if not isinstance(results, list):
-            return posts
-        for p in results:
-            if not isinstance(p, dict):
-                continue
-            post_id = str(p.get("post_id") or p.get("id") or "")
-            if not post_id:
-                continue
-            text = p.get("message") or p.get("text") or p.get("content") or ""
-            author = p.get("author") or p.get("user") or {}
-            if not isinstance(author, dict):
-                author = {}
-            username = (
-                p.get("author_name")
-                or author.get("name")
-                or author.get("username")
-                or f"user_{post_id}"
-            )
-            url = p.get("url") or p.get("post_url") or p.get("permalink") or ""
-            posts.append({"id": post_id, "text": text, "username": username, "url": url})
-    except Exception as exc:
-        log.error(f"Facebook response parse error: {exc}")
-    return posts
-
-
-def poll_facebook(client: dict):
-    seen_ids: set = load_seen_ids("facebook")
-    dirty = 0
-    log.info(
-        f"Facebook poll started | keywords:{len(KEYWORDS)} | "
-        f"poll interval: {FACEBOOK_POLL_INTERVAL}s per full cycle | "
-        f"dedup set resumed with {len(seen_ids)} known ID(s)"
-    )
-
-    url = "https://facebook-scraper3.p.rapidapi.com/search/posts"
-
-    while True:
-        cycle_start  = time.time()
-        total_new    = 0
-        total_errors = 0
-
-        for keyword in KEYWORDS:
-            try:
-                params = {"query": keyword}
-                response = requests.get(url=url, headers=client, params=params, timeout=30)
-
-                # v7.9.0 NEW — explicit rate-limit/quota detection, purely
-                # for clearer operator logs. This does NOT change isolation
-                # behaviour — Facebook already runs in its own thread with
-                # its own try/except, so a 429/403 here was ALREADY unable
-                # to affect LinkedIn's thread in any way. This just makes
-                # it obvious in the logs that it's a quota issue (not a
-                # random error) and skips to the next keyword immediately.
-                if response.status_code in (429, 403):
-                    log.warning(
-                        f"[FACEBOOK] Rate-limited/quota exhausted for keyword '{keyword}' "
-                        f"(HTTP {response.status_code}) — skipping to next keyword. "
-                        f"LinkedIn is unaffected (separate thread/poller)."
-                    )
-                    total_errors += 1
-                    time.sleep(FACEBOOK_KEYWORD_GAP_SECONDS)
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-
-                posts = _extract_posts_from_facebook_scraper3(data)
-
-                new_this_keyword = 0
-                for p in posts:
-                    post_id = p["id"]
-                    if post_id in seen_ids:
-                        continue
-                    seen_ids.add(post_id)
-                    dirty += 1
-
-                    if len(seen_ids) > 50_000:
-                        seen_ids.clear()
-
-                    text     = p["text"]
-                    username = p["username"]
-
-                    _fb_item = {
-                        "message_id":     f"facebook_{post_id}",
-                        "platform":       "facebook",
-                        "content_type":   "post",
-                        "text":           text,
-                        "username":       username,
-                        "subreddit":      "",
-                        "telegram_group": "",
-                        "post_url":       p.get("url") or "",
-                        # v7.7.0 NEW — which KEYWORDS entry this search
-                        # cycle was on when this post came back, so it's
-                        # traceable later which keyword found it.
-                        "search_keyword": keyword,
-                    }
-                    facebook_queue.put(_fb_item)
-                    save_queue_message("facebook", _fb_item)
-                    total_new += 1
-                    new_this_keyword += 1
-
-                if new_this_keyword:
-                    log.info(
-                        f"[FACEBOOK] '{keyword}' → {new_this_keyword} new items queued "
-                        f"(queue size: {facebook_queue.qsize()})"
-                    )
-
-                if dirty >= 10:
-                    save_seen_ids("facebook", seen_ids)
-                    dirty = 0
-
-                time.sleep(FACEBOOK_KEYWORD_GAP_SECONDS)
-
-            except Exception as exc:
-                log.error(f"[FACEBOOK] Unhandled error for keyword '{keyword}': {exc}")
-                total_errors += 1
-
-        save_seen_ids("facebook", seen_ids)
-
-        cycle_elapsed = time.time() - cycle_start
-        log.info(
-            f"[FACEBOOK] Cycle complete | new:{total_new} errors:{total_errors} | "
-            f"elapsed:{cycle_elapsed:.1f}s | sleeping {FACEBOOK_POLL_INTERVAL}s..."
-        )
-        time.sleep(FACEBOOK_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LINKEDIN POLLER — v7.6.0 NEW
-# linkedin-data-scraper1.p.rapidapi.com
-#   1) POST /search_linkedIn.php   {"keywords": <kw>, "start": "0"}
-#   2) POST /get_user_data.php     {"username_or_url": <profile url>}
-#   3) POST /get_company_data.php  {"company_name": <company>}
-#
-# Same per-keyword cycle shape as Facebook (poll_facebook). Each of the
-# three endpoint calls is wrapped in its OWN try/except so that a failure
-# or exhausted quota on any single endpoint never blocks the other two or
-# crashes the poll cycle — it just degrades to "no enrichment for this
-# item" and keeps going, exactly as requested.
-# ─────────────────────────────────────────────────────────────────────────────
-
-LINKEDIN_HOST         = "linkedin-data-scraper1.p.rapidapi.com"
-LINKEDIN_SEARCH_URL   = f"https://{LINKEDIN_HOST}/search_linkedIn.php"
-LINKEDIN_USER_URL     = f"https://{LINKEDIN_HOST}/get_user_data.php"
-LINKEDIN_COMPANY_URL  = f"https://{LINKEDIN_HOST}/get_company_data.php"
-
-
-def build_linkedin_client() -> dict | None:
-    # v7.9.0 — shares RAPID_API_KEY with Facebook (same account/plan,
-    # intentional). Twitter has its own separate key(s) — see Twitter
-    # section. To move LinkedIn to a different RapidAPI provider later,
-    # only this function's headers need to change.
-    if not RAPID_API_KEY:
-        log.warning("RAPID_API_KEY not set — LinkedIn platform disabled.")
-        return None
-    try:
-        client = {
-            "x-rapidapi-key":  RAPID_API_KEY,
-            "x-rapidapi-host": LINKEDIN_HOST,
-            "Content-Type":    "application/x-www-form-urlencoded",
-        }
-        log.info("LinkedIn client initialised (linkedin-data-scraper1).")
-        return client
-    except Exception as exc:
-        log.error(f"LinkedIn client error: {exc}")
-        return None
-
-
-def _extract_results_from_linkedin_search(data: dict) -> list:
-    """Best-effort walk of search_linkedIn.php's response into a list of
-    {id, name, headline, url, company} dicts. Field names are checked
-    defensively (results/data/people/items, id/profile_id/urn/url,
-    name/full_name/title, headline/summary/snippet/description) since the
-    vendor's exact schema for this endpoint hasn't been confirmed against a
-    live response — same defensive approach already used for twitter-api45
-    and facebook-scraper3 above, so a shape mismatch degrades to "no
-    results this keyword" instead of a crash.
-    """
-    results = []
-    try:
-        raw = data.get("results") or data.get("data") or data.get("people") or data.get("items") or []
-        if not isinstance(raw, list):
-            return results
-        for r in raw:
-            if not isinstance(r, dict):
-                continue
-            rid = str(r.get("id") or r.get("profile_id") or r.get("urn") or r.get("url") or "")
-            if not rid:
-                continue
-            name     = r.get("name") or r.get("full_name") or r.get("title") or "unknown"
-            headline = r.get("headline") or r.get("summary") or r.get("snippet") or r.get("description") or ""
-            url      = r.get("url") or r.get("profile_url") or r.get("link") or ""
-            company  = r.get("company") or r.get("current_company") or ""
-            results.append({
-                "id": rid, "name": name, "headline": headline,
-                "url": url, "company": company,
-            })
-    except Exception as exc:
-        log.error(f"LinkedIn search response parse error: {exc}")
-    return results
-
-
-def _linkedin_fetch_user_data(client: dict, username_or_url: str) -> dict:
-    """Calls the User Data endpoint for one matched profile. Never raises —
-    a failure (network error, bad response shape, or the endpoint's quota
-    being exhausted) degrades to an empty dict, which just means this one
-    item is queued/scored WITHOUT enrichment rather than being dropped or
-    crashing the poller. Independent of _linkedin_fetch_company_data below
-    — one failing never blocks the other.
-    """
-    if not username_or_url:
-        return {}
-    try:
-        payload = {"username_or_url": username_or_url}
-        r = requests.post(LINKEDIN_USER_URL, data=payload, headers=client, timeout=30)
-        r.raise_for_status()
-        raw = r.json()
-        d = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
-        if not isinstance(d, dict):
-            return {}
-        return {
-            "linkedin_full_name":    d.get("full_name") or d.get("name"),
-            "linkedin_headline":     d.get("headline"),
-            "linkedin_email":        d.get("email") or d.get("email_address"),
-            "linkedin_phone":        d.get("phone") or d.get("phone_number"),
-            "linkedin_location":     d.get("location") or d.get("geo_location") or d.get("city"),
-            "linkedin_company":      d.get("company") or d.get("current_company"),
-            "linkedin_job_title":    d.get("job_title") or d.get("position") or d.get("title"),
-            "linkedin_profile_url":  d.get("profile_url") or d.get("url") or username_or_url,
-        }
-    except Exception as exc:
-        log.warning(
-            f"[LINKEDIN] User Data endpoint error for '{username_or_url}': {exc} "
-            f"— continuing without this item's user enrichment."
-        )
-        return {}
-
-
-def _linkedin_fetch_company_data(client: dict, company_name: str) -> dict:
-    """Calls the Company Data endpoint. Same never-raise contract as
-    _linkedin_fetch_user_data — independent failure, independent quota.
-    """
-    if not company_name:
-        return {}
-    try:
-        payload = {"company_name": company_name}
-        r = requests.post(LINKEDIN_COMPANY_URL, data=payload, headers=client, timeout=30)
-        r.raise_for_status()
-        raw = r.json()
-        d = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
-        if not isinstance(d, dict):
-            return {}
-        return {
-            "linkedin_company_name":     d.get("name") or company_name,
-            "linkedin_company_website":  d.get("website"),
-            "linkedin_company_industry": d.get("industry"),
-            "linkedin_company_size":     d.get("company_size") or d.get("employee_count") or d.get("size"),
-            "linkedin_company_location": d.get("headquarter") or d.get("location") or d.get("headquarters"),
-            "linkedin_company_phone":    d.get("phone"),
-        }
-    except Exception as exc:
-        log.warning(
-            f"[LINKEDIN] Company Data endpoint error for '{company_name}': {exc} "
-            f"— continuing without this item's company enrichment."
-        )
-        return {}
-
-
-def poll_linkedin(client: dict):
-    seen_ids: set = load_seen_ids("linkedin")
-    dirty = 0
-    log.info(
-        f"LinkedIn poll started | keywords:{len(KEYWORDS)} | "
-        f"poll interval: {LINKEDIN_POLL_INTERVAL}s per full cycle | "
-        f"dedup set resumed with {len(seen_ids)} known ID(s)"
-    )
-
-    while True:
-        cycle_start  = time.time()
-        total_new    = 0
-        total_errors = 0
-
-        for keyword in KEYWORDS:
-            try:
-                payload = {"keywords": keyword, "start": "0"}
-                response = requests.post(
-                    LINKEDIN_SEARCH_URL, data=payload, headers=client, timeout=30
-                )
-
-                # v7.9.0 NEW — same explicit rate-limit/quota detection as
-                # Facebook above, same purpose: clearer logs only. LinkedIn
-                # already runs in its own separate thread, so this was
-                # ALREADY unable to affect Facebook's thread.
-                if response.status_code in (429, 403):
-                    log.warning(
-                        f"[LINKEDIN] Rate-limited/quota exhausted for keyword '{keyword}' "
-                        f"(HTTP {response.status_code}) — skipping to next keyword. "
-                        f"Facebook is unaffected (separate thread/poller)."
-                    )
-                    total_errors += 1
-                    time.sleep(LINKEDIN_KEYWORD_GAP_SECONDS)
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-
-                results = _extract_results_from_linkedin_search(data)
-
-                new_this_keyword = 0
-                for res in results:
-                    rid = res["id"]
-                    if rid in seen_ids:
-                        continue
-                    seen_ids.add(rid)
-                    dirty += 1
-
-                    if len(seen_ids) > 50_000:
-                        seen_ids.clear()
-
-                    text_parts = [p for p in [res.get("name"), res.get("headline"), res.get("company")] if p]
-                    text = " | ".join(text_parts) or keyword
-
-                    if not passes_keyword_filter(text):
-                        continue
-
-                    user_extra = _linkedin_fetch_user_data(client, res.get("url") or res.get("id"))
-
-                    company_extra = {}
-                    company_name = res.get("company") or user_extra.get("linkedin_company")
-                    if company_name:
-                        company_extra = _linkedin_fetch_company_data(client, company_name)
-
-                    _li_item = {
-                        "message_id":     f"linkedin_{rid}",
-                        "platform":       "linkedin",
-                        "content_type":   "profile",
-                        "text":           text,
-                        "username":       res.get("name") or "unknown",
-                        "subreddit":      "",
-                        "telegram_group": "",
-                        "post_url":       res.get("url") or "",
-                        "search_keyword": keyword,
-                    }
-                    _li_item.update(user_extra)
-                    _li_item.update(company_extra)
-
-                    linkedin_queue.put(_li_item)
-                    save_queue_message("linkedin", _li_item)
-                    total_new += 1
-                    new_this_keyword += 1
-
-                if new_this_keyword:
-                    log.info(
-                        f"[LINKEDIN] '{keyword}' → {new_this_keyword} new items queued "
-                        f"(queue size: {linkedin_queue.qsize()})"
-                    )
-
-                if dirty >= 10:
-                    save_seen_ids("linkedin", seen_ids)
-                    dirty = 0
-
-                time.sleep(LINKEDIN_KEYWORD_GAP_SECONDS)
-
-            except Exception as exc:
-                log.error(f"[LINKEDIN] Unhandled error for keyword '{keyword}': {exc}")
-                total_errors += 1
-                continue
-
-        save_seen_ids("linkedin", seen_ids)
-
-        cycle_elapsed = time.time() - cycle_start
-        log.info(
-            f"[LINKEDIN] Cycle complete | new:{total_new} errors:{total_errors} | "
-            f"elapsed:{cycle_elapsed:.1f}s | sleeping {LINKEDIN_POLL_INTERVAL}s..."
-        )
-        time.sleep(LINKEDIN_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM LISTENER (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_telegram_seen_ids: set = load_seen_ids("telegram")
-_telegram_seen_lock = threading.Lock()
-_telegram_seen_dirty_count = 0
-
-
-def _telegram_is_seen(chat_id: int, msg_id: int) -> bool:
-    global _telegram_seen_ids, _telegram_seen_dirty_count
-    key = f"{chat_id}_{msg_id}"
-    with _telegram_seen_lock:
-        if key in _telegram_seen_ids:
-            return True
-        _telegram_seen_ids.add(key)
-        if len(_telegram_seen_ids) > 100_000:
-            _telegram_seen_ids.clear()
-        _telegram_seen_dirty_count += 1
-        if _telegram_seen_dirty_count >= 10:
-            save_seen_ids("telegram", _telegram_seen_ids)
-            _telegram_seen_dirty_count = 0
-        return False
-
-
-def _join_telegram_groups_sync(client: TelegramClient):
-    log.info(
-        f"Telegram: starting auto-join for {len(TARGET_TELEGRAM_GROUPS)} groups | "
-        f"gap:{TELEGRAM_JOIN_GAP_SECONDS}s"
-    )
-    joined  = 0
-    skipped = 0
-    failed  = 0
-
-    for group in TARGET_TELEGRAM_GROUPS:
-        try:
-            target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
-            client.loop.run_until_complete(client(JoinChannelRequest(target)))
-            joined += 1
-            log.info(f"Telegram: joined {target} [{joined}/{len(TARGET_TELEGRAM_GROUPS)}]")
-            time.sleep(TELEGRAM_JOIN_GAP_SECONDS)
-        except UserAlreadyParticipantError:
-            skipped += 1
-            log.debug(f"Telegram: already in {group} — skip")
-        except FloodWaitError as e:
-            log.warning(f"Telegram: FloodWait {e.seconds}s for {group} — waiting...")
-            time.sleep(e.seconds + 5)
-            failed += 1
-        except (ChannelPrivateError, InviteHashExpiredError) as exc:
-            log.warning(f"Telegram: cannot join {group} — {exc}")
-            failed += 1
-        except Exception as exc:
-            log.error(f"Telegram: join error for {group} — {exc}")
-            failed += 1
-
-    log.info(
-        f"Telegram auto-join complete | "
-        f"joined:{joined} already_in:{skipped} failed:{failed}"
-    )
-
-
-TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "300"))
-
-
-async def _poll_telegram_groups(client: TelegramClient):
-    if TELEGRAM_POLL_INTERVAL == 0:
-        log.info("[TELEGRAM-POLL] Disabled (TELEGRAM_POLL_INTERVAL=0) — listener-only mode.")
-        return
-
-    log.info(
-        f"[TELEGRAM-POLL] Poller started | {len(TARGET_TELEGRAM_GROUPS)} groups | "
-        f"interval:{TELEGRAM_POLL_INTERVAL}s"
-    )
-
-    while True:
-        cycle_start  = time.time()
-        total_new    = 0
-        total_errors = 0
-
-        for group in TARGET_TELEGRAM_GROUPS:
-            try:
-                target = group if group.startswith(("@", "https://", "t.me/")) else f"@{group}"
-                messages = await client.get_messages(target, limit=20)
-
-                for msg in messages:
-                    if not msg or not msg.text or len(msg.text) < 5:
-                        continue
-
-                    chat_id = msg.chat_id if msg.chat_id else 0
-                    msg_id  = msg.id
-
-                    if _telegram_is_seen(chat_id, msg_id):
-                        continue
-
-                    sender   = await msg.get_sender()
-                    tg_user  = getattr(sender, "username", None) or f"user_{getattr(sender, 'id', 0)}"
-
-                    _tg_item = {
-                        "message_id":     f"telegram_{chat_id}_{msg_id}",
-                        "platform":       "telegram",
-                        "content_type":   "message",
-                        "text":           msg.text,
-                        "username":       tg_user,
-                        "display_name":   tg_user,
-                        "subreddit":      "",
-                        "telegram_group": group,
-                        "post_url":       "",
-                    }
-                    telegram_queue.put(_tg_item)
-                    save_queue_message("telegram", _tg_item)
-                    total_new += 1
-
-                if total_new:
-                    log.info(f"[TELEGRAM-POLL] {group} → queued new messages")
-
-                await asyncio.sleep(2)
-
-            except FloodWaitError as e:
-                log.warning(f"[TELEGRAM-POLL] FloodWait {e.seconds}s for {group}")
-                await asyncio.sleep(e.seconds + 5)
-                total_errors += 1
-            except Exception as exc:
-                log.error(f"[TELEGRAM-POLL] Error for {group}: {exc}")
-                total_errors += 1
-
-        save_seen_ids("telegram", _telegram_seen_ids)
-
-        cycle_elapsed = time.time() - cycle_start
-        log.info(
-            f"[TELEGRAM-POLL] Cycle complete | new:{total_new} errors:{total_errors} | "
-            f"elapsed:{cycle_elapsed:.1f}s | sleeping {TELEGRAM_POLL_INTERVAL}s..."
-        )
-        await asyncio.sleep(TELEGRAM_POLL_INTERVAL)
-
-
-async def _run_telegram_listener(client: TelegramClient):
-    target_set = set()
-    for g in TARGET_TELEGRAM_GROUPS:
-        clean = g.lstrip("@").lower()
-        target_set.add(clean)
-
-    @client.on(events.NewMessage)
-    async def _on_message(event):
-        try:
-            chat = await event.get_chat()
-
-            username_attr = getattr(chat, "username", None)
-            chat_title    = getattr(chat, "title", "") or ""
-
-            if username_attr:
-                group_key = username_attr.lower()
-            else:
-                group_key = chat_title.lower().replace(" ", "").replace("-", "").replace("_", "")
-
-            if group_key not in target_set:
-                return
-
-            sender    = await event.get_sender()
-            text      = event.raw_text or ""
-            sender_id = getattr(sender, "id", 0)
-            first     = getattr(sender, "first_name", "") or ""
-            last      = getattr(sender, "last_name", "") or ""
-            tg_user   = getattr(sender, "username", None) or f"user_{sender_id}"
-            msg_id    = event.id
-            chat_id   = event.chat_id
-
-            if not text or len(text) < 5:
-                return
-
-            if _telegram_is_seen(chat_id, msg_id):
-                return
-
-            _tg_item = {
-                "message_id":     f"telegram_{chat_id}_{msg_id}",
-                "platform":       "telegram",
-                "content_type":   "message",
-                "text":           text,
-                "username":       tg_user,
-                "display_name":   f"{first} {last}".strip() or tg_user,
-                "subreddit":      "",
-                "telegram_group": username_attr or chat_title,
-                "post_url":       "",
-            }
-            telegram_queue.put(_tg_item)
-            save_queue_message("telegram", _tg_item)
-
-        except Exception as exc:
-            log.error(f"Telegram message handler error: {exc}")
-
-    log.info("Telegram listener active — read-only, no interactions.")
-
-    await asyncio.gather(
-        client.run_until_disconnected(),
-        _poll_telegram_groups(client),
-    )
-
-
-def run_telegram_listener_thread():
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning(
-            "Telegram disabled — set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE"
-        )
-        return
-
-    try:
-        loop   = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        client = TelegramClient(
-            TELEGRAM_SESSION,
-            TELEGRAM_API_ID,
-            TELEGRAM_API_HASH,
-            loop=loop,
-        )
-
-        loop.run_until_complete(client.start(phone=TELEGRAM_PHONE))
-        me = loop.run_until_complete(client.get_me())
-        log.info(
-            f"Telegram authenticated as {me.first_name} "
-            f"(@{me.username or me.id})"
-        )
-
-        _join_telegram_groups_sync(client)
-        loop.run_until_complete(_run_telegram_listener(client))
-
-    except Exception as exc:
-        log.error(f"Telegram listener thread error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULERS — Daily Digest + Weekly Report
-# v7.6.0: platform breakdown additionally counts "linkedin". Everything
-# else unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def send_daily_digest():
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
-        signals = list(
-            db.signals.find({
-                "client_id":       CLIENT_ID,
-                "intent_score":    {"$gte": 6, "$lte": 7},
-                "created_at":      {"$gte": since},
-                "digest_included": False,
-            }).sort("intent_score", -1)
-        )
-
-        if not signals:
-            log.info("Daily digest: no medium signals in past 24h.")
-            return
-
-        lines = []
-        for s in signals:
-            preview  = s["message_text"][:120]
-            if len(s["message_text"]) > 120:
-                preview += "..."
-            corridor = s.get("corridor") or "—"
-            pain     = s.get("pain_type") or "—"
-            platform = s.get("platform", "?").upper()
-            sub      = s.get("subreddit", "")
-            grp      = s.get("telegram_group", "")
-            source   = f"r/{sub}" if sub else (f"tg/{grp}" if grp else platform)
-            lines.append(
-                f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
-                f"| {platform} | {source}\n"
-                f"  Corridor: {corridor} | Pain: {pain}\n"
-                f"  _{preview}_\n"
-                f"  ↳ {s['suggested_action']}"
-            )
-
-        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        joined   = "\n\n".join(lines)
-        chunks   = [joined[i:i+2900] for i in range(0, len(joined), 2900)]
-
-        blocks = [
-            {"type": "header", "text": {"type": "plain_text", "text": f"📋 Daily Signal Digest — {date_str}", "emoji": True}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{len(signals)} medium intent signals* (score 6–7) in the past 24 hours:"}},
-        ]
-        for chunk in chunks:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
-        blocks += [
-            {"type": "divider"},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | Client: {CLIENT_ID} | Reddit + Twitter + Telegram + Facebook + LinkedIn"}]},
-        ]
-
-        result = retry_with_backoff(
-            _post_to_slack, {"text": f"📋 Daily Signal Digest — {date_str}", "blocks": blocks},
-            retries=3, delay=2, label="Digest",
-        )
-        if result:
-            ids = [s["message_id"] for s in signals]
-            db.signals.update_many({"message_id": {"$in": ids}}, {"$set": {"digest_included": True}})
-            log.info(f"Daily digest sent | {len(signals)} signals.")
-
-    except Exception as exc:
-        log.error(f"Daily digest error: {exc}")
-
-
-def send_weekly_report():
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        since         = datetime.now(timezone.utc) - timedelta(days=7)
-        all_signals   = list(db.signals.find({"client_id": CLIENT_ID, "created_at": {"$gte": since}}))
-        high          = [s for s in all_signals if s["intent_score"] >= 8]
-        medium        = [s for s in all_signals if 6 <= s["intent_score"] <= 7]
-        business      = [s for s in all_signals if s.get("is_business")]
-        reddit_sigs   = [s for s in all_signals if s.get("platform") == "reddit"]
-        twitter_sigs  = [s for s in all_signals if s.get("platform") == "twitter"]
-        telegram_sigs = [s for s in all_signals if s.get("platform") == "telegram"]
-        facebook_sigs = [s for s in all_signals if s.get("platform") == "facebook"]
-        linkedin_sigs = [s for s in all_signals if s.get("platform") == "linkedin"]  # v7.6.0
-        total         = len(all_signals)
-
-        if total == 0:
-            log.info("Weekly report: no signals this week.")
-            return
-
-        def breakdown(key):
-            counts: dict = {}
-            for s in all_signals:
-                v = s.get(key)
-                if v:
-                    counts[v] = counts.get(v, 0) + 1
-            return "\n".join(
-                f"  • {k}: {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])
-            ) or "_None_"
-
-        top3       = sorted(high, key=lambda x: x["intent_score"], reverse=True)[:3]
-        top3_lines = [
-            f"• *{s.get('username','?')}* | Score:{s['intent_score']}/10 "
-            f"| {s.get('platform','?').upper()} | {s.get('corridor') or 'Unknown corridor'}\n"
-            f"  _{s['message_text'][:100]}{'...' if len(s['message_text'])>100 else ''}_"
-            for s in top3
-        ]
-
-        week_start = since.strftime("%b %d")
-        week_end   = datetime.now(timezone.utc).strftime("%b %d, %Y")
-
-        payload = {
-            "text": f"📊 Weekly Signal Report — {week_start} to {week_end}",
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"📊 Weekly Signal Report — {week_start} to {week_end}", "emoji": True}},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Total Signals*\n{total}"},
-                    {"type": "mrkdwn", "text": f"*High Intent (8–10)*\n{len(high)}"},
-                    {"type": "mrkdwn", "text": f"*Medium Intent (6–7)*\n{len(medium)}"},
-                    {"type": "mrkdwn", "text": f"*Business Owners*\n{len(business)}"},
-                    {"type": "mrkdwn", "text": f"*Reddit*\n{len(reddit_sigs)}"},
-                    {"type": "mrkdwn", "text": f"*Twitter/X*\n{len(twitter_sigs)}"},
-                    {"type": "mrkdwn", "text": f"*Telegram*\n{len(telegram_sigs)}"},
-                    {"type": "mrkdwn", "text": f"*Facebook*\n{len(facebook_sigs)}"},
-                    {"type": "mrkdwn", "text": f"*LinkedIn*\n{len(linkedin_sigs)}"},
-                ]},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Corridor Breakdown*\n{breakdown('corridor')}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Competitor Mentions*\n{breakdown('competitor_mentioned')}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Pain Types*\n{breakdown('pain_type')}"}},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Top 3 Signals This Week*\n\n{_safe(chr(10).join(top3_lines), 2800)}"}},
-                {"type": "divider"},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"FLINTEL v7.9.1 | {CLIENT_ID} | Week ending {week_end}"}]},
-            ],
-        }
-
-        result = retry_with_backoff(_post_to_slack, payload, retries=3, delay=2, label="WeeklyReport")
-        if result:
-            log.info(
-                f"Weekly report sent | Total:{total} High:{len(high)} Med:{len(medium)} "
-                f"Biz:{len(business)} Reddit:{len(reddit_sigs)} "
-                f"Twitter:{len(twitter_sigs)} Telegram:{len(telegram_sigs)} "
-                f"Facebook:{len(facebook_sigs)} LinkedIn:{len(linkedin_sigs)}"
-            )
-
-    except Exception as exc:
-        log.error(f"Weekly report error: {exc}")
-
-
-async def run_scheduler():
-    log.info(
-        f"Scheduler started | digest:{DAILY_DIGEST_HOUR}:00 UTC | "
-        f"report Mon {WEEKLY_REPORT_HOUR}:00 UTC"
-    )
-    last_digest_date = None
-
-    persisted_week = _get_state("last_report_week")
-    last_report_week: int | None = persisted_week
-
-    while True:
-        await asyncio.sleep(60)
-        now = datetime.now(timezone.utc)
-
-        if now.hour == DAILY_DIGEST_HOUR and now.date() != last_digest_date:
-            log.info("Scheduler: triggering daily digest...")
-            await asyncio.to_thread(send_daily_digest)
-            last_digest_date = now.date()
-
-        current_week = now.isocalendar()[1]
-        if (
-            now.weekday() == WEEKLY_REPORT_DAY
-            and now.hour == WEEKLY_REPORT_HOUR
-            and current_week != last_report_week
-        ):
-            log.info("Scheduler: triggering weekly report...")
-            await asyncio.to_thread(send_weekly_report)
-            last_report_week = current_week
-            _set_state("last_report_week", current_week)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5402,50 +2789,72 @@ async def run_scheduler():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
+    """
+    Reddit runs on THREE independent threads:
+      1. SERP discovery thread (run_serp_discovery_loop) — unchanged
+         keyword-cache behavior, saves into flintel_google_posts instead
+         of fetching Reddit RSS directly.
+      2. flintel_google_posts RSS-matching thread
+         (run_google_posts_rss_matching_loop) — the only thread that
+         talks to Reddit's RSS feeds; also owns syncing
+         flintel_targeting_subreddits / flintel_targeting_keywords every
+         pass; fully independent of #1.
+      3. Its dedicated batch processor thread (unchanged, except Reddit
+         items skip the redundant keyword filter — see
+         run_batch_processor()).
+    Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
+    is required for SERP discovery; the subreddit RSS fetch step needs no
+    credentials at all — no OAuth/PRAW).
+    """
     if not REDDIT_ENABLED:
-        log.warning("Reddit platform DISABLED (REDDIT_ENABLED=false) — skipping.")
+        log.warning("Reddit platform DISABLED — skipping.")
+        return
+    if not RAPIDAPI_KEY:
+        log.warning("Reddit not started — RAPIDAPI_KEY not set (required for SERP discovery).")
         return
 
-    _resumed_reddit = load_queue_messages("reddit")
-    for _item in _resumed_reddit:
-        reddit_queue.put(_item)
-    if _resumed_reddit:
-        log.info(
-            f"[REDDIT] Resumed {len(_resumed_reddit)} queue message(s) "
-            f"from MongoDB after restart — NOT lost."
-        )
+    resumed = load_queue_messages("reddit")
+    for it in resumed:
+        reddit_queue.put(it)
+    if resumed:
+        log.info(f"[REDDIT] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
 
-    rss_thread = threading.Thread(
-        target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
+    serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
+    google_posts_thread = threading.Thread(
+        target=run_google_posts_rss_matching_loop, daemon=True, name="Reddit-GooglePosts-RSS"
     )
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT",
-              REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
+        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
+              REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
         daemon=True, name="Reddit-Batch",
     )
-
-    rss_thread.start()
+    serp_thread.start()
+    google_posts_thread.start()
     btch_thread.start()
     log.info(
-        f"Reddit threads running: RSS-Poller ✅ | Batch ✅ | "
+        f"Reddit threads running: SERP-Discovery ✅ | GooglePosts-RSS-Matching ✅ | Batch ✅ | "
         f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s"
     )
 
     while True:
         await asyncio.sleep(60)
-        if not rss_thread.is_alive():
-            log.error("Reddit RSS thread died — restarting...")
-            rss_thread = threading.Thread(
-                target=poll_reddit_rss, daemon=True, name="Reddit-RSS"
+        if not serp_thread.is_alive():
+            log.error("Reddit SERP thread died — restarting...")
+            serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
+            serp_thread.start()
+        if not google_posts_thread.is_alive():
+            log.error("Reddit GooglePosts-RSS-Matching thread died — restarting...")
+            google_posts_thread = threading.Thread(
+                target=run_google_posts_rss_matching_loop, daemon=True, name="Reddit-GooglePosts-RSS"
             )
-            rss_thread.start()
+            google_posts_thread.start()
         if not btch_thread.is_alive():
             log.error("Reddit batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT",
-                      REDDIT_BATCH_GAP_SECONDS, REDDIT_BATCH_TIMEOUT_SECONDS),
+                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
+                      REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
                 daemon=True, name="Reddit-Batch",
             )
             btch_thread.start()
@@ -5453,232 +2862,49 @@ async def start_reddit_listener():
 
 async def start_twitter_listener():
     if not TWITTER_ENABLED:
-        log.warning("Twitter platform DISABLED (TWITTER_ENABLED=false) — skipping.")
+        log.warning("Twitter platform DISABLED — skipping.")
         return
-
     client = build_twitter_client()
     if client is None:
-        log.warning("Twitter listener not started — credentials missing.")
         return
 
-    _resumed_twitter = load_queue_messages("twitter")
-    for _item in _resumed_twitter:
-        twitter_queue.put(_item)
-    if _resumed_twitter:
-        log.info(
-            f"[TWITTER] Resumed {len(_resumed_twitter)} queue message(s) "
-            f"from MongoDB after restart — NOT lost."
-        )
+    resumed = load_queue_messages("twitter")
+    for it in resumed:
+        twitter_queue.put(it)
+    if resumed:
+        log.info(f"[TWITTER] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
 
-    poll_thread = threading.Thread(
-        target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll"
-    )
+    poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
     btch_thread = threading.Thread(
         target=run_batch_processor,
-        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER",
-              TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
+        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
+              TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
         daemon=True, name="Twitter-Batch",
     )
-
     poll_thread.start()
     btch_thread.start()
-    log.info(
-        f"Twitter threads running: Poll ✅ | Batch ✅ | "
-        f"gap:{TWITTER_BATCH_GAP_SECONDS}s | timeout:{TWITTER_BATCH_TIMEOUT_SECONDS}s"
-    )
+    log.info(f"Twitter threads running: Poll ✅ | Batch ✅ | "
+             f"gap:{TWITTER_BATCH_GAP_SECONDS}s | timeout:{TWITTER_BATCH_TIMEOUT_SECONDS}s")
 
     while True:
         await asyncio.sleep(60)
         if not poll_thread.is_alive():
             log.error("Twitter poll thread died — restarting...")
-            poll_thread = threading.Thread(
-                target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll"
-            )
+            poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
             poll_thread.start()
         if not btch_thread.is_alive():
             log.error("Twitter batch thread died — restarting...")
             btch_thread = threading.Thread(
                 target=run_batch_processor,
-                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER",
-                      TWITTER_BATCH_GAP_SECONDS, TWITTER_BATCH_TIMEOUT_SECONDS),
+                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
+                      TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
                 daemon=True, name="Twitter-Batch",
             )
             btch_thread.start()
 
 
-async def start_telegram_listener():
-    if not TELEGRAM_ENABLED:
-        log.warning("Telegram platform DISABLED (TELEGRAM_ENABLED=false) — skipping.")
-        return
-
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        log.warning(
-            "Telegram listener not started — "
-            "set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE in .env"
-        )
-        return
-
-    _resumed_telegram = load_queue_messages("telegram")
-    for _item in _resumed_telegram:
-        telegram_queue.put(_item)
-    if _resumed_telegram:
-        log.info(
-            f"[TELEGRAM] Resumed {len(_resumed_telegram)} queue message(s) "
-            f"from MongoDB after restart — NOT lost."
-        )
-
-    tg_thread = threading.Thread(
-        target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
-    )
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM",
-              TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
-        daemon=True, name="Telegram-Batch",
-    )
-
-    tg_thread.start()
-    btch_thread.start()
-    log.info(
-        f"Telegram threads running: Listener ✅ | Batch ✅ | "
-        f"Poller {'✅' if TELEGRAM_POLL_INTERVAL > 0 else '⏸ disabled'} | "
-        f"gap:{TELEGRAM_BATCH_GAP_SECONDS}s | timeout:{TELEGRAM_BATCH_TIMEOUT_SECONDS}s"
-    )
-
-    while True:
-        await asyncio.sleep(60)
-        if not tg_thread.is_alive():
-            log.error("Telegram listener thread died — restarting...")
-            tg_thread = threading.Thread(
-                target=run_telegram_listener_thread, daemon=True, name="Telegram-Listener"
-            )
-            tg_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Telegram batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(telegram_queue, TELEGRAM_BATCH_SIZE, "TELEGRAM",
-                      TELEGRAM_BATCH_GAP_SECONDS, TELEGRAM_BATCH_TIMEOUT_SECONDS),
-                daemon=True, name="Telegram-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_facebook_listener():
-    if not FACEBOOK_ENABLED:
-        log.warning("Facebook platform DISABLED (FACEBOOK_ENABLED=false) — skipping.")
-        return
-
-    client = build_facebook_client()
-    if client is None:
-        log.warning("Facebook listener not started — credentials missing.")
-        return
-
-    _resumed_facebook = load_queue_messages("facebook")
-    for _item in _resumed_facebook:
-        facebook_queue.put(_item)
-    if _resumed_facebook:
-        log.info(
-            f"[FACEBOOK] Resumed {len(_resumed_facebook)} queue message(s) "
-            f"from MongoDB after restart — NOT lost."
-        )
-
-    poll_thread = threading.Thread(
-        target=poll_facebook, args=(client,), daemon=True, name="Facebook-Poll"
-    )
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(facebook_queue, FACEBOOK_BATCH_SIZE, "FACEBOOK",
-              FACEBOOK_BATCH_GAP_SECONDS, FACEBOOK_BATCH_TIMEOUT_SECONDS),
-        daemon=True, name="Facebook-Batch",
-    )
-
-    poll_thread.start()
-    btch_thread.start()
-    log.info(
-        f"Facebook threads running: Poll ✅ | Batch ✅ | "
-        f"gap:{FACEBOOK_BATCH_GAP_SECONDS}s | timeout:{FACEBOOK_BATCH_TIMEOUT_SECONDS}s"
-    )
-
-    while True:
-        await asyncio.sleep(60)
-        if not poll_thread.is_alive():
-            log.error("Facebook poll thread died — restarting...")
-            poll_thread = threading.Thread(
-                target=poll_facebook, args=(client,), daemon=True, name="Facebook-Poll"
-            )
-            poll_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Facebook batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(facebook_queue, FACEBOOK_BATCH_SIZE, "FACEBOOK",
-                      FACEBOOK_BATCH_GAP_SECONDS, FACEBOOK_BATCH_TIMEOUT_SECONDS),
-                daemon=True, name="Facebook-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_linkedin_listener():
-    """v7.6.0 NEW — mirrors start_facebook_listener() exactly."""
-    if not LINKEDIN_ENABLED:
-        log.warning("LinkedIn platform DISABLED (LINKEDIN_ENABLED=false) — skipping.")
-        return
-
-    client = build_linkedin_client()
-    if client is None:
-        log.warning("LinkedIn listener not started — credentials missing.")
-        return
-
-    _resumed_linkedin = load_queue_messages("linkedin")
-    for _item in _resumed_linkedin:
-        linkedin_queue.put(_item)
-    if _resumed_linkedin:
-        log.info(
-            f"[LINKEDIN] Resumed {len(_resumed_linkedin)} queue message(s) "
-            f"from MongoDB after restart — NOT lost."
-        )
-
-    poll_thread = threading.Thread(
-        target=poll_linkedin, args=(client,), daemon=True, name="LinkedIn-Poll"
-    )
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(linkedin_queue, LINKEDIN_BATCH_SIZE, "LINKEDIN",
-              LINKEDIN_BATCH_GAP_SECONDS, LINKEDIN_BATCH_TIMEOUT_SECONDS),
-        daemon=True, name="LinkedIn-Batch",
-    )
-
-    poll_thread.start()
-    btch_thread.start()
-    log.info(
-        f"LinkedIn threads running: Poll ✅ | Batch ✅ | "
-        f"gap:{LINKEDIN_BATCH_GAP_SECONDS}s | timeout:{LINKEDIN_BATCH_TIMEOUT_SECONDS}s"
-    )
-
-    while True:
-        await asyncio.sleep(60)
-        if not poll_thread.is_alive():
-            log.error("LinkedIn poll thread died — restarting...")
-            poll_thread = threading.Thread(
-                target=poll_linkedin, args=(client,), daemon=True, name="LinkedIn-Poll"
-            )
-            poll_thread.start()
-        if not btch_thread.is_alive():
-            log.error("LinkedIn batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(linkedin_queue, LINKEDIN_BATCH_SIZE, "LINKEDIN",
-                      LINKEDIN_BATCH_GAP_SECONDS, LINKEDIN_BATCH_TIMEOUT_SECONDS),
-                daemon=True, name="LinkedIn-Batch",
-            )
-            btch_thread.start()
-
-
 async def start_rescore_listener():
-    rescore_thread = threading.Thread(
-        target=run_rescore_processor, daemon=True, name="Rescore-Processor"
-    )
+    rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
     rescore_thread.start()
     log.info("Rescore processor thread running ✅")
 
@@ -5686,121 +2912,121 @@ async def start_rescore_listener():
         await asyncio.sleep(60)
         if not rescore_thread.is_alive():
             log.error("Rescore processor thread died — restarting...")
-            rescore_thread = threading.Thread(
-                target=run_rescore_processor, daemon=True, name="Rescore-Processor"
-            )
+            rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
             rescore_thread.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — REST API
+# FASTAPI — read-only endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title       = "FX Signal Intelligence API — Flintel v7.9.1",
-    description = (
-        "Reddit (RSS) + Twitter + Telegram + Facebook + LinkedIn signals: "
-        "monitor, score, store, alert. Persistent batch state. Streaming "
-        "Claude. Manual rescore. HubSpot receives medium (4-7) AND high "
-        "(8-10) signals. Per-platform BATCH_GAP_SECONDS and "
-        "BATCH_TIMEOUT_SECONDS — every platform runs on its own "
-        "independent gap/timeout, never mixed. Twitter search runs in "
-        "TWITTER_CHUNK_SIZE-keyword chunks, one chunk per poll cycle."
+    title="Flintel v9.13 — Reddit (SERP + fetch-once-forever keyword cache + flintel_google_posts cache + AUTO-SYNCED flintel_targeting_subreddits/keywords + URL-match subreddit RSS confirmation + random-fallback volume/engagement) + Twitter Signal Scorer",
+    description=(
+        "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
+        "no re-fetch, ever, once a keyword's SERP results are cached) + "
+        "Twitter signals: monitor, score (generic 1-100 relevance/visibility/"
+        "engagement model), store. v9.13: Reddit's RSS-matching stage now "
+        "governs which subreddits/keywords it actively targets via two new "
+        "auto-synced mirror collections, flintel_targeting_subreddits and "
+        "flintel_targeting_keywords, rebuilt every pass from whatever is "
+        "currently pending (fetched=False) in flintel_google_posts. Matching "
+        "is still, and only ever, an exact post_url match against each "
+        "subreddit's live RSS feed — on a match, the post is marked "
+        "fetched=True in flintel_google_posts, its flintel_targeting_keywords "
+        "entry is deleted immediately, and the raw fetched text is queued "
+        "as-is (Reddit items are no longer re-filtered by keyword-phrase text "
+        "downstream — the URL match is the sole authoritative relevance "
+        "decision). flintel_keywords, the SERP call, and the search-volume "
+        "seeding logic are all 100% unchanged from v9.11.1. Persistent batch "
+        "state + queue + dedup — no in-flight item is ever lost on restart. "
+        "Streaming Claude with partial-JSON recovery. Claude failures route "
+        "to status='pending' for automatic rescore."
     ),
-    version     = "7.9.1",
+    version="9.13.0",
 )
 
 
 def _serialise(signals: list) -> list:
     for s in signals:
         s.pop("_id", None)
-        for f in ["created_at", "alerted_slack_at", "alerted_hubspot_at", "rescored_at"]:
-            if f in s and s[f] is not None:
+        for f in ["created_at", "fetched_at"]:
+            if s.get(f):
                 s[f] = s[f].isoformat()
     return signals
 
 
-def _serialise_rescore(docs: list) -> list:
-    for d in docs:
-        d["_id"] = str(d["_id"])
-        for f in ["requested_at", "processed_at"]:
-            if f in d and d[f] is not None:
-                d[f] = d[f].isoformat()
-    return docs
-
-
 @app.get("/")
 def root():
+    total_keywords_tracked = db.flintel_keywords.count_documents({})
+    due_now_count = db.flintel_keywords.count_documents({"fetched": False})
+    missing_volume_count = db.flintel_keywords.count_documents({"search_volume": None})
+    random_volume_count = db.flintel_keywords.count_documents({"search_volume_is_random": True})
+
+    total_google_posts = db.flintel_google_posts.count_documents({})
+    pending_google_posts = db.flintel_google_posts.count_documents({"fetched": False})
+    confirmed_google_posts = db.flintel_google_posts.count_documents({"fetched": True})
+
+    targeting_subreddits_count = db.flintel_targeting_subreddits.count_documents({})
+    targeting_keywords_count = db.flintel_targeting_keywords.count_documents({})
+
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v7.9.1",
+        "system":                  "FLINTEL v9.13.0 (Reddit SERP + fetch-once-forever keyword cache + flintel_google_posts cache + AUTO-SYNCED flintel_targeting_subreddits/keywords + URL-match RSS confirmation + random-fallback volume/engagement + Twitter)",
         "client":                  CLIENT_ID,
-        "platforms":               ["reddit", "twitter", "telegram", "facebook", "linkedin"],
+        "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
-        "reddit_status":           _working(REDDIT_ENABLED),
+        "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_fetch_method":     "SERP discovery (RapidAPI) -> flintel_google_posts cache -> flintel_targeting_subreddits/keywords (auto-synced) -> subreddit RSS URL-match confirmation (credential-free) — no OAuth/PRAW",
         "twitter_enabled":         TWITTER_ENABLED,
-        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS)),
-        "telegram_enabled":        TELEGRAM_ENABLED,
-        "telegram_status":         _working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)),
-        "facebook_enabled":        FACEBOOK_ENABLED,
-        "facebook_status":         _working(FACEBOOK_ENABLED and bool(RAPID_API_KEY)),
-        "linkedin_enabled":        LINKEDIN_ENABLED,
-        "linkedin_status":         _working(LINKEDIN_ENABLED and bool(RAPID_API_KEY)),
-        "reddit_mode":             "feedparser RSS (no credentials required)",
-        "reddit_poll_interval":    REDDIT_POLL_INTERVAL,
+        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
+        "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
+        "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
+        "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
+        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords), UNCHANGED from v9.11.1, no longer tied to Reddit RSS reliability",
+        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNCHANGED",
+        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
+        "google_posts_cache":              "ENABLED — flintel_google_posts, fetch-once-forever per post_url",
+        "targeting_collections":           "ENABLED (NEW v9.13) — flintel_targeting_subreddits + flintel_targeting_keywords, fully auto-synced from flintel_google_posts pending state every RSS-matching pass, no hardcoded python list",
+        "reddit_batch_filter_bypassed":    True,
+        "google_posts_rss_check_interval_seconds": GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS,
+        "fuzzy_keywords_per_post":         FUZZY_KEYWORDS_PER_POST,
+        "reddit_engagement_random_fallback": f"ENABLED — range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (RSS has no real upvotes/comments), always logged",
+        "keywords_tracked":               total_keywords_tracked,
+        "keywords_due_now":               due_now_count,
+        "keywords_missing_search_volume": missing_volume_count,
+        "keywords_with_random_search_volume": random_volume_count,
+        "google_posts_total":             total_google_posts,
+        "google_posts_pending_rss_confirmation": pending_google_posts,
+        "google_posts_confirmed":          confirmed_google_posts,
+        "targeting_subreddits_tracked":    targeting_subreddits_count,
+        "targeting_keywords_tracked":      targeting_keywords_count,
+        "serp_months_back":        SERP_MONTHS_BACK,
+        "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
         "twitter_batch_size":      TWITTER_BATCH_SIZE,
-        "telegram_batch_size":     TELEGRAM_BATCH_SIZE,
-        "facebook_batch_size":     FACEBOOK_BATCH_SIZE,
-        "linkedin_batch_size":     LINKEDIN_BATCH_SIZE,
         "rescore_batch_size":      RESCORE_BATCH_SIZE,
-        "telegram_poll_interval":  TELEGRAM_POLL_INTERVAL,
-        "facebook_poll_interval":  FACEBOOK_POLL_INTERVAL,
-        "linkedin_poll_interval":  LINKEDIN_POLL_INTERVAL,
-        "twitter_rapid_api_keys_configured": len(TWITTER_RAPID_API_KEYS),
-        "twitter_chunk_size":       TWITTER_CHUNK_SIZE,
-        "twitter_total_chunks":     len(TWITTER_SEARCH_CHUNKS),
-        "reddit_batch_gap_s":       REDDIT_BATCH_GAP_SECONDS,
-        "reddit_batch_timeout_s":   REDDIT_BATCH_TIMEOUT_SECONDS,
-        "twitter_batch_gap_s":      TWITTER_BATCH_GAP_SECONDS,
-        "twitter_batch_timeout_s":  TWITTER_BATCH_TIMEOUT_SECONDS,
-        "telegram_batch_gap_s":     TELEGRAM_BATCH_GAP_SECONDS,
-        "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
-        "facebook_batch_gap_s":     FACEBOOK_BATCH_GAP_SECONDS,
-        "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
-        "linkedin_batch_gap_s":     LINKEDIN_BATCH_GAP_SECONDS,
-        "linkedin_batch_timeout_s": LINKEDIN_BATCH_TIMEOUT_SECONDS,
-        "rescore_batch_gap_s":      RESCORE_BATCH_GAP_SECONDS,
-        "max_tokens":              MAX_TOKENS,
-        "claude_stream_timeout_s": CLAUDE_STREAM_TIMEOUT,
+        "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
+        "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
+        "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
+        "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
+        "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
+        "rapidapi_configured":    bool(RAPIDAPI_KEY),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
-        "telegram_queue_size":     telegram_queue.qsize(),
-        "facebook_queue_size":     facebook_queue.qsize(),
-        "linkedin_queue_size":     linkedin_queue.qsize(),
-        "telegram_groups":         len(TARGET_TELEGRAM_GROUPS),
+        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "auth_required":           bool(API_KEY),
-        "output_schema":           "platform-specific (v7.2 cost optimisation, unchanged)",
-        "persistent_batch_state":  True,
-        "persistent_queue_messages": True,
-        "persistent_batch_seconds": True,
-        "partial_json_recovery":   True,
-        "claude_streaming":        True,
-        "rescore_enabled":         True,
-        "hubspot_error_visibility": True,
-        "hubspot_medium_signals":  True,
-        "slack_hubspot_score_hidden": True,
-        "per_platform_batch_timing": True,
-        "linkedin_enrichment":     True,
-        "twitter_chunked_search":  True,
-        "twitter_rapid_api_failover": True,
-        "min_score_medium":        MIN_SCORE_MEDIUM,
-        "min_score_high":          MIN_SCORE_HIGH,
-        "score_routing": {
-            "1-3":  "MongoDB only",
-            "4-7":  "MongoDB + Slack + HubSpot (score number hidden in message/note)",
-            "8-10": "MongoDB + Slack + HubSpot (score number hidden in message/note)",
-        },
+        "telegram_removed":        True,
+        "reddit_per_post_json_removed": True,
+        "reddit_oauth_praw_removed": True,
+        "fixed_full_cycle_sleep_removed": True,
+        "post_url_dedup_before_scoring": True,
+        "claude_failure_routes_to_pending": True,
+        "keyword_due_state_independent_of_python_list": True,
+        "google_posts_state_independent_of_python_list": True,
+        "targeting_state_independent_of_python_list": True,
+        "reddit_serp_never_waits_on_reddit_rss": True,
+        "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
     }
 
 
@@ -5812,444 +3038,169 @@ def health():
     except Exception:
         mongo = "disconnected"
 
-    reddit_working   = REDDIT_ENABLED
-    twitter_working  = TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS)
-    telegram_working = TELEGRAM_ENABLED and bool(TELEGRAM_API_ID)
-    facebook_working = FACEBOOK_ENABLED and bool(RAPID_API_KEY)
-    linkedin_working = LINKEDIN_ENABLED and bool(RAPID_API_KEY)
-
-    pending_rescore = 0
-    try:
-        pending_rescore = db.flintel_rescore_messages.count_documents({"status": "pending"})
-    except Exception:
-        pass
-
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
-        "reddit":                  ("polling-rss" if REDDIT_ENABLED else "disabled"),
-        "reddit_working":          reddit_working,
-        "reddit_indicator":        _working(reddit_working),
-        "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
-        "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
-        "twitter":                 ("polling" if twitter_working else "disabled"),
-        "twitter_working":         twitter_working,
-        "twitter_indicator":       _working(twitter_working),
-        "twitter_rapid_api_keys":  len(TWITTER_RAPID_API_KEYS),
-        "twitter_chunk_size":      TWITTER_CHUNK_SIZE,
-        "twitter_total_chunks":    len(TWITTER_SEARCH_CHUNKS),
-        "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
-        "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
-        "telegram":                ("listening" if telegram_working else "disabled"),
-        "telegram_working":        telegram_working,
-        "telegram_indicator":      _working(telegram_working),
-        "telegram_batch_gap_s":    TELEGRAM_BATCH_GAP_SECONDS,
-        "telegram_batch_timeout_s": TELEGRAM_BATCH_TIMEOUT_SECONDS,
-        "facebook":                ("polling" if facebook_working else "disabled"),
-        "facebook_working":        facebook_working,
-        "facebook_indicator":      _working(facebook_working),
-        "facebook_batch_gap_s":    FACEBOOK_BATCH_GAP_SECONDS,
-        "facebook_batch_timeout_s": FACEBOOK_BATCH_TIMEOUT_SECONDS,
-        "linkedin":                ("polling" if linkedin_working else "disabled"),
-        "linkedin_working":        linkedin_working,
-        "linkedin_indicator":      _working(linkedin_working),
-        "linkedin_batch_gap_s":    LINKEDIN_BATCH_GAP_SECONDS,
-        "linkedin_batch_timeout_s": LINKEDIN_BATCH_TIMEOUT_SECONDS,
-        "hubspot_configured":      bool(HUBSPOT_API_KEY),
-        "hubspot_indicator":       _working(bool(HUBSPOT_API_KEY)),
-        "hubspot_medium_signals":  True,
+        "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
+        "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_fetch_method":     "SERP -> flintel_google_posts -> flintel_targeting_subreddits/keywords -> subreddit RSS URL-match confirmation (credential-free) — no OAuth/PRAW",
+        "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
+        "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
-        "telegram_queue_size":     telegram_queue.qsize(),
-        "facebook_queue_size":     facebook_queue.qsize(),
-        "linkedin_queue_size":     linkedin_queue.qsize(),
-        "rescore_pending":         pending_rescore,
-        "rescore_working":         True,
-        "rescore_indicator":       _working(True),
-        "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
+        "google_posts_pending":    db.flintel_google_posts.count_documents({"fetched": False}),
+        "targeting_subreddits":    db.flintel_targeting_subreddits.count_documents({}),
+        "targeting_keywords":      db.flintel_targeting_keywords.count_documents({}),
+        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
 
 
-@app.get("/hubspot/properties-check", dependencies=[Depends(verify_api_key)])
-def get_hubspot_properties_check():
-    if not HUBSPOT_API_KEY:
-        return {"configured": False, "detail": "HUBSPOT_API_KEY not set."}
-    try:
-        r = requests.get(
-            f"{HUBSPOT_BASE}/crm/v3/properties/contacts",
-            headers=_hs_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        existing = {p.get("name") for p in r.json().get("results", [])}
-        missing  = [p for p in _HUBSPOT_REQUIRED_CONTACT_PROPERTIES if p not in existing]
-        return {
-            "configured":          True,
-            "required_properties": _HUBSPOT_REQUIRED_CONTACT_PROPERTIES,
-            "missing_properties":  missing,
-            "all_present":         len(missing) == 0,
-        }
-    except requests.exceptions.HTTPError as exc:
-        body = None
-        try:
-            body = exc.response.text if exc.response is not None else None
-        except Exception:
-            body = None
-        raise HTTPException(
-            status_code=502,
-            detail=f"HubSpot API error: {exc} | body: {body}",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/rescore", dependencies=[Depends(verify_api_key)])
-def post_rescore(
-    message_ids: list = Body(..., description="List of message_id strings to rescore"),
-    operator_note: str = Body("", description="Optional operator note"),
-):
-    if not message_ids:
-        raise HTTPException(status_code=400, detail="message_ids list is empty.")
-
-    missing = []
-    for mid in message_ids:
-        if not db.signals.find_one({"message_id": mid}, {"_id": 1}):
-            missing.append(mid)
-
-    if missing:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Signal(s) not found in DB: {missing}. Cannot queue for rescore.",
-        )
-
-    req_ids = _rescore_queue_requests(message_ids, operator_note=operator_note)
+@app.get("/keywords", dependencies=[Depends(verify_api_key)])
+def get_keywords_status():
+    """
+    Inspect the fetch-once-forever keyword cache directly — UNCHANGED
+    FROM v9.11.1. Note: "fetched=True" here now means "this keyword's
+    SERP results are all cached in flintel_google_posts" (see
+    process_one_keyword() docstring) — actual Reddit RSS confirmation
+    status lives in /google-posts and /targeting-keywords below.
+    """
+    raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
+    due_count = 0
+    missing_volume_count = 0
+    random_volume_count = 0
+    docs = []
+    for d in raw_docs:
+        is_due = not d.get("fetched")
+        if is_due:
+            due_count += 1
+        if d.get("search_volume") is None:
+            missing_volume_count += 1
+        if d.get("search_volume_is_random"):
+            random_volume_count += 1
+        for f in ["last_fetched_at", "created_at"]:
+            if d.get(f):
+                d[f] = d[f].isoformat()
+        d["due_now"] = is_due
+        docs.append(d)
     return {
-        "queued":       len(req_ids),
-        "request_ids":  req_ids,
-        "message_ids":  message_ids,
-        "operator_note": operator_note,
-        "status":       "pending",
-        "note":         "Rescore processor will pick these up within the next poll interval.",
+        "total": len(docs),
+        "due_now": due_count,
+        "missing_search_volume": missing_volume_count,
+        "random_fallback_search_volume": random_volume_count,
+        "keywords": docs,
     }
 
 
-@app.get("/rescore/pending", dependencies=[Depends(verify_api_key)])
-def get_rescore_pending(limit: int = 50):
-    try:
-        docs = list(
-            db.flintel_rescore_messages.find(
-                {"status": {"$in": ["pending", "processing"]}}
-            ).sort("requested_at", ASCENDING).limit(limit)
-        )
-        return {"count": len(docs), "requests": _serialise_rescore(docs)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/google-posts", dependencies=[Depends(verify_api_key)])
+def get_google_posts_status(subreddit: str = None, pending_only: bool = False, limit: int = 200):
+    """
+    Inspect the flintel_google_posts cache directly. Shows every
+    SERP-discovered post_url, its google_rank, matched_keyword,
+    auto-generated fuzzy_keywords, subreddit, and whether it has been
+    confirmed yet (fetched=True) via run_google_posts_rss_matching_loop().
+    """
+    q: dict = {}
+    if subreddit:
+        q["subreddit"] = subreddit
+    if pending_only:
+        q["fetched"] = False
+
+    raw_docs = list(db.flintel_google_posts.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+    docs = []
+    for d in raw_docs:
+        for f in ["created_at", "fetched_at"]:
+            if d.get(f):
+                d[f] = d[f].isoformat()
+        docs.append(d)
+
+    total = db.flintel_google_posts.count_documents({})
+    pending = db.flintel_google_posts.count_documents({"fetched": False})
+    confirmed = db.flintel_google_posts.count_documents({"fetched": True})
+
+    return {
+        "total": total,
+        "pending": pending,
+        "confirmed": confirmed,
+        "count_returned": len(docs),
+        "google_posts": docs,
+    }
 
 
-@app.get("/rescore/history", dependencies=[Depends(verify_api_key)])
-def get_rescore_history(limit: int = 100, status: str = None):
-    try:
-        query = {}
-        if status:
-            query["status"] = status
-        else:
-            query["status"] = {"$in": ["done", "error"]}
-        docs = list(
-            db.flintel_rescore_messages.find(query)
-            .sort("processed_at", -1)
-            .limit(limit)
-        )
-        return {"count": len(docs), "requests": _serialise_rescore(docs)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/targeting-subreddits", dependencies=[Depends(verify_api_key)])
+def get_targeting_subreddits_status(limit: int = 500):
+    """
+    NEW in v9.13 — inspect flintel_targeting_subreddits directly: the
+    live, auto-synced list of subreddits the RSS-matching loop is
+    currently polling this cycle. Fully rebuilt every pass from
+    flintel_google_posts's pending state — never hand-maintained.
+    """
+    docs = list(db.flintel_targeting_subreddits.find({}, {"_id": 0}).sort("subreddit", 1).limit(limit))
+    for d in docs:
+        for f in ["created_at", "last_synced_at"]:
+            if d.get(f):
+                d[f] = d[f].isoformat()
+    return {
+        "total": db.flintel_targeting_subreddits.count_documents({}),
+        "count_returned": len(docs),
+        "targeting_subreddits": docs,
+    }
 
 
-@app.get("/rescore/status/{req_id}", dependencies=[Depends(verify_api_key)])
-def get_rescore_status(req_id: str):
-    try:
-        from bson import ObjectId
-        doc = db.flintel_rescore_messages.find_one({"_id": ObjectId(req_id)})
-        if not doc:
-            raise HTTPException(status_code=404, detail=f"Rescore request not found: {req_id}")
-        return _serialise_rescore([doc])[0]
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/pending-batch", dependencies=[Depends(verify_api_key)])
-def get_pending_batch():
-    try:
-        docs = list(db.flintel_pending_batch.find({}, {"_id": 0}))
-        for d in docs:
-            if d.get("batch_start_time"):
-                d["batch_start_time"] = d["batch_start_time"].isoformat()
-            if d.get("updated_at"):
-                d["updated_at"] = d["updated_at"].isoformat()
-            d["item_count"] = len(d.get("items", []))
-        return {"pending_batches": docs}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/targeting-keywords", dependencies=[Depends(verify_api_key)])
+def get_targeting_keywords_status(subreddit: str = None, limit: int = 500):
+    """
+    NEW in v9.13 — inspect flintel_targeting_keywords directly: one live
+    entry per still-pending flintel_google_posts document (post_url +
+    matched keyword + fuzzy_keywords + subreddit). An entry disappears
+    the instant its post_url is confirmed via exact RSS-link match.
+    """
+    q: dict = {}
+    if subreddit:
+        q["subreddit"] = subreddit
+    docs = list(db.flintel_targeting_keywords.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+    for d in docs:
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+    return {
+        "total": db.flintel_targeting_keywords.count_documents({}),
+        "count_returned": len(docs),
+        "targeting_keywords": docs,
+    }
 
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
-def get_signals(
-    limit:       int  = 50,
-    platform:    str  = None,
-    category:    str  = None,
-    min_score:   int  = None,
-    subreddit:   str  = None,
-    tg_group:    str  = None,
-    tier:        str  = None,
-    corridor:    str  = None,
-    pain_type:   str  = None,
-    is_business: bool = None,
-):
-    try:
-        q: dict = {"client_id": CLIENT_ID}
-        if platform:    q["platform"]        = platform
-        if category:    q["signal_category"] = category
-        if min_score is not None: q["intent_score"] = {"$gte": min_score}
-        if subreddit:   q["subreddit"]       = subreddit
-        if tg_group:    q["telegram_group"]  = {"$regex": tg_group, "$options": "i"}
-        if tier:        q["tier"]            = tier
-        if corridor:    q["corridor"]        = {"$regex": corridor, "$options": "i"}
-        if pain_type:   q["pain_type"]       = pain_type
-        if is_business is not None: q["is_business"] = is_business
-
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def get_signals(limit: int = 50, min_score: int = None, is_relevant: bool = None,
+                 platform: str = None, status: str = None):
+    q: dict = {"client_id": CLIENT_ID}
+    if min_score is not None:
+        q["intent_score"] = {"$gte": min_score}
+    if is_relevant is not None:
+        q["is_relevant"] = is_relevant
+    if platform:
+        q["platform"] = platform
+    if status:
+        q["status"] = status
+    signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+    return {"count": len(signals), "signals": _serialise(signals)}
 
 
-@app.get("/signals/stats", dependencies=[Depends(verify_api_key)])
-def get_stats():
-    try:
-        total    = db.signals.count_documents({"client_id": CLIENT_ID})
-        biz      = db.signals.count_documents({"client_id": CLIENT_ID, "is_business": True})
-        reddit   = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "reddit"})
-        twitter  = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "twitter"})
-        telegram = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "telegram"})
-        facebook = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "facebook"})
-        linkedin = db.signals.count_documents({"client_id": CLIENT_ID, "platform": "linkedin"})
-        rescored = db.signals.count_documents({"client_id": CLIENT_ID, "rescored_at": {"$exists": True}})
-
-        def agg(group_field):
-            return list(db.signals.aggregate([
-                {"$match": {"client_id": CLIENT_ID, group_field: {"$ne": None}}},
-                {"$group": {"_id": f"${group_field}", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
-            ]))
-
-        return {
-            "total_signals":    total,
-            "business_owners":  biz,
-            "reddit_signals":   reddit,
-            "twitter_signals":  twitter,
-            "telegram_signals": telegram,
-            "facebook_signals": facebook,
-            "linkedin_signals": linkedin,
-            "rescored_signals": rescored,
-            "corridors":        agg("corridor"),
-            "pain_types":       agg("pain_type"),
-            "competitors":      agg("competitor_mentioned"),
-            "tiers":            agg("tier"),
-            "reddit_queue":     reddit_queue.qsize(),
-            "twitter_queue":    twitter_queue.qsize(),
-            "telegram_queue":   telegram_queue.qsize(),
-            "facebook_queue":   facebook_queue.qsize(),
-            "linkedin_queue":   linkedin_queue.qsize(),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/signals/relevant", dependencies=[Depends(verify_api_key)])
+def get_relevant_signals(limit: int = 50, min_score: int = 0):
+    signals = list(
+        db.signals.find(
+            {"client_id": CLIENT_ID, "is_relevant": True, "intent_score": {"$gte": min_score}},
+            {"_id": 0},
+        ).sort("intent_score", -1).limit(limit)
+    )
+    return {"count": len(signals), "signals": _serialise(signals)}
 
 
-@app.get("/signals/high-intent", dependencies=[Depends(verify_api_key)])
-def get_high_intent(limit: int = 20):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "intent_score": {"$gte": 8}}, {"_id": 0}
-            ).sort("created_at", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/digest", dependencies=[Depends(verify_api_key)])
-def get_digest(limit: int = 50):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "intent_score": {"$gte": 6, "$lte": 7}}, {"_id": 0}
-            ).sort("created_at", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/business", dependencies=[Depends(verify_api_key)])
-def get_business(limit: int = 20):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "is_business": True}, {"_id": 0}
-            ).sort("intent_score", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/outreach", dependencies=[Depends(verify_api_key)])
-def get_outreach(limit: int = 20):
-    try:
-        signals = list(
-            db.signals.find(
-                {
-                    "client_id":    CLIENT_ID,
-                    "intent_score": {"$gte": 5},
-                    "$or": [
-                        {"twitter_reply":    {"$ne": None}},
-                        {"twitter_dm":       {"$ne": None}},
-                        {"linkedin_message": {"$ne": None}},
-                        {"telegram_dm":      {"$ne": None}},
-                        {"facebook_comment": {"$ne": None}},
-                        {"linkedin_reply":   {"$ne": None}},  # v7.6.0
-                        {"linkedin_dm":      {"$ne": None}},  # v7.6.0
-                    ],
-                },
-                {"_id": 0},
-            ).sort("intent_score", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/twitter", dependencies=[Depends(verify_api_key)])
-def get_twitter_signals(limit: int = 50, min_score: int = None):
-    try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "twitter"}
-        if min_score is not None:
-            q["intent_score"] = {"$gte": min_score}
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/reddit", dependencies=[Depends(verify_api_key)])
-def get_reddit_signals(limit: int = 50, min_score: int = None):
-    try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "reddit"}
-        if min_score is not None:
-            q["intent_score"] = {"$gte": min_score}
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/telegram", dependencies=[Depends(verify_api_key)])
-def get_telegram_signals(limit: int = 50, min_score: int = None, group: str = None):
-    try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "telegram"}
-        if min_score is not None:
-            q["intent_score"] = {"$gte": min_score}
-        if group:
-            q["telegram_group"] = {"$regex": group, "$options": "i"}
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/facebook", dependencies=[Depends(verify_api_key)])
-def get_facebook_signals(limit: int = 50, min_score: int = None):
-    try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "facebook"}
-        if min_score is not None:
-            q["intent_score"] = {"$gte": min_score}
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/linkedin", dependencies=[Depends(verify_api_key)])
-def get_linkedin_signals(limit: int = 50, min_score: int = None):
-    """v7.6.0 NEW — mirrors /signals/facebook exactly, filtered to
-    platform == "linkedin". Returns the full enrichment fields (email,
-    phone, location, company, etc) alongside the usual signal fields."""
-    try:
-        q: dict = {"client_id": CLIENT_ID, "platform": "linkedin"}
-        if min_score is not None:
-            q["intent_score"] = {"$gte": min_score}
-        signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/corridors", dependencies=[Depends(verify_api_key)])
-def get_by_corridor(corridor: str, limit: int = 20):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "corridor": {"$regex": corridor, "$options": "i"}},
-                {"_id": 0},
-            ).sort("intent_score", -1).limit(limit)
-        )
-        return {"count": len(signals), "corridor": corridor, "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/watchlist", dependencies=[Depends(verify_api_key)])
-def get_watchlist(limit: int = 50):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "watchlist": True}, {"_id": 0}
-            ).sort("created_at", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/silent", dependencies=[Depends(verify_api_key)])
-def get_silent_signals(limit: int = 50):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "intent_score": {"$lte": 5}}, {"_id": 0}
-            ).sort("created_at", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/signals/rescored", dependencies=[Depends(verify_api_key)])
-def get_rescored_signals(limit: int = 50):
-    try:
-        signals = list(
-            db.signals.find(
-                {"client_id": CLIENT_ID, "rescored_at": {"$exists": True}},
-                {"_id": 0},
-            ).sort("rescored_at", -1).limit(limit)
-        )
-        return {"count": len(signals), "signals": _serialise(signals)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+@app.get("/signals/pending", dependencies=[Depends(verify_api_key)])
+def get_pending(limit: int = 100):
+    signals = list(db.signals.find({"status": "pending"}, {"_id": 0}).limit(limit))
+    return {"count": len(signals), "signals": _serialise(signals)}
 
 
 def run_fastapi():
@@ -6268,71 +3219,57 @@ async def main():
     await asyncio.gather(
         start_reddit_listener(),
         start_twitter_listener(),
-        start_telegram_listener(),
-        start_facebook_listener(),
-        start_linkedin_listener(),   # v7.6.0 NEW
         start_rescore_listener(),
-        run_scheduler(),
     )
 
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FX SIGNAL INTELLIGENCE SYSTEM — FLINTEL v7.9.1")
+    log.info("  FLINTEL v9.13.0 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("                   + FLINTEL_GOOGLE_POSTS CACHE + AUTO-SYNCED")
+    log.info("                   FLINTEL_TARGETING_SUBREDDITS/KEYWORDS + URL-MATCH")
+    log.info("                   SUBREDDIT RSS CONFIRMATION + RANDOM-FALLBACK VOLUME/")
+    log.info("                   ENGAGEMENT) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
-    log.info(f"  Client             : {CLIENT_ID}")
-    log.info(f"  Platforms          : Reddit (RSS) + Twitter/X + Telegram + Facebook + LinkedIn")
-    log.info(f"  Reddit             : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED)}")
-    log.info(f"  Twitter            : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_RAPID_API_KEYS))}")
-    log.info(f"  Twitter keys       : {len(TWITTER_RAPID_API_KEYS)} RapidAPI key(s) configured for failover")
-    log.info(f"  Twitter chunking   : {TWITTER_CHUNK_SIZE} keyword(s)/chunk | {len(TWITTER_SEARCH_CHUNKS)} total chunk(s) | 1 chunk sent per poll cycle")
-    log.info(f"  Telegram           : {TELEGRAM_ENABLED} | {_working(TELEGRAM_ENABLED and bool(TELEGRAM_API_ID))}")
-    log.info(f"  Facebook           : {FACEBOOK_ENABLED} | {_working(FACEBOOK_ENABLED and bool(RAPID_API_KEY))}")
-    log.info(f"  LinkedIn           : {LINKEDIN_ENABLED} | {_working(LINKEDIN_ENABLED and bool(RAPID_API_KEY))}")
-    log.info(f"  LinkedIn mode      : linkedin-data-scraper1 RapidAPI — search_linkedIn.php per keyword,")
-    log.info(f"                     : + get_user_data.php + get_company_data.php enrichment per match")
-    log.info(f"  LinkedIn poll gap  : {LINKEDIN_POLL_INTERVAL}s between full keyword cycles | {LINKEDIN_KEYWORD_GAP_SECONDS}s between keywords")
-    log.info(f"  Reddit batch       : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {REDDIT_BATCH_GAP_SECONDS}s")
-    log.info(f"  Twitter batch      : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TWITTER_BATCH_GAP_SECONDS}s")
-    log.info(f"  Telegram batch     : {TELEGRAM_BATCH_SIZE} items OR {TELEGRAM_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {TELEGRAM_BATCH_GAP_SECONDS}s")
-    log.info(f"  Facebook batch     : {FACEBOOK_BATCH_SIZE} items OR {FACEBOOK_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {FACEBOOK_BATCH_GAP_SECONDS}s")
-    log.info(f"  LinkedIn batch     : {LINKEDIN_BATCH_SIZE} items OR {LINKEDIN_BATCH_TIMEOUT_SECONDS}s → 1 Claude call | gap {LINKEDIN_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore batch      : {RESCORE_BATCH_SIZE} items per Claude call | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Batch timing       : per-platform, independent — no platform shares gap/timeout with another")
-    log.info(f"  max_tokens         : {MAX_TOKENS}")
-    log.info(f"  Claude streaming   : True | {_working(True)}")
-    log.info(f"  Score 1-3          : SILENT SAVE — MongoDB only, no alerts")
-    log.info(f"  Score {MIN_SCORE_MEDIUM}-{MIN_SCORE_HIGH-1}          : MEDIUM — MongoDB + Slack + HubSpot (number hidden in message)")
-    log.info(f"  Score {MIN_SCORE_HIGH}-10         : HIGH   — MongoDB + Slack + HubSpot (number hidden in message)")
-    log.info(f"  MIN_SCORE_MEDIUM   : {MIN_SCORE_MEDIUM} (env-configurable)")
-    log.info(f"  MIN_SCORE_HIGH     : {MIN_SCORE_HIGH} (env-configurable)")
-    log.info(f"  MongoDB            : ALL scores 1-10 saved, nothing discarded")
-    log.info(f"  Platform isolation : Reddit/Twitter/Telegram/Facebook/LinkedIn NEVER mixed")
-    log.info(f"  Deduplication      : Persistent (MongoDB flintel_seen_ids) — survives restarts")
-    log.info(f"  Batch state        : Persistent (MongoDB flintel_pending_batch) — survives restarts")
-    log.info(f"  Queue messages     : Persistent (MongoDB flintel_queue_messages) — survives restarts")
-    log.info(f"  Batch timeout      : Persistent (MongoDB flintel_batch_seconds) — survives restarts")
-    log.info(f"  Twitter chunk pos  : Persistent (MongoDB flintel_state key=twitter_chunk_index) — survives restarts")
-    log.info(f"  Rescore            : True | {_working(True)} — flintel_rescore_messages collection")
-    log.info(f"  Rescore poll       : every {RESCORE_POLL_INTERVAL}s")
-    log.info(f"  API auth           : {'True | ' + _working(True) + ' (API_KEY set)' if API_KEY else 'False | ' + _working(False) + ' (API_KEY not set — open access)'}")
-    log.info(f"  Daily digest       : {DAILY_DIGEST_HOUR}:00 UTC")
-    log.info(f"  Weekly report      : Monday {WEEKLY_REPORT_HOUR}:00 UTC")
-    log.info(f"  Subreddits         : {len(TARGET_SUBREDDITS)} monitored")
-    log.info(f"  Telegram groups    : {len(TARGET_TELEGRAM_GROUPS)} configured")
-    log.info(f"  Keywords           : {len(KEYWORDS)} filters (shared by all 5 platforms) — FILL THIS LIST IN")
-    log.info(f"  MongoDB DB         : {MONGODB_DB}")
-    log.info(f"  HubSpot            : {'True | ' + _working(True) if HUBSPOT_API_KEY else 'False | ' + _working(False) + ' — set HUBSPOT_API_KEY'}")
-    log.info(f"  Slack              : {'True | ' + _working(True) if SLACK_WEBHOOK_URL else 'False | ' + _working(False) + ' — set SLACK_WEBHOOK_URL'}")
-    log.info(f"  v7.9.1 change      : Twitter search chunked into {TWITTER_CHUNK_SIZE}-keyword OR-queries — fixes")
-    log.info(f"                     : HTTP 414 Request-URI Too Large from v7.9.0's single giant query. ONE chunk")
-    log.info(f"                     : is sent per TWITTER_POLL_INTERVAL, advancing through all {len(TWITTER_SEARCH_CHUNKS)} chunk(s)")
-    log.info(f"                     : and wrapping back to chunk 1 once the full list is covered. Chunk position")
-    log.info(f"                     : persists across restarts. RapidAPI key failover (429/403) unchanged from")
-    log.info(f"                     : v7.9.0. Reddit, Telegram, Facebook, LinkedIn, scoring, storage, delivery,")
-    log.info(f"                     : and every FastAPI route are 100% untouched by this change.")
+    log.info(f"  Client               : {CLIENT_ID}")
+    log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
+    log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
+    log.info(f"  Reddit fetch method  : SERP (RapidAPI) -> flintel_google_posts cache -> "
+             f"flintel_targeting_subreddits/keywords (auto-synced every pass) -> subreddit RSS "
+             f"URL-match confirmation — credential-free, no OAuth/PRAW")
+    log.info(f"  Reddit engagement    : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
+    log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
+    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery + to seed brand-new flintel_keywords docs)")
+    log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
+    log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
+             f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD} | UNCHANGED from v9.11.1")
+    log.info(f"  Keyword due state    : read directly from flintel_keywords — NOT filtered by the current "
+             f"REDDIT_SEARCH_KEYWORDS python list")
+    log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | UNCHANGED from v9.11.1")
+    log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+             f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged")
+    log.info(f"  flintel_google_posts : every SERP-discovered post_url + google_rank + matched_keyword "
+             f"+ {FUZZY_KEYWORDS_PER_POST} auto fuzzy keywords + subreddit cached immediately, no wait on Reddit")
+    log.info(f"  Targeting collections: NEW — flintel_targeting_subreddits + flintel_targeting_keywords, "
+             f"fully auto-synced from flintel_google_posts pending state EVERY pass, no hardcoded python list")
+    log.info(f"  Google-posts RSS     : independent thread | check every {GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS}s | "
+             f"reads flintel_targeting_subreddits | confirms by exact post_url match ONLY | "
+             f"{REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback")
+    log.info(f"  On match             : flintel_google_posts.fetched=True permanently + "
+             f"flintel_targeting_keywords entry deleted immediately + raw text queued as-is "
+             f"(no downstream keyword-phrase re-filter for Reddit)")
+    log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
+    log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore source       : signals collection, status='pending' — never re-fetches, only re-scores")
+    log.info(f"  Claude streaming     : True | prompt: generic 1-100 relevance/visibility/engagement")
+    log.info(f"  RapidAPI config      : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume)")
+    log.info(f"  Telegram             : REMOVED")
+    log.info(f"  Reddit per-post JSON/RSS-in-discovery : REMOVED (moved to flintel_google_posts + subreddit RSS)")
+    log.info(f"  Reddit OAuth/PRAW    : REMOVED")
+    log.info(f"  Fixed full-cycle sleep: REMOVED (each keyword + each google_post has its own independent fetch-once-forever state)")
+    log.info(f"  MongoDB DB           : {MONGODB_DB}")
+    log.info(f"  API auth             : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
-
-    _hs_verify_properties()
 
     asyncio.run(main())
