@@ -132,7 +132,16 @@ REDDIT_POLL_INTERVAL_SECONDS = int(os.getenv("REDDIT_POLL_INTERVAL_SECONDS", "30
 # REDDIT_ENABLED=False -> the poller thread stays alive (heartbeat/status
 # still updates) but it skips fetching + matching entirely every cycle —
 # Reddit fetching is simply stopped until this is flipped back to True.
-REDDIT_ENABLED = _env_bool("REDDIT_ENABLED", True)
+#
+# IMPORTANT: this is checked LIVE every single cycle via
+# _is_reddit_enabled() below (not read once at startup) — so editing
+# REDDIT_ENABLED in .env while the service is already running takes
+# effect on the very next cycle, no restart needed. Flip it back to
+# True and the next cycle rebuilds the keyword list from scratch and
+# starts matching again, exactly as if freshly started.
+def _is_reddit_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("REDDIT_ENABLED", True)
 
 # How many jobs can be processed IN PARALLEL. With this at 1 (old
 # behaviour), a second job (e.g. "adidas") sits at status="pending" and
@@ -177,7 +186,15 @@ RAPID_API_KEY          = os.getenv("RAPID_API_KEY", "")
 # REDDIT_ENABLED above. TWITTER_ENABLED=True (default) -> Twitter is
 # fetched per-job as long as RAPID_API_KEY is also set. TWITTER_ENABLED=False
 # -> Twitter fetching is stopped completely, even if RAPID_API_KEY is set.
-TWITTER_ENABLED        = _env_bool("TWITTER_ENABLED", True) and bool(RAPID_API_KEY)
+#
+# IMPORTANT: also checked LIVE every time via _is_twitter_enabled() below
+# (not cached at startup) — editing TWITTER_ENABLED in .env while the
+# service is running takes effect on the very next job, no restart needed.
+def _is_twitter_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("TWITTER_ENABLED", True) and bool(os.getenv("RAPID_API_KEY", ""))
+
+
 TWITTER_HOST           = "twitter-api45.p.rapidapi.com"
 TWITTER_RESULTS_PER_QUERY = int(os.getenv("TWITTER_RESULTS_PER_QUERY", "50"))
 TWITTER_REQUEST_TIMEOUT   = int(os.getenv("TWITTER_REQUEST_TIMEOUT", "15"))
@@ -469,7 +486,7 @@ def _fetch_twitter_search(keyword: str) -> list:
     both platforms can be saved through the same _save_signal() call.
     Never raises — a failure here just means zero results for this
     keyword; it never blocks the rest of the job."""
-    if not TWITTER_ENABLED:
+    if not _is_twitter_enabled():
         return []
 
     url = f"https://{TWITTER_HOST}/search.php"
@@ -625,10 +642,13 @@ def run_reddit_poller():
 
             cycle_start = time.time()
             try:
-                if not REDDIT_ENABLED:
-                    # Master switch is off — thread stays alive (heartbeat
-                    # keeps updating) but no fetching/matching happens at
-                    # all until this flips back to True.
+                if not _is_reddit_enabled():
+                    # Master switch is off (checked LIVE, fresh from .env,
+                    # every cycle) — thread stays alive (heartbeat keeps
+                    # updating) but no fetching/matching happens at all
+                    # until this flips back to True. As soon as it does,
+                    # the very next cycle below runs _load_all_jobs_keyword_map()
+                    # fresh and starts matching again from scratch.
                     log.info("[REDDIT-POLLER] REDDIT_ENABLED=False | fetching stopped this cycle")
                     time.sleep(REDDIT_POLL_INTERVAL_SECONDS)
                     continue
@@ -702,7 +722,7 @@ def process_job(job: dict) -> int:
     # poller in the background, and this job additionally does the
     # Twitter search below.
     targeting_platform = (job.get("targeting_platform") or "all").strip().lower()
-    fetch_twitter = targeting_platform in ("x_twitter", "all") and TWITTER_ENABLED
+    fetch_twitter = targeting_platform in ("x_twitter", "all") and _is_twitter_enabled()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
@@ -838,8 +858,8 @@ if __name__ == "__main__":
     log.info("  Platform          : Reddit (site-wide RSS, ALWAYS-ON poller) + Twitter/X (via RapidAPI, job-driven)")
     log.info(f"  Reddit fetch mode : continuous poller, every {REDDIT_POLL_INTERVAL_SECONDS}s, keyword list rebuilt from ALL jobs each cycle")
     log.info("  Keywords source   : MongoDB (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
-    log.info(f"  Reddit fetching   : {'ENABLED' if REDDIT_ENABLED else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'}")
-    log.info(f"  Twitter/X         : {'ENABLED' if TWITTER_ENABLED else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'}")
+    log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
+    log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
     log.info("  Scoring           : NONE — raw messages only")
     log.info("  Slack / HubSpot   : REMOVED")
