@@ -16,14 +16,16 @@ WHAT THIS SERVICE DOES (and nothing else):
      dedicated background thread (`run_reddit_poller`) loops FOREVER, on its
      own timer (REDDIT_POLL_INTERVAL_SECONDS), completely independent of any
      job's status. On every cycle it:
-       a) Fetches the site-wide r/all "new posts" RSS feed ONCE.
+       a) Fetches the site-wide r/all "new posts" RSS feed ONCE, AND the
+          site-wide r/all "new comments" RSS feed ONCE.
        b) Re-reads flintel_search_jobs and builds a fresh, in-memory
           keyword list out of EVERY job in the collection (not just
           "pending" ones — a job's keywords are live/patched-in by the web
           service at any time, so this list is rebuilt every cycle).
-       c) Matches every RSS entry against every job's keywords locally,
-          and for every match saves the post into flintel_signals tagged
-          with that job's topic_key + whichever keyword matched.
+       c) Matches every RSS entry (posts AND comments) against every job's
+          keywords locally, and for every match saves the entry into
+          flintel_signals tagged with that job's topic_key + whichever
+          keyword matched.
      This never waits for a job to be picked up / claimed / marked
      "pending" — it just keeps running, cycle after cycle, forever,
      accumulating matches over time. This is what lets the site-wide RSS
@@ -36,29 +38,30 @@ WHAT THIS SERVICE DOES (and nothing else):
      before, since that API supports real query search and doesn't need a
      "keep polling forever" workaround.
 
-  4. Saves every matched post as a raw, unscored message into MongoDB
-     collection `flintel_signals`, tagged with the job's topic_key and
-     platform ("reddit" or "twitter"). Duplicate posts are silently
-     skipped via the unique index on message_id — so the continuous poller
-     re-fetching the same RSS window over and over is harmless; it will
-     just keep hitting DuplicateKeyError for posts it already saved and
-     only insert genuinely new ones.
+  4. Saves every matched post/comment as a raw, unscored message into
+     MongoDB collection `flintel_signals`, tagged with the job's topic_key
+     and platform ("reddit", "reddit_comment", or "twitter"). Duplicate
+     entries are silently skipped via the unique index on message_id — so
+     the continuous poller re-fetching the same RSS window over and over is
+     harmless; it will just keep hitting DuplicateKeyError for entries it
+     already saved and only insert genuinely new ones.
 
   5. Job status (`flintel_search_jobs.status`) is still driven by the
      worker pool (`process_job` / `run_worker`), exactly as before, for
      Twitter's sake and so the web service still has a "done" signal to
-     watch. Reddit matches are NOT tied to a specific job's matched_count
-     anymore, since Reddit is no longer fetched inside a single job run —
-     it's continuous and shared across every job's keywords at once.
+     watch. Reddit matches (posts + comments) are NOT tied to a specific
+     job's matched_count anymore, since Reddit is no longer fetched inside
+     a single job run — it's continuous and shared across every job's
+     keywords at once.
 
 ⚠️ IMPORTANT TRADE-OFF — READ THIS:
-  RSS only ever shows Reddit's current "new posts" window — a rolling,
-  very recent set (roughly the last few minutes to a couple of hours of
-  site-wide activity, depending on how busy Reddit is), NOT a searchable
-  6-month history. The old .json search endpoint could pull posts from up
-  to a year back for an exact keyword; this RSS feed cannot — it has no
-  concept of "search for X", only "here's what's newest right now".
-  LOOKBACK_DAYS / cutoff filtering is kept for consistency but will
+  RSS only ever shows Reddit's current "new posts" / "new comments" window
+  — a rolling, very recent set (roughly the last few minutes to a couple
+  of hours of site-wide activity, depending on how busy Reddit is), NOT a
+  searchable 6-month history. The old .json search endpoint could pull
+  posts from up to a year back for an exact keyword; this RSS feed cannot
+  — it has no concept of "search for X", only "here's what's newest right
+  now". LOOKBACK_DAYS / cutoff filtering is kept for consistency but will
   almost always be a no-op here, since RSS entries are always fresh.
   This is exactly why Reddit fetching is now a continuous always-on
   poller instead of a single fetch-per-job: a poller that keeps running
@@ -81,8 +84,9 @@ WHAT THIS SERVICE DELIBERATELY DOES NOT DO (removed on purpose):
 
 Requires the `feedparser` package (pip install feedparser) for RSS parsing.
 
-This file is intentionally simple: one always-on Reddit poller loop, one
-job-driven worker pool for Twitter + job status, one shared save function.
+This file is intentionally simple: one always-on Reddit poller loop (now
+covering both posts AND comments), one job-driven worker pool for Twitter
++ job status, one shared save function.
 """
 
 import os
@@ -122,7 +126,7 @@ MONGODB_DB  = os.getenv("MONGODB_DB", "flintel_bot")
 # How often the worker checks for a new pending job when idle.
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 
-# How often the ALWAYS-ON Reddit poller re-fetches the r/all RSS feed and
+# How often the ALWAYS-ON Reddit poller re-fetches the r/all RSS feeds and
 # re-reads the current keyword list from flintel_search_jobs. This loop
 # never stops and never waits on any job's "pending" status.
 REDDIT_POLL_INTERVAL_SECONDS = int(os.getenv("REDDIT_POLL_INTERVAL_SECONDS", "30"))
@@ -172,6 +176,14 @@ REDDIT_USER_AGENT = os.getenv(
 # limit= is respected by Reddit's RSS the same way it is by its old JSON
 # endpoint (up to 100).
 REDDIT_RSS_URL = os.getenv("REDDIT_RSS_URL", "https://www.reddit.com/r/all/new.rss")
+
+# Site-wide COMMENTS RSS feed — r/all's new-comments stream, same shape /
+# same rolling-window behaviour as REDDIT_RSS_URL above, just comments
+# instead of posts. Added purely additively — everything else in the file
+# is untouched.
+REDDIT_COMMENTS_RSS_URL = os.getenv(
+    "REDDIT_COMMENTS_RSS_URL", "https://www.reddit.com/r/all/comments/.rss"
+)
 
 REDDIT_RESULTS_PER_QUERY = int(os.getenv("REDDIT_RESULTS_PER_QUERY", "100"))
 REDDIT_REQUEST_TIMEOUT   = int(os.getenv("REDDIT_REQUEST_TIMEOUT", "15"))
@@ -474,6 +486,79 @@ def _fetch_reddit_rss_feed() -> list:
     return entries
 
 
+def _fetch_reddit_comments_rss_feed() -> list:
+    """Fetches the SITE-WIDE r/all "new comments" RSS feed — ONE request,
+    exact same approach/shape as _fetch_reddit_rss_feed() above, just
+    pointed at REDDIT_COMMENTS_RSS_URL instead of REDDIT_RSS_URL. Added
+    purely additively so the existing posts fetch function above is left
+    completely untouched.
+
+    A comment RSS entry's "title" field from Reddit is usually something
+    like "Comment by u/someone on some post title" — not the comment body
+    — so here `title` is built as the comment's own text (from the entry
+    summary/content) so keyword-matching works against what the user
+    actually wrote, same as it does for post title+selftext. Never raises
+    — a failure here just means zero comment entries this round; it never
+    blocks the poller's next cycle or the posts fetch."""
+    url = f"{REDDIT_COMMENTS_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
+    headers = {"User-Agent": REDDIT_USER_AGENT}
+
+    entries = []
+    try:
+        resp = requests.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+
+        if feed.bozo and not feed.entries:
+            log.warning(f"[REDDIT-COMMENTS-RSS] feed parse issue: {feed.bozo_exception}")
+            return entries
+
+        for entry in feed.entries:
+            entry_id = entry.get("id", "") or entry.get("link", "")
+            if not entry_id:
+                continue
+
+            link = entry.get("link", "") or ""
+            subreddit_match = re.search(r"/r/([^/]+)/", link)
+            subreddit = subreddit_match.group(1) if subreddit_match else "unknown"
+
+            # Prefer the full HTML content block if feedparser exposes it
+            # (comment RSS usually puts the actual comment body there);
+            # fall back to summary otherwise.
+            raw_body = ""
+            if entry.get("content"):
+                try:
+                    raw_body = entry["content"][0].get("value", "") or ""
+                except Exception:
+                    raw_body = ""
+            if not raw_body:
+                raw_body = entry.get("summary", "").strip()
+
+            body_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_body)).strip()
+
+            author = entry.get("author", "unknown").lstrip("u/").strip() or "unknown"
+
+            published_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+            created_utc = time.mktime(published_struct) if published_struct else None
+
+            entries.append({
+                "id":            entry_id.split("/")[-1] or entry_id,
+                "title":         body_plain,
+                "selftext":      "",
+                "author":        author,
+                "subreddit":     subreddit,
+                "post_url":      link,
+                "created_utc":   created_utc,
+                "score":         0,
+                "num_comments":  0,
+            })
+
+    except Exception as exc:
+        log.warning(f"[REDDIT-COMMENTS-RSS] fetch failed: {exc}")
+
+    return entries
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TWITTER / X FETCH — same twitter-api45.p.rapidapi.com approach as the
 # original system. One keyword per call, no restriction beyond the query
@@ -561,14 +646,14 @@ def _fetch_twitter_search(keyword: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict) -> bool:
-    """Upserts a raw fetched post (Reddit or Twitter — same shape from
-    either fetch function) into flintel_signals. No scoring, no Claude, no
-    derived fields — just the raw message plus which topic/keyword found
-    it. Duplicate posts (already fetched before, by this cycle or a past
-    one) are silently skipped via the unique index — this is exactly what
-    makes it safe for the Reddit poller to keep re-fetching the same
-    rolling RSS window over and over: only genuinely new posts get
-    inserted."""
+    """Upserts a raw fetched post/comment (Reddit post, Reddit comment, or
+    Twitter — same shape from any fetch function) into flintel_signals. No
+    scoring, no Claude, no derived fields — just the raw message plus which
+    topic/keyword found it. Duplicate entries (already fetched before, by
+    this cycle or a past one) are silently skipped via the unique index —
+    this is exactly what makes it safe for the Reddit poller to keep
+    re-fetching the same rolling RSS window over and over: only genuinely
+    new entries get inserted."""
     created = post.get("created_utc")
     created_dt = (
         datetime.fromtimestamp(created, tz=timezone.utc) if created else datetime.now(timezone.utc)
@@ -614,9 +699,11 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
 # single fetch-per-job snapshot. It never checks job "status", never
 # claims/marks jobs, and never stops. It just:
 #   loop forever:
-#     1. fetch r/all RSS once
+#     1. fetch r/all posts RSS once, AND r/all comments RSS once
 #     2. rebuild the keyword list from EVERY job in flintel_search_jobs
-#     3. match + save
+#     3. match + save (posts and comments both go into flintel_signals,
+#        same as before — comments just carry platform="reddit_comment"
+#        so they can be told apart from posts later if needed)
 #     4. sleep REDDIT_POLL_INTERVAL_SECONDS, repeat
 #
 # Because step 2 re-reads the jobs collection from scratch every cycle,
@@ -624,6 +711,40 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
 # picked up automatically on the very next cycle — no restart needed, no
 # waiting for a "pending" status.
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _match_and_save_entries(entries: list, reddit_jobs: list, cutoff: datetime, platform: str) -> int:
+    """Shared matching+saving loop used for BOTH the posts feed and the
+    comments feed — exact same logic that used to live inline in
+    run_reddit_poller() for posts, just pulled out so it can be reused for
+    comments too without duplicating it. Behaviour is identical to before:
+    every entry is checked against EVERY job's keyword list, and each
+    match is saved individually via _save_signal()."""
+    saved = 0
+    for entry in entries:
+        created = entry.get("created_utc")
+        if created is not None:
+            post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
+            if post_dt < cutoff:
+                continue  # older than lookback window — skip (rarely triggers on a live feed)
+
+        match_text = f"{entry.get('title', '')} {entry.get('selftext', '')}"
+
+        # Check this single RSS entry against EVERY job's keyword
+        # list — one entry can legitimately match several
+        # different topics at once, and each gets its own saved
+        # signal (message_id is unique per platform+post, but
+        # topic_key differs, so both are kept — same behaviour
+        # the old fetch-once-per-job version had).
+        for job in reddit_jobs:
+            matched_keyword = _match_any_keyword(match_text, job["keywords"])
+            if not matched_keyword:
+                continue
+            was_saved = _save_signal(job["topic_key"], matched_keyword, platform, entry)
+            if was_saved:
+                saved += 1
+
+    return saved
+
 
 def run_reddit_poller():
     log.info(
@@ -661,36 +782,23 @@ def run_reddit_poller():
                     time.sleep(REDDIT_POLL_INTERVAL_SECONDS)
                     continue
 
-                entries = _fetch_reddit_rss_feed()
                 cutoff = datetime.now(timezone.utc) - cutoff_days
 
-                saved_this_cycle = 0
-                for entry in entries:
-                    created = entry.get("created_utc")
-                    if created is not None:
-                        post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
-                        if post_dt < cutoff:
-                            continue  # older than lookback window — skip (rarely triggers on a live feed)
+                # ── Posts (unchanged) ──
+                entries = _fetch_reddit_rss_feed()
+                saved_posts = _match_and_save_entries(entries, reddit_jobs, cutoff, "reddit")
 
-                    match_text = f"{entry.get('title', '')} {entry.get('selftext', '')}"
+                # ── Comments (new, additive) — same matching/saving path,
+                # just a different feed and a different platform tag. ──
+                comment_entries = _fetch_reddit_comments_rss_feed()
+                saved_comments = _match_and_save_entries(comment_entries, reddit_jobs, cutoff, "reddit_comment")
 
-                    # Check this single RSS entry against EVERY job's keyword
-                    # list — one entry can legitimately match several
-                    # different topics at once, and each gets its own saved
-                    # signal (message_id is unique per platform+post, but
-                    # topic_key differs, so both are kept — same behaviour
-                    # the old fetch-once-per-job version had).
-                    for job in reddit_jobs:
-                        matched_keyword = _match_any_keyword(match_text, job["keywords"])
-                        if not matched_keyword:
-                            continue
-                        saved = _save_signal(job["topic_key"], matched_keyword, "reddit", entry)
-                        if saved:
-                            saved_this_cycle += 1
+                saved_this_cycle = saved_posts + saved_comments
 
                 log.info(
                     f"[REDDIT-POLLER] cycle done | jobs_checked={len(reddit_jobs)} | "
-                    f"rss_entries={len(entries)} | new_messages_saved={saved_this_cycle}"
+                    f"rss_entries={len(entries)} | comment_entries={len(comment_entries)} | "
+                    f"new_messages_saved={saved_this_cycle} (posts={saved_posts}, comments={saved_comments})"
                 )
 
             except Exception as exc:
@@ -855,8 +963,8 @@ if __name__ == "__main__":
     log.info("=" * 70)
     log.info("  FLINTEL — SIMPLIFIED FETCH-ONLY BACKGROUND SERVICE")
     log.info("=" * 70)
-    log.info("  Platform          : Reddit (site-wide RSS, ALWAYS-ON poller) + Twitter/X (via RapidAPI, job-driven)")
-    log.info(f"  Reddit fetch mode : continuous poller, every {REDDIT_POLL_INTERVAL_SECONDS}s, keyword list rebuilt from ALL jobs each cycle")
+    log.info("  Platform          : Reddit (site-wide RSS — posts + comments, ALWAYS-ON poller) + Twitter/X (via RapidAPI, job-driven)")
+    log.info(f"  Reddit fetch mode : continuous poller, every {REDDIT_POLL_INTERVAL_SECONDS}s, keyword list rebuilt from ALL jobs each cycle, posts AND comments both fetched")
     log.info("  Keywords source   : MongoDB (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
     log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
