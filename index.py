@@ -679,6 +679,15 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         "fetched_at":       datetime.now(timezone.utc),
     }
 
+    # Reddit POSTS carry a nested "reddit_comments" field — this is where
+    # any matching comments for THIS post get pushed into (see
+    # _attach_comment_to_post() below). Defaults to 0 (plain integer) when
+    # no matching comment has been found yet; becomes a list of comment
+    # texts the moment the first matching comment is attached. Twitter
+    # docs don't get this field — comments are a Reddit-only concept here.
+    if platform == "reddit":
+        doc["reddit_comments"] = 0
+
     try:
         db.flintel_signals.insert_one(doc)
         return True
@@ -688,6 +697,67 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         return False
     except Exception as exc:
         log.error(f"[MONGO] save_signal error | message_id={doc['message_id']} | {exc}")
+        return False
+
+
+def _extract_post_id_from_comment_link(link: str):
+    """Pulls the parent POST's reddit id out of a comment's permalink.
+    Reddit comment permalinks look like:
+        https://www.reddit.com/r/subreddit/comments/POST_ID/slug/COMMENT_ID/
+    so the id right after "/comments/" is always the parent post's id —
+    same id the post itself was saved under as message_id
+    f"reddit_{POST_ID}". Returns None if the link doesn't match the
+    expected shape (never raises)."""
+    if not link:
+        return None
+    m = re.search(r"/comments/([a-zA-Z0-9]+)/", link)
+    return m.group(1) if m else None
+
+
+def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_id: str, comment_text: str) -> bool:
+    """Finds the PARENT POST's already-saved document in flintel_signals
+    (matched on topic_key + message_id built from the comment's parent
+    post id) and pushes this comment's text into that document's
+    "reddit_comments" field — turning it from the default 0 into a list
+    on the first match, and appending to that list on every match after.
+
+    No separate comment document is created — comments live nested INSIDE
+    their post's own document, exactly as requested. If the parent post
+    was never itself saved (its own title/selftext never matched any
+    job's keywords, so no post document exists to attach to), there is
+    nowhere to nest this comment, so it is skipped — never raises."""
+    if not comment_post_id:
+        return False
+
+    post_message_id = f"reddit_{comment_post_id}"
+    try:
+        existing = db.flintel_signals.find_one(
+            {"topic_key": topic_key, "message_id": post_message_id}
+        )
+        if not existing:
+            # Parent post itself never matched/was never saved — nothing
+            # to attach this comment to.
+            return False
+
+        current = existing.get("reddit_comments", 0)
+        if not isinstance(current, list):
+            current = []
+
+        if comment_text in current:
+            # Same comment already attached (poller re-fetched the same
+            # rolling RSS window) — avoid duplicate entries.
+            return False
+
+        current.append(comment_text)
+
+        db.flintel_signals.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {"reddit_comments": current}},
+        )
+        return True
+
+    except Exception as exc:
+        log.error(f"[MONGO] attach_comment error | post_message_id={post_message_id} | {exc}")
         return False
 
 
@@ -746,6 +816,39 @@ def _match_and_save_entries(entries: list, reddit_jobs: list, cutoff: datetime, 
     return saved
 
 
+def _match_and_attach_comments(comment_entries: list, reddit_jobs: list, cutoff: datetime) -> int:
+    """Same keyword-matching pass as _match_and_save_entries() above, but
+    for COMMENTS specifically: instead of inserting a new standalone
+    document, a match gets nested into its PARENT POST's own document
+    (flintel_signals.<post doc>.reddit_comments) via
+    _attach_comment_to_post(). If the parent post was never saved (its
+    own text never matched any keyword), the comment has nowhere to nest
+    and is skipped — same "only matching ones, attached under their
+    post" behaviour requested."""
+    attached = 0
+    for entry in comment_entries:
+        created = entry.get("created_utc")
+        if created is not None:
+            post_dt = datetime.fromtimestamp(created, tz=timezone.utc)
+            if post_dt < cutoff:
+                continue  # older than lookback window — skip (rarely triggers on a live feed)
+
+        comment_text = entry.get("title", "")
+        comment_post_id = _extract_post_id_from_comment_link(entry.get("post_url", ""))
+
+        for job in reddit_jobs:
+            matched_keyword = _match_any_keyword(comment_text, job["keywords"])
+            if not matched_keyword:
+                continue
+            was_attached = _attach_comment_to_post(
+                job["topic_key"], matched_keyword, comment_post_id, comment_text
+            )
+            if was_attached:
+                attached += 1
+
+    return attached
+
+
 def run_reddit_poller():
     log.info(
         f"[REDDIT-POLLER] started | interval={REDDIT_POLL_INTERVAL_SECONDS}s | "
@@ -788,17 +891,21 @@ def run_reddit_poller():
                 entries = _fetch_reddit_rss_feed()
                 saved_posts = _match_and_save_entries(entries, reddit_jobs, cutoff, "reddit")
 
-                # ── Comments (new, additive) — same matching/saving path,
-                # just a different feed and a different platform tag. ──
+                # ── Comments — matched the same way as posts, but instead
+                # of becoming their own document, matches get nested into
+                # their PARENT POST's own document under "reddit_comments"
+                # (0 by default, becomes a list of matching comment texts
+                # once at least one is attached). No separate comment
+                # document is created. ──
                 comment_entries = _fetch_reddit_comments_rss_feed()
-                saved_comments = _match_and_save_entries(comment_entries, reddit_jobs, cutoff, "reddit_comment")
+                attached_comments = _match_and_attach_comments(comment_entries, reddit_jobs, cutoff)
 
-                saved_this_cycle = saved_posts + saved_comments
+                saved_this_cycle = saved_posts
 
                 log.info(
                     f"[REDDIT-POLLER] cycle done | jobs_checked={len(reddit_jobs)} | "
                     f"rss_entries={len(entries)} | comment_entries={len(comment_entries)} | "
-                    f"new_messages_saved={saved_this_cycle} (posts={saved_posts}, comments={saved_comments})"
+                    f"new_posts_saved={saved_posts} | comments_attached_to_posts={attached_comments}"
                 )
 
             except Exception as exc:
