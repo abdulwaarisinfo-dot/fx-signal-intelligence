@@ -714,12 +714,18 @@ def _extract_post_id_from_comment_link(link: str):
     return m.group(1) if m else None
 
 
-def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_id: str, comment_text: str) -> bool:
+def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_id: str, comment_text: str, comment_created_utc) -> bool:
     """Finds the PARENT POST's already-saved document in flintel_signals
     (matched on topic_key + message_id built from the comment's parent
-    post id) and pushes this comment's text into that document's
-    "reddit_comments" field — turning it from the default 0 into a list
-    on the first match, and appending to that list on every match after.
+    post id) and pushes this comment (text + its own date) into that
+    document's "reddit_comments" field — turning it from the default 0
+    into a list on the first match, and appending to that list on every
+    match after.
+
+    Each entry in "reddit_comments" is an object:
+        {"text": "<comment text>", "created_utc": <comment's own date>}
+    so the comment's date is preserved alongside its text, separate from
+    the parent post's own created_utc.
 
     No separate comment document is created — comments live nested INSIDE
     their post's own document, exactly as requested. If the parent post
@@ -728,6 +734,11 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
     nowhere to nest this comment, so it is skipped — never raises."""
     if not comment_post_id:
         return False
+
+    comment_created_dt = (
+        datetime.fromtimestamp(comment_created_utc, tz=timezone.utc)
+        if comment_created_utc else datetime.now(timezone.utc)
+    )
 
     post_message_id = f"reddit_{comment_post_id}"
     try:
@@ -743,12 +754,15 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
         if not isinstance(current, list):
             current = []
 
-        if comment_text in current:
-            # Same comment already attached (poller re-fetched the same
-            # rolling RSS window) — avoid duplicate entries.
+        # De-dupe on comment text (poller re-fetching the same rolling
+        # RSS window shouldn't create repeat entries).
+        if any(c.get("text") == comment_text for c in current if isinstance(c, dict)):
             return False
 
-        current.append(comment_text)
+        current.append({
+            "text":         comment_text,
+            "created_utc":  comment_created_dt,
+        })
 
         db.flintel_signals.update_one(
             {"_id": existing["_id"]},
@@ -834,6 +848,7 @@ def _match_and_attach_comments(comment_entries: list, reddit_jobs: list, cutoff:
                 continue  # older than lookback window — skip (rarely triggers on a live feed)
 
         comment_text = entry.get("title", "")
+        comment_created_utc = entry.get("created_utc")
         comment_post_id = _extract_post_id_from_comment_link(entry.get("post_url", ""))
 
         for job in reddit_jobs:
@@ -841,7 +856,7 @@ def _match_and_attach_comments(comment_entries: list, reddit_jobs: list, cutoff:
             if not matched_keyword:
                 continue
             was_attached = _attach_comment_to_post(
-                job["topic_key"], matched_keyword, comment_post_id, comment_text
+                job["topic_key"], matched_keyword, comment_post_id, comment_text, comment_created_utc
             )
             if was_attached:
                 attached += 1
