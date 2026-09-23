@@ -87,6 +87,19 @@ Requires the `feedparser` package (pip install feedparser) for RSS parsing.
 This file is intentionally simple: one always-on Reddit poller loop (now
 covering both posts AND comments), one job-driven worker pool for Twitter
 + job status, one shared save function.
+
+──────────────────────────────────────────────────────────────────────────
+DUAL-MONGODB NOTE (the one change made in this version):
+  - `flintel_signals` (raw fetched messages) still lives on the ORIGINAL
+    MongoDB connection (`MONGODB_URI` / `MONGODB_DB`) — exactly as before.
+  - EVERYTHING ELSE that touches Mongo — `flintel_search_jobs` (the job
+    queue) and `flintel_service_status` (the poller/worker heartbeat) —
+    now lives on a SECOND MongoDB connection (`MONGODB1_URI` /
+    `MONGODB1_DB`).
+  - Nothing else about the logic, structure, matching, saving, or field
+    names changed. This is purely "which client a given collection is
+    opened on".
+──────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -120,8 +133,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# ── Original MongoDB — used ONLY for `flintel_signals` now. ──
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "flintel_bot")
+
+# ── Second MongoDB — used for EVERYTHING ELSE: `flintel_search_jobs`
+# (the job queue) and `flintel_service_status` (poller/worker heartbeat).
+# This is the one addition in this version. ──
+MONGODB1_URI = os.getenv("MONGODB1_URI")
+MONGODB1_DB  = os.getenv("MONGODB1_DB", "flintel_bot")
 
 # How often the worker checks for a new pending job when idle.
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
@@ -227,22 +247,19 @@ log = logging.getLogger("flintel-fetch")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
-    """Connects to MongoDB and ensures only the indexes this simplified
-    service actually needs. No leftover indexes from the old scoring
-    pipeline."""
+    """Connects to BOTH MongoDB instances and ensures only the indexes
+    this simplified service actually needs, on whichever instance each
+    collection now lives on:
+
+      - `db`  (MONGODB_URI / MONGODB_DB)   -> `flintel_signals` ONLY.
+      - `db1` (MONGODB1_URI / MONGODB1_DB) -> `flintel_search_jobs` and
+                                               `flintel_service_status`.
+
+    No leftover indexes from the old scoring pipeline, on either side."""
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.server_info()
         db = client[MONGODB_DB]
-
-        # Jobs queue — web service inserts here, this worker consumes.
-        db.flintel_search_jobs.create_index(
-            [("status", ASCENDING), ("requested_at", ASCENDING)],
-            name="jobs_status_requested_at",
-        )
-        db.flintel_search_jobs.create_index(
-            [("topic_key", ASCENDING)], name="jobs_topic_key"
-        )
 
         # Raw fetched messages — this worker writes, web service reads.
         db.flintel_signals.create_index(
@@ -258,21 +275,37 @@ def get_database():
             [("created_utc", ASCENDING)], name="signals_created_utc"
         )
 
+        log.info(f"MongoDB (signals) connected | db={MONGODB_DB}")
+
+        client1 = MongoClient(MONGODB1_URI, serverSelectionTimeoutMS=5000)
+        client1.server_info()
+        db1 = client1[MONGODB1_DB]
+
+        # Jobs queue — web service inserts here, this worker consumes.
+        db1.flintel_search_jobs.create_index(
+            [("status", ASCENDING), ("requested_at", ASCENDING)],
+            name="jobs_status_requested_at",
+        )
+        db1.flintel_search_jobs.create_index(
+            [("topic_key", ASCENDING)], name="jobs_topic_key"
+        )
+
         # Live status/heartbeat flags — lets anything outside this process
         # check whether the Reddit poller and the Twitter/job worker pool
         # are currently running (True) or stopped (False).
-        db.flintel_service_status.create_index(
+        db1.flintel_service_status.create_index(
             [("service", ASCENDING)], unique=True, name="service_status_service_unique"
         )
 
-        log.info(f"MongoDB connected | db={MONGODB_DB}")
-        return db
+        log.info(f"MongoDB (jobs/status) connected | db1={MONGODB1_DB}")
+
+        return db, db1
     except Exception as exc:
         log.critical(f"MongoDB connection failed: {exc}")
         raise
 
 
-db = get_database()
+db, db1 = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB QUEUE HELPERS
@@ -281,7 +314,7 @@ db = get_database()
 def fetch_next_pending_job():
     """Atomically claims the oldest pending job so multiple worker instances
     (if ever scaled horizontally) never process the same job twice."""
-    return db.flintel_search_jobs.find_one_and_update(
+    return db1.flintel_search_jobs.find_one_and_update(
         {"status": "pending"},
         {"$set": {"status": "processing", "started_at": datetime.now(timezone.utc)}},
         sort=[("requested_at", ASCENDING)],
@@ -290,7 +323,7 @@ def fetch_next_pending_job():
 
 
 def mark_job_done(job_id, matched_count: int):
-    db.flintel_search_jobs.update_one(
+    db1.flintel_search_jobs.update_one(
         {"_id": job_id},
         {"$set": {
             "status": "done",
@@ -301,7 +334,7 @@ def mark_job_done(job_id, matched_count: int):
 
 
 def mark_job_error(job_id, error: str):
-    db.flintel_search_jobs.update_one(
+    db1.flintel_search_jobs.update_one(
         {"_id": job_id},
         {"$set": {
             "status": "error",
@@ -327,7 +360,7 @@ def enqueue_search_job(topic_key: str, keywords: list, targeting_platform: str =
     to be "picked up" first."""
     topic_key = topic_key.strip().lower()
     targeting_platform = (targeting_platform or "all").strip().lower()
-    db.flintel_search_jobs.update_one(
+    db1.flintel_search_jobs.update_one(
         {"topic_key": topic_key},
         {"$set": {
             "topic_key": topic_key,
@@ -357,13 +390,13 @@ def _set_service_status(service_name: str, running: bool):
     for both Reddit and Twitter so anything outside this process (web
     service, monitoring dashboard, etc.) can check either the same way:
 
-        db.flintel_service_status.find_one({"service": "reddit_poller"})
-        db.flintel_service_status.find_one({"service": "twitter_worker"})
+        db1.flintel_service_status.find_one({"service": "reddit_poller"})
+        db1.flintel_service_status.find_one({"service": "twitter_worker"})
 
     Never raises — a DB hiccup while updating status never crashes the
     actual poller/worker loop."""
     try:
-        db.flintel_service_status.update_one(
+        db1.flintel_service_status.update_one(
             {"service": service_name},
             {"$set": {
                 "service": service_name,
@@ -394,7 +427,7 @@ def _load_all_jobs_keyword_map() -> list:
     cycle matches against zero jobs; it never crashes the poller."""
     jobs = []
     try:
-        cursor = db.flintel_search_jobs.find(
+        cursor = db1.flintel_search_jobs.find(
             {}, {"topic_key": 1, "keywords": 1, "targeting_platform": 1}
         )
         for doc in cursor:
@@ -1087,7 +1120,7 @@ if __name__ == "__main__":
     log.info("=" * 70)
     log.info("  Platform          : Reddit (site-wide RSS — posts + comments, ALWAYS-ON poller) + Twitter/X (via RapidAPI, job-driven)")
     log.info(f"  Reddit fetch mode : continuous poller, every {REDDIT_POLL_INTERVAL_SECONDS}s, keyword list rebuilt from ALL jobs each cycle, posts AND comments both fetched")
-    log.info("  Keywords source   : MongoDB (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
+    log.info("  Keywords source   : MongoDB1 (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
     log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
@@ -1095,7 +1128,8 @@ if __name__ == "__main__":
     log.info("  Slack / HubSpot   : REMOVED")
     log.info("  Batching          : REMOVED — fetch and save immediately")
     log.info(f"  Worker concurrency: {WORKER_CONCURRENCY} parallel jobs (Twitter + job status) — a new search never waits on another")
-    log.info(f"  MongoDB DB        : {MONGODB_DB}")
+    log.info(f"  MongoDB (signals) : {MONGODB_DB}")
+    log.info(f"  MongoDB1 (jobs/status): {MONGODB1_DB}")
     log.info("=" * 70)
 
     start_all()
