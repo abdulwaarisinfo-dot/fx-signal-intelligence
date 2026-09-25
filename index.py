@@ -46,6 +46,16 @@ WHAT THIS SERVICE DOES (and nothing else):
      harmless; it will just keep hitting DuplicateKeyError for entries it
      already saved and only insert genuinely new ones.
 
+  4b. NEW — EMBEDDING LAYER (this is the one addition in this version):
+     The moment a post/comment's raw text is about to be saved into
+     `flintel_signals` (i.e. right before the very first insert of that
+     document — duplicates never re-run this), this service generates ONE
+     vector embedding from that document's own `text` field and stores it
+     on the SAME document under the `embedding` field. Nothing else about
+     the save path changed. See the "EMBEDDINGS" section below for full
+     details, config, and the one-time backfill helper for historical docs
+     that already have text but no embedding yet.
+
   5. Job status (`flintel_search_jobs.status`) is still driven by the
      worker pool (`process_job` / `run_worker`), exactly as before, for
      Twitter's sake and so the web service still has a "done" signal to
@@ -81,29 +91,68 @@ WHAT THIS SERVICE DELIBERATELY DOES NOT DO (removed on purpose):
   - No unused Mongo collections/indexes left over from the old scoring
     pipeline (flintel_pending_batch, flintel_batch_seconds,
     flintel_rescore_messages, flintel_queue_messages, etc. are all gone).
+  - No query embeddings, no vector search, no retrieval/ranking logic, no
+    Claude-generated search phrases, no intent classification. This
+    version ONLY generates and stores the per-document embedding at save
+    time (and via the optional one-time backfill helper) — nothing else
+    in the pipeline changed.
 
-Requires the `feedparser` package (pip install feedparser) for RSS parsing.
+Requires the `feedparser` package (pip install feedparser) for RSS parsing,
+and the `openai` package (pip install openai) for embedding generation.
 
 This file is intentionally simple: one always-on Reddit poller loop (now
 covering both posts AND comments), one job-driven worker pool for Twitter
-+ job status, one shared save function.
++ job status, one shared save function (now also generating+storing one
+embedding per document on first save).
 
 ──────────────────────────────────────────────────────────────────────────
-DUAL-MONGODB NOTE (the one change made in this version):
-  - `flintel_signals` (raw fetched messages) still lives on the ORIGINAL
-    MongoDB connection (`MONGODB_URI` / `MONGODB_DB`) — exactly as before.
+DUAL-MONGODB NOTE (unchanged from the previous version):
+  - `flintel_signals` (raw fetched messages, now also carrying each
+    document's own `embedding` field) still lives on the ORIGINAL MongoDB
+    connection (`MONGODB_URI` / `MONGODB_DB`) — exactly as before.
   - EVERYTHING ELSE that touches Mongo — `flintel_search_jobs` (the job
     queue) and `flintel_service_status` (the poller/worker heartbeat) —
-    now lives on a SECOND MongoDB connection (`MONGODB1_URI` /
+    still lives on the SECOND MongoDB connection (`MONGODB1_URI` /
     `MONGODB1_DB`).
   - Nothing else about the logic, structure, matching, saving, or field
-    names changed. This is purely "which client a given collection is
-    opened on".
+    names changed, other than the new `embedding` field described below.
+──────────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────────
+EMBEDDINGS — WHAT WAS ADDED IN THIS VERSION (and nothing else):
+  - One embedding is generated from a document's own `text` field, once,
+    at the moment that document is first saved into `flintel_signals`
+    (inside `_save_signal`, right before `insert_one`). It is stored on
+    that same document under `embedding` (a plain list of floats).
+  - Embeddings are NEVER shared between documents — each document's
+    embedding comes only from that document's own `text`.
+  - Duplicates (an entry already saved before — same unique message_id)
+    never reach the embedding call at all, because `_save_signal` already
+    skips the whole insert via `DuplicateKeyError` before an embedding
+    would ever be generated for it again. So an already-stored, unchanged
+    post never gets re-embedded.
+  - If embedding generation fails or is disabled (`EMBEDDING_ENABLED` =
+    False, or no API key configured), the document is still saved exactly
+    as before — `embedding` is simply set to `None` on that document
+    rather than blocking the save. Nothing about the existing fetch/match/
+    save pipeline is allowed to break because of this.
+  - `backfill_missing_embeddings()` is a one-time, on-demand helper (run
+    manually via `python flintel_service.py --backfill-embeddings`) that
+    scans EXISTING documents in `flintel_signals` that already have a
+    `text` field but no `embedding` (or `embedding: None`), and generates
+    an embedding for each straight from that already-stored `text` — it
+    never re-fetches anything from Reddit/Twitter. This does not run
+    automatically on every startup; it only runs when explicitly invoked,
+    so it never interferes with the normal always-on poller / worker
+    pool behaviour.
+  - Nothing else — no query embeddings, no vector index creation, no
+    vector search, no ranking/retrieval changes.
 ──────────────────────────────────────────────────────────────────────────
 """
 
 import os
 import re
+import sys
 import html
 import time
 import logging
@@ -139,7 +188,7 @@ MONGODB_DB  = os.getenv("MONGODB_DB", "flintel_bot")
 
 # ── Second MongoDB — used for EVERYTHING ELSE: `flintel_search_jobs`
 # (the job queue) and `flintel_service_status` (poller/worker heartbeat).
-# This is the one addition in this version. ──
+# This is the one addition from the previous version. ──
 MONGODB1_URI = os.getenv("MONGODB1_URI")
 MONGODB1_DB  = os.getenv("MONGODB1_DB", "flintel_bot")
 
@@ -230,6 +279,35 @@ def _is_twitter_enabled() -> bool:
 TWITTER_HOST           = "twitter-api45.p.rapidapi.com"
 TWITTER_RESULTS_PER_QUERY = int(os.getenv("TWITTER_RESULTS_PER_QUERY", "50"))
 TWITTER_REQUEST_TIMEOUT   = int(os.getenv("TWITTER_REQUEST_TIMEOUT", "15"))
+
+# ── EMBEDDINGS — the one new piece of config in this version. Everything
+# here is additive; none of the settings above were touched. ──
+#
+# Master ON/OFF switch, same live-checked pattern as REDDIT_ENABLED /
+# TWITTER_ENABLED above. EMBEDDING_ENABLED=True (default) -> every newly
+# saved document gets an embedding generated from its own text.
+# EMBEDDING_ENABLED=False -> _save_signal still saves documents exactly as
+# before, just with embedding=None — fetching/matching/saving never stops
+# or breaks because of this switch.
+def _is_embedding_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("EMBEDDING_ENABLED", True) and bool(os.getenv("OPENAI_API_KEY", ""))
+
+
+EMBEDDING_PROVIDER   = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
+EMBEDDING_TIMEOUT    = int(os.getenv("EMBEDDING_TIMEOUT", "20"))
+# Max characters of a document's text sent to the embedding model per call
+# (keeps a single unusually long post/comment from blowing past the
+# model's token limit). Purely a safety truncation, does not change what
+# gets stored as `text` on the document itself.
+EMBEDDING_MAX_CHARS  = int(os.getenv("EMBEDDING_MAX_CHARS", "8000"))
+# How many documents backfill_missing_embeddings() updates per DB batch.
+EMBEDDING_BACKFILL_BATCH_SIZE = int(os.getenv("EMBEDDING_BACKFILL_BATCH_SIZE", "100"))
+# Politeness delay between individual embedding calls during backfill, so
+# a large historical backlog doesn't hammer the embedding API all at once.
+EMBEDDING_BACKFILL_GAP_SECONDS = float(os.getenv("EMBEDDING_BACKFILL_GAP_SECONDS", "0.2"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -672,6 +750,164 @@ def _fetch_twitter_search(keyword: str) -> list:
         return []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EMBEDDINGS — NEW SECTION IN THIS VERSION. Everything below is additive:
+# one function that turns a document's own text into one vector, called
+# from exactly one place (_save_signal, right before insert), plus one
+# manually-triggered backfill helper for historical documents. Nothing
+# else in the file calls these, and these never touch fetching/matching.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_openai_client = None
+
+
+def _get_openai_client():
+    """Lazily creates (once) and reuses a single OpenAI client for the
+    lifetime of the process. Returns None (never raises) if the `openai`
+    package isn't installed or OPENAI_API_KEY isn't set — callers treat
+    that as "embeddings unavailable right now" and just store
+    embedding=None rather than failing the save."""
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+
+    if not OPENAI_API_KEY:
+        return None
+
+    try:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=EMBEDDING_TIMEOUT)
+        return _openai_client
+    except Exception as exc:
+        log.warning(f"[EMBEDDING] could not initialise OpenAI client: {exc}")
+        return None
+
+
+def generate_embedding(text: str):
+    """Generates ONE embedding vector from ONE piece of text, using the
+    configured embedding model (EMBEDDING_MODEL, default
+    "text-embedding-3-small"). This is the ONLY function in the whole
+    service that talks to the embedding API.
+
+    - One call in, one embedding out — this function is never given more
+      than one document's text at a time, and never mixes text from more
+      than one document into a single embedding call, so embeddings are
+      never shared across posts.
+    - Returns a plain list[float] on success, or None on any failure
+      (missing/invalid key, network error, empty text, provider outage,
+      etc.) — it NEVER raises, so a failed embedding call can never break
+      or block the fetch/match/save pipeline that calls it.
+    - Respects EMBEDDING_ENABLED (checked live by the caller via
+      _is_embedding_enabled()) — this function itself doesn't check the
+      switch again; callers gate on it first so this stays a pure
+      "text in, vector out" helper.
+    """
+    if not text or not text.strip():
+        return None
+
+    client = _get_openai_client()
+    if client is None:
+        return None
+
+    # Simple safety truncation — keeps one unusually long document from
+    # exceeding the embedding model's input limit. Does not affect what
+    # is stored as the document's own `text` field, only what is sent to
+    # the embedding call.
+    payload_text = text.strip()[:EMBEDDING_MAX_CHARS]
+
+    try:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=payload_text,
+        )
+        return response.data[0].embedding
+    except Exception as exc:
+        log.warning(f"[EMBEDDING] generation failed | model={EMBEDDING_MODEL} | {exc}")
+        return None
+
+
+def backfill_missing_embeddings():
+    """ONE-TIME / ON-DEMAND helper — NOT called automatically anywhere in
+    the normal poller/worker startup path. Run it manually when you want
+    to generate embeddings for documents that were saved to
+    flintel_signals BEFORE this embedding layer existed (or that were
+    saved while EMBEDDING_ENABLED was False):
+
+        python flintel_service.py --backfill-embeddings
+
+    What it does, and nothing more:
+      1. Finds documents in flintel_signals that already have a `text`
+         field but no usable `embedding` (missing OR None OR empty list).
+      2. For each one, generates an embedding from that document's own
+         ALREADY-STORED `text` — it never re-fetches anything from Reddit
+         or Twitter, and never touches any other field on the document.
+      3. Writes the embedding onto that same document.
+
+    Documents that already have a real embedding are left completely
+    untouched (never regenerated). Processes in batches
+    (EMBEDDING_BACKFILL_BATCH_SIZE at a time) with a small politeness
+    delay between embedding calls (EMBEDDING_BACKFILL_GAP_SECONDS) so a
+    large backlog doesn't hammer the embedding API all at once. Safe to
+    stop and re-run at any time — it always just picks up wherever
+    documents are still missing an embedding."""
+    if not _is_embedding_enabled():
+        log.warning(
+            "[EMBEDDING-BACKFILL] EMBEDDING_ENABLED is False or OPENAI_API_KEY is not "
+            "set — nothing to do. Set both and re-run."
+        )
+        return
+
+    query = {
+        "text": {"$exists": True, "$ne": ""},
+        "$or": [
+            {"embedding": {"$exists": False}},
+            {"embedding": None},
+            {"embedding": []},
+        ],
+    }
+
+    total_scanned = 0
+    total_updated = 0
+    total_failed = 0
+
+    log.info("[EMBEDDING-BACKFILL] starting one-time backfill of missing embeddings...")
+
+    while True:
+        batch = list(
+            db.flintel_signals.find(query, {"_id": 1, "text": 1}).limit(EMBEDDING_BACKFILL_BATCH_SIZE)
+        )
+        if not batch:
+            break
+
+        for doc in batch:
+            total_scanned += 1
+            embedding = generate_embedding(doc.get("text", ""))
+
+            if embedding is not None:
+                try:
+                    db.flintel_signals.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"embedding": embedding}},
+                    )
+                    total_updated += 1
+                except Exception as exc:
+                    total_failed += 1
+                    log.error(f"[EMBEDDING-BACKFILL] update failed | _id={doc['_id']} | {exc}")
+            else:
+                total_failed += 1
+                log.warning(f"[EMBEDDING-BACKFILL] embedding generation failed | _id={doc['_id']}")
+
+            time.sleep(EMBEDDING_BACKFILL_GAP_SECONDS)
+
+        log.info(
+            f"[EMBEDDING-BACKFILL] progress | scanned={total_scanned} | "
+            f"updated={total_updated} | failed={total_failed}"
+        )
+
+    log.info(
+        f"[EMBEDDING-BACKFILL] done | scanned={total_scanned} | "
+        f"updated={total_updated} | failed={total_failed}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -682,11 +918,14 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
     """Upserts a raw fetched post/comment (Reddit post, Reddit comment, or
     Twitter — same shape from any fetch function) into flintel_signals. No
     scoring, no Claude, no derived fields — just the raw message plus which
-    topic/keyword found it. Duplicate entries (already fetched before, by
-    this cycle or a past one) are silently skipped via the unique index —
-    this is exactly what makes it safe for the Reddit poller to keep
-    re-fetching the same rolling RSS window over and over: only genuinely
-    new entries get inserted."""
+    topic/keyword found it, plus (new in this version) one embedding
+    generated from this document's own text. Duplicate entries (already
+    fetched before, by this cycle or a past one) are silently skipped via
+    the unique index — this is exactly what makes it safe for the Reddit
+    poller to keep re-fetching the same rolling RSS window over and over:
+    only genuinely new entries get inserted, and only genuinely new
+    entries ever trigger an embedding call — an already-saved, unchanged
+    post is never re-embedded."""
     created = post.get("created_utc")
     created_dt = (
         datetime.fromtimestamp(created, tz=timezone.utc) if created else datetime.now(timezone.utc)
@@ -712,6 +951,14 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         "fetched_at":       datetime.now(timezone.utc),
     }
 
+    # ── NEW: one embedding, generated from THIS document's own `text`
+    # only, stored on this same document. Generated once, right here,
+    # right before the first (and only, thanks to the unique index below)
+    # insert of this document — never regenerated afterwards. If
+    # embeddings are disabled or generation fails for any reason, this is
+    # simply None and the save proceeds exactly as it always did. ──
+    doc["embedding"] = generate_embedding(text) if _is_embedding_enabled() else None
+
     # Reddit POSTS carry a nested "reddit_comments" field — this is where
     # any matching comments for THIS post get pushed into (see
     # _attach_comment_to_post() below). Defaults to 0 (plain integer) when
@@ -726,7 +973,8 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         return True
     except DuplicateKeyError:
         # Already fetched this post before (possibly for a different
-        # topic/keyword search that also matched it) — not an error.
+        # topic/keyword search that also matched it) — not an error, and
+        # no embedding call happens for it again.
         return False
     except Exception as exc:
         log.error(f"[MONGO] save_signal error | message_id={doc['message_id']} | {exc}")
@@ -764,7 +1012,11 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
     their post's own document, exactly as requested. If the parent post
     was never itself saved (its own title/selftext never matched any
     job's keywords, so no post document exists to attach to), there is
-    nowhere to nest this comment, so it is skipped — never raises."""
+    nowhere to nest this comment, so it is skipped — never raises.
+
+    NOTE: this nested comment array does NOT get its own embedding — the
+    embedding layer only applies to documents saved via _save_signal
+    (i.e. the post's own text), exactly as scoped."""
     if not comment_post_id:
         return False
 
@@ -820,7 +1072,8 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
 #     2. rebuild the keyword list from EVERY job in flintel_search_jobs
 #     3. match + save (posts and comments both go into flintel_signals,
 #        same as before — comments just carry platform="reddit_comment"
-#        so they can be told apart from posts later if needed)
+#        so they can be told apart from posts later if needed; every
+#        newly saved post also gets its own embedding via _save_signal)
 #     4. sleep REDDIT_POLL_INTERVAL_SECONDS, repeat
 #
 # Because step 2 re-reads the jobs collection from scratch every cycle,
@@ -999,7 +1252,9 @@ def process_job(job: dict) -> int:
 
     # ── Twitter/X (only if RAPID_API_KEY is configured AND this job's
     #    targeting_platform allows it) — unchanged, one real search call
-    #    per keyword since RapidAPI supports actual query search. ──
+    #    per keyword since RapidAPI supports actual query search. Every
+    #    newly saved tweet also gets its own embedding via _save_signal,
+    #    same as Reddit posts. ──
     if fetch_twitter:
         for keyword in keywords:
             twitter_posts = _fetch_twitter_search(keyword)
@@ -1020,8 +1275,6 @@ def process_job(job: dict) -> int:
 
     log.info(f"[JOB] DONE | topic_key={topic_key} | new_messages_saved={matched_count} (Twitter only — Reddit accrues continuously via the poller)")
     return matched_count
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1115,6 +1368,18 @@ def start_all():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # NEW: optional one-time backfill mode. Running with this flag does
+    # NOT start the poller/worker pool — it only generates embeddings for
+    # existing flintel_signals documents that have text but no embedding
+    # yet, then exits. Normal `python flintel_service.py` (no flag) starts
+    # everything exactly as before.
+    if "--backfill-embeddings" in sys.argv:
+        log.info("=" * 70)
+        log.info("  FLINTEL — ONE-TIME EMBEDDING BACKFILL (historical documents only)")
+        log.info("=" * 70)
+        backfill_missing_embeddings()
+        sys.exit(0)
+
     log.info("=" * 70)
     log.info("  FLINTEL — SIMPLIFIED FETCH-ONLY BACKGROUND SERVICE")
     log.info("=" * 70)
@@ -1123,6 +1388,7 @@ if __name__ == "__main__":
     log.info("  Keywords source   : MongoDB1 (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
     log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
+    log.info(f"  Embeddings        : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved document)")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
     log.info("  Scoring           : NONE — raw messages only")
     log.info("  Slack / HubSpot   : REMOVED")
@@ -1130,6 +1396,7 @@ if __name__ == "__main__":
     log.info(f"  Worker concurrency: {WORKER_CONCURRENCY} parallel jobs (Twitter + job status) — a new search never waits on another")
     log.info(f"  MongoDB (signals) : {MONGODB_DB}")
     log.info(f"  MongoDB1 (jobs/status): {MONGODB1_DB}")
+    log.info("  Embedding backfill: run with --backfill-embeddings for historical docs missing an embedding")
     log.info("=" * 70)
 
     start_all()
