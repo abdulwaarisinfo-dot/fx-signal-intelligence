@@ -39,22 +39,19 @@ WHAT THIS SERVICE DOES (and nothing else):
      "keep polling forever" workaround.
 
   4. Saves every matched post/comment as a raw, unscored message into
-     MongoDB collection `flintel_signals`, tagged with the job's topic_key
-     and platform ("reddit", "reddit_comment", or "twitter"). Duplicate
-     entries are silently skipped via the unique index on message_id — so
-     the continuous poller re-fetching the same RSS window over and over is
-     harmless; it will just keep hitting DuplicateKeyError for entries it
-     already saved and only insert genuinely new ones.
+     MongoDB collection `flintel_signals` (and/or MySQL, see "MYSQL SINK"
+     below), tagged with the job's topic_key and platform ("reddit",
+     "reddit_comment", or "twitter"). Duplicate entries are silently
+     skipped via the unique index on message_id — so the continuous poller
+     re-fetching the same RSS window over and over is harmless; it will
+     just keep skipping entries it already saved and only insert genuinely
+     new ones.
 
-  4b. NEW — EMBEDDING LAYER (this is the one addition in this version):
+  4b. EMBEDDING LAYER:
      The moment a post/comment's raw text is about to be saved into
-     `flintel_signals` (i.e. right before the very first insert of that
-     document — duplicates never re-run this), this service generates ONE
-     vector embedding from that document's own `text` field and stores it
-     on the SAME document under the `embedding` field. Nothing else about
-     the save path changed. See the "EMBEDDINGS" section below for full
-     details, config, and the one-time backfill helper for historical docs
-     that already have text but no embedding yet.
+     `flintel_signals`, this service generates ONE vector embedding from
+     that document's own `text` field and stores it on the SAME document
+     under the `embedding` field. See the "EMBEDDINGS" section below.
 
   5. Job status (`flintel_search_jobs.status`) is still driven by the
      worker pool (`process_job` / `run_worker`), exactly as before, for
@@ -98,63 +95,91 @@ WHAT THIS SERVICE DELIBERATELY DOES NOT DO (removed on purpose):
     in the pipeline changed.
 
 Requires the `feedparser` package (pip install feedparser) for RSS parsing,
-and the `openai` package (pip install openai) for embedding generation.
+the `openai` package (pip install openai) for embedding generation, and
+`PyMySQL` (pip install PyMySQL) only if the MySQL sink is used.
 
 This file is intentionally simple: one always-on Reddit poller loop (now
 covering both posts AND comments), one job-driven worker pool for Twitter
-+ job status, one shared save function (now also generating+storing one
-embedding per document on first save).
++ job status, one shared save function (generating+storing one embedding
+per document on first save).
 
 ──────────────────────────────────────────────────────────────────────────
-DUAL-MONGODB NOTE (unchanged from the previous version):
-  - `flintel_signals` (raw fetched messages, now also carrying each
+DUAL-MONGODB NOTE (unchanged):
+  - `flintel_signals` (raw fetched messages, also carrying each
     document's own `embedding` field) still lives on the ORIGINAL MongoDB
     connection (`MONGODB_URI` / `MONGODB_DB`) — exactly as before.
   - EVERYTHING ELSE that touches Mongo — `flintel_search_jobs` (the job
     queue) and `flintel_service_status` (the poller/worker heartbeat) —
     still lives on the SECOND MongoDB connection (`MONGODB1_URI` /
     `MONGODB1_DB`).
-  - Nothing else about the logic, structure, matching, saving, or field
-    names changed, other than the new `embedding` field described below.
 ──────────────────────────────────────────────────────────────────────────
 
 ──────────────────────────────────────────────────────────────────────────
-EMBEDDINGS — WHAT WAS ADDED IN THIS VERSION (and nothing else):
+EMBEDDINGS:
   - One embedding is generated from a document's own `text` field, once,
-    at the moment that document is first saved into `flintel_signals`
-    (inside `_save_signal`, right before `insert_one`). It is stored on
-    that same document under `embedding` (a plain list of floats).
+    when that document is first saved (inside `_save_signal`). It is
+    stored on that same document under `embedding` (Mongo: a plain list
+    of floats; MySQL: float32 little-endian BLOB, see below).
   - Embeddings are NEVER shared between documents — each document's
     embedding comes only from that document's own `text`.
-  - Duplicates (an entry already saved before — same unique message_id)
-    never reach the embedding call at all, because `_save_signal` already
-    skips the whole insert via `DuplicateKeyError` before an embedding
-    would ever be generated for it again. So an already-stored, unchanged
-    post never gets re-embedded.
   - If embedding generation fails or is disabled (`EMBEDDING_ENABLED` =
     False, or no API key configured), the document is still saved exactly
-    as before — `embedding` is simply set to `None` on that document
-    rather than blocking the save. Nothing about the existing fetch/match/
-    save pipeline is allowed to break because of this.
+    as before — `embedding` is simply None rather than blocking the save.
   - `backfill_missing_embeddings()` is a one-time, on-demand helper (run
-    manually via `python flintel_service.py --backfill-embeddings`) that
-    scans EXISTING documents in `flintel_signals` that already have a
-    `text` field but no `embedding` (or `embedding: None`), and generates
-    an embedding for each straight from that already-stored `text` — it
-    never re-fetches anything from Reddit/Twitter. This does not run
-    automatically on every startup; it only runs when explicitly invoked,
-    so it never interferes with the normal always-on poller / worker
-    pool behaviour.
+    manually via `python flintel_service.py --backfill-embeddings`) for
+    EXISTING Mongo documents that have `text` but no `embedding`. It does
+    not run automatically. (There is NO MySQL backfill.)
   - Nothing else — no query embeddings, no vector index creation, no
     vector search, no ranking/retrieval changes.
+──────────────────────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────────────────────
+MYSQL SINK (added in this version):
+  - Two live on/off switches (checked via load_dotenv(override=True) +
+    _env_bool on every save, no restart needed — same pattern as
+    REDDIT_ENABLED / TWITTER_ENABLED / EMBEDDING_ENABLED):
+        MONGODB_DATA = true/false   (default TRUE)  -> save into Mongo
+                                                       `flintel_signals`
+        MYSQL_DATA   = true/false   (default FALSE) -> save into MySQL
+                                                       table `flintel_signals`
+    With the defaults, behaviour is identical to before (Mongo only).
+    If BOTH are false nothing is saved, a warning is logged every poller
+    cycle, and nothing crashes.
+  - MySQL is used purely as a CLIENT (PyMySQL). The MySQL server runs
+    separately (Render Private Service + Persistent Disk). This service
+    has no disk and writes nothing to SQLite/local files.
+  - Table `flintel_signals` is created with CREATE TABLE IF NOT EXISTS
+    only (never DROP/ALTER) — at startup via init_mysql() and lazily on the
+    first save if it doesn't exist yet. UNIQUE key is `message_id` only,
+    exactly like Mongo, so both sinks dedupe identically.
+  - Embedding is stored as a BLOB: float32, little-endian, flat bytes
+    (1536 * 4 = 6144 bytes for text-embedding-3-small), plus
+    `embedding_dim` and `embedding_model`. Never JSON/TEXT. Mongo's
+    embedding format (list of floats) is unchanged. Helpers:
+    _embedding_to_blob() / _blob_to_embedding().
+  - One PyMySQL connection PER THREAD (threading.local), ping(reconnect)
+    before every use, one retry on a dropped connection. A MySQL failure
+    never blocks the Mongo save and never crashes a poller/worker thread.
+
+  BUG FIX (duplicate embeddings): previously `_save_signal` generated the
+  OpenAI embedding BEFORE insert_one, so every duplicate (the poller
+  re-fetches the same RSS window every 30s) still cost one embedding call.
+  Now an existence check runs first in every enabled sink; the embedding
+  is generated only if at least one enabled sink does NOT have the post
+  yet, it is generated at most ONCE and shared by both sinks, and if Mongo
+  already has the post WITH an embedding that vector is reused for MySQL
+  (zero OpenAI calls). DuplicateKeyError / MySQL 1062 are still caught on
+  insert to cover races between threads.
 ──────────────────────────────────────────────────────────────────────────
 """
 
 import os
 import re
 import sys
+import json
 import html
 import time
+import array
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -164,6 +189,17 @@ import feedparser
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
+
+try:  # PyMySQL is only needed when MYSQL_DATA is used
+    import pymysql
+    import pymysql.err
+except ImportError:  # pragma: no cover
+    pymysql = None
+
+try:  # numpy is optional; array.array fallback is used if missing
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / CONFIG
@@ -187,10 +223,34 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "flintel_bot")
 
 # ── Second MongoDB — used for EVERYTHING ELSE: `flintel_search_jobs`
-# (the job queue) and `flintel_service_status` (poller/worker heartbeat).
-# This is the one addition from the previous version. ──
+# (the job queue) and `flintel_service_status` (poller/worker heartbeat). ──
 MONGODB1_URI = os.getenv("MONGODB1_URI")
 MONGODB1_DB  = os.getenv("MONGODB1_DB", "flintel_bot")
+
+# ── SAVE-TARGET SWITCHES (live-checked, no restart needed) ──
+# MONGODB_DATA (default True)  -> save into Mongo `flintel_signals`.
+# MYSQL_DATA   (default False) -> save into MySQL `flintel_signals`.
+def _is_mongodb_data_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("MONGODB_DATA", True)
+
+
+def _is_mysql_data_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("MYSQL_DATA", False)
+
+
+# ── MySQL connection settings (client only). Password is NEVER logged. ──
+MYSQL_HOST            = os.getenv("MYSQL_HOST", "")
+MYSQL_PORT            = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER            = os.getenv("MYSQL_USER", "")
+MYSQL_PASSWORD        = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE        = os.getenv("MYSQL_DATABASE", "")
+MYSQL_SSL             = _env_bool("MYSQL_SSL", False)
+MYSQL_SSL_CA          = os.getenv("MYSQL_SSL_CA", "")  # optional CA file when MYSQL_SSL=true
+MYSQL_CONNECT_TIMEOUT = int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10"))
+MYSQL_READ_TIMEOUT    = int(os.getenv("MYSQL_READ_TIMEOUT", "30"))
+MYSQL_WRITE_TIMEOUT   = int(os.getenv("MYSQL_WRITE_TIMEOUT", "30"))
 
 # How often the worker checks for a new pending job when idle.
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
@@ -248,8 +308,7 @@ REDDIT_RSS_URL = os.getenv("REDDIT_RSS_URL", "https://www.reddit.com/r/all/new.r
 
 # Site-wide COMMENTS RSS feed — r/all's new-comments stream, same shape /
 # same rolling-window behaviour as REDDIT_RSS_URL above, just comments
-# instead of posts. Added purely additively — everything else in the file
-# is untouched.
+# instead of posts.
 REDDIT_COMMENTS_RSS_URL = os.getenv(
     "REDDIT_COMMENTS_RSS_URL", "https://www.reddit.com/r/all/comments/.rss"
 )
@@ -280,8 +339,7 @@ TWITTER_HOST           = "twitter-api45.p.rapidapi.com"
 TWITTER_RESULTS_PER_QUERY = int(os.getenv("TWITTER_RESULTS_PER_QUERY", "50"))
 TWITTER_REQUEST_TIMEOUT   = int(os.getenv("TWITTER_REQUEST_TIMEOUT", "15"))
 
-# ── EMBEDDINGS — the one new piece of config in this version. Everything
-# here is additive; none of the settings above were touched. ──
+# ── EMBEDDINGS config.
 #
 # Master ON/OFF switch, same live-checked pattern as REDDIT_ENABLED /
 # TWITTER_ENABLED above. EMBEDDING_ENABLED=True (default) -> every newly
@@ -308,6 +366,9 @@ EMBEDDING_BACKFILL_BATCH_SIZE = int(os.getenv("EMBEDDING_BACKFILL_BATCH_SIZE", "
 # Politeness delay between individual embedding calls during backfill, so
 # a large historical backlog doesn't hammer the embedding API all at once.
 EMBEDDING_BACKFILL_GAP_SECONDS = float(os.getenv("EMBEDDING_BACKFILL_GAP_SECONDS", "0.2"))
+# Expected vector length for the MySQL BLOB sanity check (1536 floats for
+# text-embedding-3-small -> 6144 bytes).
+EMBEDDING_EXPECTED_DIM = int(os.getenv("EMBEDDING_EXPECTED_DIM", "1536"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -333,7 +394,10 @@ def get_database():
       - `db1` (MONGODB1_URI / MONGODB1_DB) -> `flintel_search_jobs` and
                                                `flintel_service_status`.
 
-    No leftover indexes from the old scoring pipeline, on either side."""
+    No leftover indexes from the old scoring pipeline, on either side.
+    (`db` is connected at startup even when MONGODB_DATA=false, so flipping
+    MONGODB_DATA to true live just works. MySQL is NOT handled here — see
+    init_mysql().)"""
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.server_info()
@@ -600,9 +664,7 @@ def _fetch_reddit_rss_feed() -> list:
 def _fetch_reddit_comments_rss_feed() -> list:
     """Fetches the SITE-WIDE r/all "new comments" RSS feed — ONE request,
     exact same approach/shape as _fetch_reddit_rss_feed() above, just
-    pointed at REDDIT_COMMENTS_RSS_URL instead of REDDIT_RSS_URL. Added
-    purely additively so the existing posts fetch function above is left
-    completely untouched.
+    pointed at REDDIT_COMMENTS_RSS_URL instead of REDDIT_RSS_URL.
 
     A comment RSS entry's "title" field from Reddit is usually something
     like "Comment by u/someone on some post title" — not the comment body
@@ -751,11 +813,9 @@ def _fetch_twitter_search(keyword: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMBEDDINGS — NEW SECTION IN THIS VERSION. Everything below is additive:
-# one function that turns a document's own text into one vector, called
-# from exactly one place (_save_signal, right before insert), plus one
-# manually-triggered backfill helper for historical documents. Nothing
-# else in the file calls these, and these never touch fetching/matching.
+# EMBEDDINGS — one function that turns a document's own text into one
+# vector, called from exactly one place (_save_signal), plus one
+# manually-triggered backfill helper for historical Mongo documents.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _openai_client = None
@@ -829,8 +889,8 @@ def generate_embedding(text: str):
 def backfill_missing_embeddings():
     """ONE-TIME / ON-DEMAND helper — NOT called automatically anywhere in
     the normal poller/worker startup path. Run it manually when you want
-    to generate embeddings for documents that were saved to
-    flintel_signals BEFORE this embedding layer existed (or that were
+    to generate embeddings for MONGO documents that were saved to
+    flintel_signals BEFORE the embedding layer existed (or that were
     saved while EMBEDDING_ENABLED was False):
 
         python flintel_service.py --backfill-embeddings
@@ -849,7 +909,8 @@ def backfill_missing_embeddings():
     delay between embedding calls (EMBEDDING_BACKFILL_GAP_SECONDS) so a
     large backlog doesn't hammer the embedding API all at once. Safe to
     stop and re-run at any time — it always just picks up wherever
-    documents are still missing an embedding."""
+    documents are still missing an embedding. (Mongo only — there is no
+    MySQL backfill.)"""
     if not _is_embedding_enabled():
         log.warning(
             "[EMBEDDING-BACKFILL] EMBEDDING_ENABLED is False or OPENAI_API_KEY is not "
@@ -911,21 +972,345 @@ def backfill_missing_embeddings():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MYSQL SINK — client only (PyMySQL). The MySQL server runs elsewhere.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MYSQL_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS flintel_signals (
+    id               BIGINT        NOT NULL AUTO_INCREMENT,
+    message_id       VARCHAR(191)  NOT NULL,
+    topic_key        VARCHAR(255)  NOT NULL,
+    search_keyword   VARCHAR(255)  NULL,
+    platform         VARCHAR(32)   NOT NULL,
+    subreddit        VARCHAR(128)  NULL,
+    username         VARCHAR(255)  NULL,
+    title            MEDIUMTEXT    NULL,
+    text             MEDIUMTEXT    NULL,
+    post_url         VARCHAR(1024) NULL,
+    score            INT           DEFAULT 0,
+    num_comments     INT           DEFAULT 0,
+    created_utc      DATETIME(3)   NOT NULL,
+    fetched_at       DATETIME(3)   NOT NULL,
+    embedding        BLOB          NULL,
+    embedding_dim    SMALLINT      NULL,
+    embedding_model  VARCHAR(64)   NULL,
+    reddit_comments  JSON          NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_signals_message_id (message_id),
+    KEY idx_signals_topic_key (topic_key),
+    KEY idx_signals_search_keyword (search_keyword),
+    KEY idx_signals_created_utc (created_utc),
+    KEY idx_signals_fetched_at (fetched_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+# Column order used for INSERT (params must follow this order).
+_MYSQL_COLUMNS = [
+    "message_id", "topic_key", "search_keyword", "platform", "subreddit",
+    "username", "title", "text", "post_url", "score", "num_comments",
+    "created_utc", "fetched_at", "embedding", "embedding_dim",
+    "embedding_model", "reddit_comments",
+]
+_MYSQL_INSERT_SQL = (
+    "INSERT INTO flintel_signals ("
+    + ", ".join(f"`{c}`" for c in _MYSQL_COLUMNS)
+    + ") VALUES (" + ", ".join(["%s"] * len(_MYSQL_COLUMNS)) + ")"
+)
+
+_mysql_local = threading.local()          # one connection PER THREAD
+_mysql_table_ready = False
+_mysql_table_lock = threading.Lock()
+
+
+# ── Embedding <-> BLOB (float32, little-endian, flat bytes) ──────────────────
+
+def _embedding_to_blob(vec):
+    """list[float] -> float32 little-endian bytes. Returns None for a
+    None/empty vector. Raises ValueError if the byte length isn't
+    EMBEDDING_EXPECTED_DIM * 4 (1536 * 4 = 6144 by default)."""
+    if vec is None or len(vec) == 0:
+        return None
+    if _np is not None:
+        raw = _np.asarray(vec, dtype="<f4").tobytes()
+    else:
+        arr = array.array("f", vec)
+        if sys.byteorder == "big":
+            arr.byteswap()
+        raw = arr.tobytes()
+    expected = EMBEDDING_EXPECTED_DIM * 4
+    if len(raw) != expected:
+        raise ValueError(
+            f"embedding blob length {len(raw)} != expected {expected} "
+            f"(dim={len(vec)}, expected_dim={EMBEDDING_EXPECTED_DIM})"
+        )
+    return raw
+
+
+def _blob_to_embedding(blob):
+    """float32 little-endian bytes -> list[float] (float32 precision).
+    Returns None for None/empty. Raises ValueError on a wrong length."""
+    if blob is None or len(blob) == 0:
+        return None
+    expected = EMBEDDING_EXPECTED_DIM * 4
+    if len(blob) != expected:
+        raise ValueError(f"embedding blob length {len(blob)} != expected {expected}")
+    if _np is not None:
+        return _np.frombuffer(bytes(blob), dtype="<f4").astype(float).tolist()
+    arr = array.array("f")
+    arr.frombytes(bytes(blob))
+    if sys.byteorder == "big":
+        arr.byteswap()
+    return list(arr)
+
+
+# ── connection handling ──────────────────────────────────────────────────────
+
+def _mysql_connect():
+    """Opens ONE new PyMySQL connection (utf8mb4, autocommit). Password is
+    never logged."""
+    if pymysql is None:
+        raise RuntimeError("PyMySQL is not installed (pip install PyMySQL)")
+    kwargs = dict(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        charset="utf8mb4",
+        autocommit=True,
+        connect_timeout=MYSQL_CONNECT_TIMEOUT,
+        read_timeout=MYSQL_READ_TIMEOUT,
+        write_timeout=MYSQL_WRITE_TIMEOUT,
+    )
+    if MYSQL_SSL:
+        kwargs["ssl"] = {"ca": MYSQL_SSL_CA} if MYSQL_SSL_CA else {"check_hostname": False}
+    return pymysql.connect(**kwargs)
+
+
+def _reset_mysql_conn():
+    conn = getattr(_mysql_local, "conn", None)
+    _mysql_local.conn = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _get_mysql_conn():
+    """This thread's own connection (never shared across threads),
+    ping(reconnect=True)-ed before every use."""
+    conn = getattr(_mysql_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.ping(reconnect=True)
+            return conn
+        except Exception:
+            _reset_mysql_conn()
+    conn = _mysql_connect()
+    _mysql_local.conn = conn
+    return conn
+
+
+def _mysql_retry_errors() -> tuple:
+    if pymysql is None:
+        return (OSError,)
+    return (pymysql.err.OperationalError, pymysql.err.InterfaceError, OSError)
+
+
+def _with_mysql(fn):
+    """Runs fn(conn) on this thread's connection. If the connection is
+    dropped, reconnects and retries ONCE; if it still fails, raises (the
+    callers catch it, log, and move on)."""
+    last = None
+    for _ in range(2):
+        try:
+            return fn(_get_mysql_conn())
+        except _mysql_retry_errors() as exc:
+            last = exc
+            _reset_mysql_conn()
+    raise last
+
+
+def _ensure_mysql_table(conn):
+    """CREATE TABLE IF NOT EXISTS (never DROP/ALTER). Runs once per
+    process, lazily on first use if startup init didn't manage it."""
+    global _mysql_table_ready
+    if _mysql_table_ready:
+        return
+    with _mysql_table_lock:
+        if _mysql_table_ready:
+            return
+        with conn.cursor() as cur:
+            cur.execute(_MYSQL_CREATE_TABLE_SQL)
+        _mysql_table_ready = True
+        log.info("[MYSQL] table flintel_signals ready")
+
+
+def init_mysql() -> bool:
+    """Startup helper: if MYSQL_DATA is true, connect and make sure the
+    table exists. Never raises — if MySQL is down the service still
+    starts (warning) and the next save reconnects by itself."""
+    if not _is_mysql_data_enabled():
+        return False
+    try:
+        _with_mysql(_ensure_mysql_table)
+        log.info(f"[MYSQL] connected | host={MYSQL_HOST} db={MYSQL_DATABASE}")
+        return True
+    except Exception as exc:
+        log.warning(
+            f"[MYSQL] startup connect/table init failed (service continues, will retry on next save) | {exc}"
+        )
+        return False
+
+
+# ── helpers for rows ─────────────────────────────────────────────────────────
+
+def _to_utc_naive(dt: datetime) -> datetime:
+    """tz-aware -> UTC naive (what MySQL DATETIME(3) wants)."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _clip(value, n: int):
+    """Truncate to a VARCHAR width so strict-mode MySQL never rejects a row
+    over 'Data too long'."""
+    if value is None:
+        return None
+    s = str(value)
+    return s[:n]
+
+
+def _build_mysql_row(doc: dict) -> tuple:
+    emb = doc.get("embedding")
+    blob = dim = model = None
+    if emb is not None and len(emb) > 0:
+        try:
+            blob = _embedding_to_blob(emb)
+            dim = len(emb)
+            model = _clip(EMBEDDING_MODEL, 64)
+        except ValueError as exc:
+            log.warning(f"[MYSQL] embedding rejected, saving row with NULL embedding | {exc}")
+            blob = dim = model = None
+
+    # NOTE: Mongo stores `reddit_comments` as plain integer 0 until a
+    # comment is attached (then a list). In MySQL the JSON column stays
+    # NULL (NOT 0) until a comment is attached, then holds a JSON list.
+    return (
+        _clip(doc["message_id"], 191),
+        _clip(doc["topic_key"], 255),
+        _clip(doc.get("search_keyword"), 255),
+        _clip(doc["platform"], 32),
+        _clip(doc.get("subreddit", ""), 128),
+        _clip(doc.get("username"), 255),
+        doc.get("title"),
+        doc.get("text"),
+        _clip(doc.get("post_url", ""), 1024),
+        int(doc.get("score", 0) or 0),
+        int(doc.get("num_comments", 0) or 0),
+        _to_utc_naive(doc["created_utc"]),
+        _to_utc_naive(doc["fetched_at"]),
+        blob,
+        dim,
+        model,
+        None,
+    )
+
+
+def _mysql_post_exists(message_id: str) -> bool:
+    """Cheap existence check. On any MySQL failure returns False (the
+    insert attempt will then log the real error)."""
+    def op(conn):
+        _ensure_mysql_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM flintel_signals WHERE message_id=%s LIMIT 1", (message_id,)
+            )
+            return cur.fetchone() is not None
+    try:
+        return bool(_with_mysql(op))
+    except Exception as exc:
+        log.warning(f"[MYSQL] existence check failed | message_id={message_id} | {exc}")
+        return False
+
+
+def _save_to_mongo(doc: dict) -> bool:
+    """True only if a NEW Mongo document was inserted."""
+    try:
+        db.flintel_signals.insert_one(doc)
+        return True
+    except DuplicateKeyError:
+        # Already fetched before (possibly for a different topic/keyword
+        # search that also matched it) — not an error.
+        return False
+    except Exception as exc:
+        log.error(f"[MONGO] save_signal error | message_id={doc.get('message_id')} | {exc}")
+        return False
+
+
+def _save_to_mysql(doc: dict) -> bool:
+    """True only if a NEW MySQL row was inserted. Never raises."""
+    try:
+        row = _build_mysql_row(doc)
+
+        def op(conn):
+            _ensure_mysql_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(_MYSQL_INSERT_SQL, row)
+            return True
+
+        return bool(_with_mysql(op))
+    except Exception as exc:
+        if pymysql is not None and isinstance(exc, pymysql.err.IntegrityError) \
+                and exc.args and exc.args[0] == 1062:
+            return False  # duplicate message_id (race) — not an error
+        log.error(f"[MYSQL] save_signal error | message_id={doc.get('message_id')} | {exc}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SAVE FETCHED MESSAGES
 # ─────────────────────────────────────────────────────────────────────────────
 
+_NO_SINK_MSG = "MONGODB_DATA aur MYSQL_DATA dono false: kuch save nahi ho raha"
+_last_no_sink_warn = 0.0
+
+
+def _warn_no_sinks(force: bool = False):
+    """Logs the 'both sinks off' warning. The poller forces it once per
+    cycle; _save_signal calls it throttled (max once/60s) so a big RSS
+    window doesn't flood the log."""
+    global _last_no_sink_warn
+    now = time.time()
+    if force or now - _last_no_sink_warn >= 60:
+        log.warning(_NO_SINK_MSG)
+        _last_no_sink_warn = now
+
+
 def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict) -> bool:
-    """Upserts a raw fetched post/comment (Reddit post, Reddit comment, or
-    Twitter — same shape from any fetch function) into flintel_signals. No
-    scoring, no Claude, no derived fields — just the raw message plus which
-    topic/keyword found it, plus (new in this version) one embedding
-    generated from this document's own text. Duplicate entries (already
-    fetched before, by this cycle or a past one) are silently skipped via
-    the unique index — this is exactly what makes it safe for the Reddit
-    poller to keep re-fetching the same rolling RSS window over and over:
-    only genuinely new entries get inserted, and only genuinely new
-    entries ever trigger an embedding call — an already-saved, unchanged
-    post is never re-embedded."""
+    """Saves a raw fetched post/comment (Reddit post, Reddit comment, or
+    Twitter — same shape from any fetch function) into every ENABLED sink
+    (Mongo if MONGODB_DATA, MySQL if MYSQL_DATA). No scoring, no Claude, no
+    derived fields — just the raw message, which topic/keyword found it,
+    and one embedding generated from this document's own text.
+
+    Order (this is the duplicate-embedding bug fix):
+      1. cheap existence check in each enabled sink;
+      2. if EVERY enabled sink already has it -> return False, NO embedding;
+      3. otherwise ONE embedding (or reuse Mongo's existing one) shared by
+         every sink that still needs the row;
+      4. insert per sink (each with its own try/except); DuplicateKeyError /
+         MySQL 1062 are still caught for thread races.
+
+    Returns True if a NEW row was inserted in at least one enabled sink."""
+    mongo_on = _is_mongodb_data_enabled()
+    mysql_on = _is_mysql_data_enabled()
+
+    if not mongo_on and not mysql_on:
+        _warn_no_sinks()
+        return False
+
     created = post.get("created_utc")
     created_dt = (
         datetime.fromtimestamp(created, tz=timezone.utc) if created else datetime.now(timezone.utc)
@@ -950,35 +1335,60 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         "created_utc":      created_dt,
         "fetched_at":       datetime.now(timezone.utc),
     }
+    mid = doc["message_id"]
 
-    # ── NEW: one embedding, generated from THIS document's own `text`
-    # only, stored on this same document. Generated once, right here,
-    # right before the first (and only, thanks to the unique index below)
-    # insert of this document — never regenerated afterwards. If
-    # embeddings are disabled or generation fails for any reason, this is
-    # simply None and the save proceeds exactly as it always did. ──
-    doc["embedding"] = generate_embedding(text) if _is_embedding_enabled() else None
+    # ── 1. existence checks (cheap, no embedding yet) ──
+    mongo_exists = False
+    mongo_embedding = None
+    if mongo_on:
+        try:
+            found = db.flintel_signals.find_one({"message_id": mid}, {"_id": 1, "embedding": 1})
+            if found is not None:
+                mongo_exists = True
+                emb = found.get("embedding")
+                if isinstance(emb, list) and emb:
+                    mongo_embedding = emb
+        except Exception as exc:
+            log.error(f"[MONGO] existence check failed | message_id={mid} | {exc}")
 
-    # Reddit POSTS carry a nested "reddit_comments" field — this is where
-    # any matching comments for THIS post get pushed into (see
-    # _attach_comment_to_post() below). Defaults to 0 (plain integer) when
-    # no matching comment has been found yet; becomes a list of comment
-    # texts the moment the first matching comment is attached. Twitter
-    # docs don't get this field — comments are a Reddit-only concept here.
-    if platform == "reddit":
-        doc["reddit_comments"] = 0
+    mysql_exists = _mysql_post_exists(mid) if mysql_on else False
 
-    try:
-        db.flintel_signals.insert_one(doc)
-        return True
-    except DuplicateKeyError:
-        # Already fetched this post before (possibly for a different
-        # topic/keyword search that also matched it) — not an error, and
-        # no embedding call happens for it again.
+    need_mongo = mongo_on and not mongo_exists
+    need_mysql = mysql_on and not mysql_exists
+
+    # ── 2. already everywhere -> NO embedding call ──
+    if not need_mongo and not need_mysql:
         return False
-    except Exception as exc:
-        log.error(f"[MONGO] save_signal error | message_id={doc['message_id']} | {exc}")
-        return False
+
+    # ── 3. one embedding, shared. Reuse Mongo's if it already has one. ──
+    if mongo_embedding is not None:
+        embedding = mongo_embedding
+    elif _is_embedding_enabled():
+        embedding = generate_embedding(text)
+    else:
+        embedding = None
+
+    # ── 4. per-sink inserts, each isolated ──
+    inserted = False
+
+    if need_mongo:
+        mongo_doc = dict(doc)
+        mongo_doc["embedding"] = embedding
+        # Reddit POSTS carry a nested "reddit_comments" field — plain
+        # integer 0 until the first matching comment is attached, then a
+        # list (see _attach_comment_to_post). Twitter docs don't get it.
+        if platform == "reddit":
+            mongo_doc["reddit_comments"] = 0
+        if _save_to_mongo(mongo_doc):
+            inserted = True
+
+    if need_mysql:
+        mysql_doc = dict(doc)
+        mysql_doc["embedding"] = embedding
+        if _save_to_mysql(mysql_doc):
+            inserted = True
+
+    return inserted
 
 
 def _extract_post_id_from_comment_link(link: str):
@@ -995,36 +1405,8 @@ def _extract_post_id_from_comment_link(link: str):
     return m.group(1) if m else None
 
 
-def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_id: str, comment_text: str, comment_created_utc) -> bool:
-    """Finds the PARENT POST's already-saved document in flintel_signals
-    (matched on topic_key + message_id built from the comment's parent
-    post id) and pushes this comment (text + its own date) into that
-    document's "reddit_comments" field — turning it from the default 0
-    into a list on the first match, and appending to that list on every
-    match after.
-
-    Each entry in "reddit_comments" is an object:
-        {"text": "<comment text>", "created_utc": <comment's own date>}
-    so the comment's date is preserved alongside its text, separate from
-    the parent post's own created_utc.
-
-    No separate comment document is created — comments live nested INSIDE
-    their post's own document, exactly as requested. If the parent post
-    was never itself saved (its own title/selftext never matched any
-    job's keywords, so no post document exists to attach to), there is
-    nowhere to nest this comment, so it is skipped — never raises.
-
-    NOTE: this nested comment array does NOT get its own embedding — the
-    embedding layer only applies to documents saved via _save_signal
-    (i.e. the post's own text), exactly as scoped."""
-    if not comment_post_id:
-        return False
-
-    comment_created_dt = (
-        datetime.fromtimestamp(comment_created_utc, tz=timezone.utc)
-        if comment_created_utc else datetime.now(timezone.utc)
-    )
-
+def _attach_comment_to_post_mongo(topic_key: str, comment_post_id: str, comment_text: str, comment_created_dt) -> bool:
+    """Mongo half of comment attaching — logic unchanged from before."""
     post_message_id = f"reddit_{comment_post_id}"
     try:
         existing = db.flintel_signals.find_one(
@@ -1060,6 +1442,89 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
         return False
 
 
+def _attach_comment_to_post_mysql(topic_key: str, comment_post_id: str, comment_text: str, comment_created_dt) -> bool:
+    """MySQL half: inside a transaction, SELECT ... FOR UPDATE the parent's
+    reddit_comments JSON, append in Python (dedupe on text), then UPDATE.
+    Parent not in MySQL -> skipped. `created_utc` of the comment is stored
+    inside the JSON as an ISO-8601 UTC string. Never raises."""
+    post_message_id = f"reddit_{comment_post_id}"
+
+    def op(conn):
+        _ensure_mysql_table(conn)
+        conn.begin()
+        try:
+            changed = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reddit_comments FROM flintel_signals "
+                    "WHERE topic_key=%s AND message_id=%s FOR UPDATE",
+                    (topic_key, post_message_id),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    raw = row[0]
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8")
+                    current = json.loads(raw) if isinstance(raw, str) and raw else (raw or [])
+                    if not isinstance(current, list):
+                        current = []
+                    if not any(c.get("text") == comment_text for c in current if isinstance(c, dict)):
+                        current.append({
+                            "text":        comment_text,
+                            "created_utc": comment_created_dt.astimezone(timezone.utc).isoformat(),
+                        })
+                        cur.execute(
+                            "UPDATE flintel_signals SET reddit_comments=%s "
+                            "WHERE topic_key=%s AND message_id=%s",
+                            (json.dumps(current, ensure_ascii=False), topic_key, post_message_id),
+                        )
+                        changed = True
+            conn.commit()
+            return changed
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    try:
+        return bool(_with_mysql(op))
+    except Exception as exc:
+        log.error(f"[MYSQL] attach_comment error | post_message_id={post_message_id} | {exc}")
+        return False
+
+
+def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_id: str, comment_text: str, comment_created_utc) -> bool:
+    """Finds the PARENT POST's already-saved document (matched on topic_key
+    + message_id built from the comment's parent post id) in every ENABLED
+    sink and nests this comment (text + its own date) into that post's
+    "reddit_comments" — in Mongo the default 0 becomes a list on the first
+    match; in MySQL the JSON column goes from NULL to a list.
+
+    No separate comment document is created. If the parent post is not
+    stored in a sink, that sink skips the comment. Returns True if the
+    comment was attached in at least one sink. Never raises.
+
+    NOTE: nested comments do NOT get their own embedding."""
+    if not comment_post_id:
+        return False
+
+    comment_created_dt = (
+        datetime.fromtimestamp(comment_created_utc, tz=timezone.utc)
+        if comment_created_utc else datetime.now(timezone.utc)
+    )
+
+    attached = False
+    if _is_mongodb_data_enabled():
+        if _attach_comment_to_post_mongo(topic_key, comment_post_id, comment_text, comment_created_dt):
+            attached = True
+    if _is_mysql_data_enabled():
+        if _attach_comment_to_post_mysql(topic_key, comment_post_id, comment_text, comment_created_dt):
+            attached = True
+    return attached
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — ALWAYS-ON POLLER (runs forever, independent of the job queue)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1070,10 +1535,9 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
 #   loop forever:
 #     1. fetch r/all posts RSS once, AND r/all comments RSS once
 #     2. rebuild the keyword list from EVERY job in flintel_search_jobs
-#     3. match + save (posts and comments both go into flintel_signals,
-#        same as before — comments just carry platform="reddit_comment"
-#        so they can be told apart from posts later if needed; every
-#        newly saved post also gets its own embedding via _save_signal)
+#     3. match + save (posts go into flintel_signals; matching comments get
+#        nested into their parent post's "reddit_comments"; every newly
+#        saved post also gets its own embedding via _save_signal)
 #     4. sleep REDDIT_POLL_INTERVAL_SECONDS, repeat
 #
 # Because step 2 re-reads the jobs collection from scratch every cycle,
@@ -1178,6 +1642,10 @@ def run_reddit_poller():
                     time.sleep(REDDIT_POLL_INTERVAL_SECONDS)
                     continue
 
+                # Both save targets off -> warn every cycle, keep running.
+                if not _is_mongodb_data_enabled() and not _is_mysql_data_enabled():
+                    _warn_no_sinks(force=True)
+
                 jobs = _load_all_jobs_keyword_map()
                 reddit_jobs = [j for j in jobs if j["targeting_platform"] in ("reddit", "all")]
 
@@ -1195,9 +1663,8 @@ def run_reddit_poller():
                 # ── Comments — matched the same way as posts, but instead
                 # of becoming their own document, matches get nested into
                 # their PARENT POST's own document under "reddit_comments"
-                # (0 by default, becomes a list of matching comment texts
-                # once at least one is attached). No separate comment
-                # document is created. ──
+                # (0 by default in Mongo / NULL in MySQL, becomes a list of
+                # matching comments once at least one is attached). ──
                 comment_entries = _fetch_reddit_comments_rss_feed()
                 attached_comments = _match_and_attach_comments(comment_entries, reddit_jobs, cutoff)
 
@@ -1368,11 +1835,9 @@ def start_all():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # NEW: optional one-time backfill mode. Running with this flag does
-    # NOT start the poller/worker pool — it only generates embeddings for
-    # existing flintel_signals documents that have text but no embedding
-    # yet, then exits. Normal `python flintel_service.py` (no flag) starts
-    # everything exactly as before.
+    # Optional one-time backfill mode (Mongo only). Running with this flag
+    # does NOT start the poller/worker pool. Normal
+    # `python flintel_service.py` (no flag) starts everything.
     if "--backfill-embeddings" in sys.argv:
         log.info("=" * 70)
         log.info("  FLINTEL — ONE-TIME EMBEDDING BACKFILL (historical documents only)")
@@ -1389,6 +1854,8 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
     log.info(f"  Embeddings        : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved document)")
+    log.info(f"  Mongo signals save : {'ENABLED' if _is_mongodb_data_enabled() else 'DISABLED'} (MONGODB_DATA)")
+    log.info(f"  MySQL signals save : {'ENABLED' if _is_mysql_data_enabled() else 'DISABLED'} (MYSQL_DATA) | host={MYSQL_HOST or '-'} db={MYSQL_DATABASE or '-'}")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
     log.info("  Scoring           : NONE — raw messages only")
     log.info("  Slack / HubSpot   : REMOVED")
@@ -1396,7 +1863,9 @@ if __name__ == "__main__":
     log.info(f"  Worker concurrency: {WORKER_CONCURRENCY} parallel jobs (Twitter + job status) — a new search never waits on another")
     log.info(f"  MongoDB (signals) : {MONGODB_DB}")
     log.info(f"  MongoDB1 (jobs/status): {MONGODB1_DB}")
-    log.info("  Embedding backfill: run with --backfill-embeddings for historical docs missing an embedding")
+    log.info("  Embedding backfill: run with --backfill-embeddings for historical Mongo docs missing an embedding")
     log.info("=" * 70)
+
+    init_mysql()   # no-op unless MYSQL_DATA is true; never raises
 
     start_all()
