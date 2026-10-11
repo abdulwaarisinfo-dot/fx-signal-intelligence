@@ -111,6 +111,20 @@ def is_hn_stories_enabled() -> bool:
     return _env_bool("HN_FETCH_STORIES", True)
 
 
+def is_hn_strict_match_enabled() -> bool:
+    """
+    Strict local keyword match ka switch.
+    Env: HN_STRICT_MATCH (default True).
+    True ho to Algolia ke har hit ko save se pehle locally check kiya jata hai
+    (title/text mein keyword case-insensitive substring ho, Reddit ke
+    `_match_any_keyword` jaisa). Is se wo items save nahi hote jo Algolia ne
+    sirf URL / author / typo-tolerance ki wajah se diye hon.
+    False ho to purana behaviour: Algolia ka har hit save_fn ko jata hai.
+    """
+    load_dotenv(override=True)
+    return _env_bool("HN_STRICT_MATCH", True)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
