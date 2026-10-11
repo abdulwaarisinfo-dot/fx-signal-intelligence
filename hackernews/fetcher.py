@@ -97,6 +97,19 @@ def _hit_to_post(hit: dict, kind: str):
     }
 
 
+def _keyword_in_post(keyword: str, post: dict) -> bool:
+    """
+    Local keyword match: kya keyword post ke title/selftext mein maujood hai?
+
+    Case-insensitive substring match, bilkul Reddit ke `_match_any_keyword`
+    jaisa. Comment ke liye `title` mein hi comment ka text hota hai, isliye
+    comments par bhi wahi check lagta hai. Algolia kabhi URL / author / typo
+    tolerance ki wajah se bhi item deta hai; ye check un items ko pakadta hai.
+    """
+    text = f"{post.get('title','')} {post.get('selftext','')}".lower()
+    return keyword.strip().lower() in text
+
+
 def fetch_hackernews_search(keyword: str, kind: str, since_ts) -> list:
     """
     Algolia HN API se ek keyword ke liye stories ya comments fetch karta hai.
@@ -222,6 +235,7 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
 
                     max_ts = None
                     save_failed = False
+                    strict_skipped = 0
                     for post in posts:
                         created = post.get("created_utc")
                         if created is not None:
@@ -229,6 +243,11 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
                                 continue
                             if max_ts is None or created > max_ts:
                                 max_ts = created
+                        # Strict local match: max_ts upar hi update ho chuka hai, yaani skip hui
+                        # posts bhi checkpoint mein ginti hain (agli baar dobara fetch nahi hongi).
+                        if config.is_hn_strict_match_enabled() and not _keyword_in_post(keyword, post):
+                            strict_skipped += 1
+                            continue
                         try:
                             if save_fn(topic_key, keyword, platform, post):
                                 total_saved += 1
@@ -240,6 +259,12 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
                                 f"[HACKERNEWS] save failed | topic_key={topic_key} | "
                                 f"keyword='{keyword}' | kind={kind} | id={post.get('id')} | {save_exc}"
                             )
+
+                    if strict_skipped > 0:
+                        log.info(
+                            f"[HACKERNEWS] strict match skipped {strict_skipped} | "
+                            f"keyword='{keyword}' | kind={kind}"
+                        )
 
                     if max_ts is not None and not save_failed:
                         database.set_last_seen_ts(topic_key, keyword, kind, int(max_ts))
