@@ -286,3 +286,128 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
     except Exception as exc:
         log.error(f"[HACKERNEWS] job failed | topic_key={topic_key} | {exc}")
         return total_saved
+
+
+# ---------------------------------------------------------------------------
+# Story ke keyword-matched comments (additive; upar ka koi code change nahi)
+# ---------------------------------------------------------------------------
+
+# Algolia ek query par max 1000 hits deta hai; page loop phir bhi nbPages tak chalta hai.
+_HN_COMMENTS_PER_PAGE = 1000
+
+# HN ke deleted/dead comments kabhi kabhi ye placeholder text ke saath aate hain.
+_HN_DEAD_TEXTS = {"[dead]", "[deleted]", "[flagged]"}
+
+
+def fetch_story_comments(story_id, keyword: str, since_ts=None) -> list:
+    """
+    Ek HN story ke woh comments (saare depths, flat list) laata hai jin mein
+    `keyword` aata hai.
+
+    Args:
+        story_id: HN story ka objectID (str ya int).
+        keyword:  search term. HN_EXACT_PHRASE on ho aur keyword multi-word ho
+                  to quote hota hai (fetch_hackernews_search jaisi hi logic).
+        since_ts: unix seconds ya None. Diya ho to `created_at_i>=since_ts`
+                  (>= jaan boojh kar: overlap safe hai kyunke dedupe comment_id
+                  par hota hai).
+
+    Returns:
+        list of dicts, oldest first:
+        {"comment_id", "author", "text", "created_utc" (UTC datetime), "parent_id"}
+
+        Khali / deleted / dead text skip hota hai. HN_STRICT_MATCH on ho to
+        keyword comment text mein case-insensitive substring bhi hona chahiye.
+
+    Failure par (koi bhi page fail ho) [] return hota hai aur log.warning
+    likhi jati hai. Partial result jaan boojh kar return nahi hota: Algolia
+    newest-first deta hai, aur partial list se caller ka since_ts aage badh
+    kar purane comments hamesha ke liye miss ho sakte the. Kabhi raise nahi karta.
+    """
+    try:
+        keyword = (keyword or "").strip()
+        story_id = str(story_id or "").strip()
+        if not keyword or not story_id:
+            return []
+
+        query = keyword
+        if config.HN_EXACT_PHRASE and " " in keyword:
+            query = f'"{keyword}"'
+
+        params = {
+            "query": query,
+            "tags": f"comment,story_{story_id}",
+            "hitsPerPage": _HN_COMMENTS_PER_PAGE,
+        }
+        if since_ts is not None:
+            params["numericFilters"] = f"created_at_i>={int(since_ts)}"
+
+        strict = config.is_hn_strict_match_enabled()
+
+        comments = {}  # comment_id -> dict (pages ke overlap par dobara nahi judta)
+        page = 0
+        nb_pages = 1
+        while page < nb_pages:
+            params["page"] = page
+            resp = requests.get(
+                config.HN_API_URL,
+                params=params,
+                headers={"User-Agent": config.HN_USER_AGENT},
+                timeout=config.HN_REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json() or {}
+            try:
+                nb_pages = int(data.get("nbPages") or 0)
+            except (ValueError, TypeError):
+                nb_pages = 0
+
+            for hit in data.get("hits") or []:
+                try:
+                    comment = _hit_to_story_comment(hit, keyword, strict)
+                except Exception as hit_exc:
+                    log.warning(
+                        f"[HACKERNEWS] bad comment hit skipped | story_id={story_id} | {hit_exc}"
+                    )
+                    continue
+                if comment is not None:
+                    comments.setdefault(comment["comment_id"], comment)
+            page += 1
+
+        return sorted(comments.values(), key=lambda c: (c["created_utc"], c["comment_id"]))
+
+    except Exception as exc:
+        log.warning(
+            f"[HACKERNEWS] story comments fetch failed | story_id={story_id} | "
+            f"keyword='{keyword}' | {exc}"
+        )
+        return []
+
+
+def _hit_to_story_comment(hit: dict, keyword: str, strict: bool):
+    """Algolia comment hit -> story-comment dict, ya None (skip)."""
+    comment_id = str(hit.get("objectID") or "").strip()
+    if not comment_id:
+        return None
+
+    text = _strip_html(hit.get("comment_text"))
+    if not text or text.lower() in _HN_DEAD_TEXTS:
+        return None
+
+    # Strict local match: wahi existing _keyword_in_post (comment text "title" mein jata hai).
+    if strict and not _keyword_in_post(keyword, {"title": text, "selftext": ""}):
+        return None
+
+    created_at_i = hit.get("created_at_i")
+    if created_at_i is None:
+        return None
+    created_utc = datetime.fromtimestamp(float(created_at_i), tz=timezone.utc)
+
+    parent_id = hit.get("parent_id")
+    return {
+        "comment_id": comment_id,
+        "author": hit.get("author") or "unknown",
+        "text": text,
+        "created_utc": created_utc,
+        "parent_id": str(parent_id) if parent_id is not None else None,
+    }
