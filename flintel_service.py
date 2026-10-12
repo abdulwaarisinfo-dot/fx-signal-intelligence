@@ -180,6 +180,7 @@ import json
 import html
 import time
 import array
+import base64
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -207,6 +208,11 @@ try:
 except Exception:  # pragma: no cover
     run_hackernews_for_job = None
     hn_config = None
+
+try:  # HN story ke keyword-matched comments (hackernews package flintel_service ko import nahi karta)
+    from hackernews.fetcher import fetch_story_comments
+except Exception:  # pragma: no cover
+    fetch_story_comments = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / CONFIG
@@ -376,6 +382,28 @@ EMBEDDING_BACKFILL_GAP_SECONDS = float(os.getenv("EMBEDDING_BACKFILL_GAP_SECONDS
 # Expected vector length for the MySQL BLOB sanity check (1536 floats for
 # text-embedding-3-small -> 6144 bytes).
 EMBEDDING_EXPECTED_DIM = int(os.getenv("EMBEDDING_EXPECTED_DIM", "1536"))
+
+# ── HACKER NEWS NESTED COMMENTS config (additive; sirf platform == "hackernews" stories) ──
+def _env_int_safe(name: str, default: int) -> int:
+    """int env var; galat value par default (import par crash nahi)."""
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+# Master switch (live-checked): False -> _save_signal ka HN hook AUR refresher dono skip.
+def _is_hn_nested_comments_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("HN_NESTED_COMMENTS_ENABLED", True)
+
+
+# Refresher thread har kitne seconds baad naye matching comments dhoondta hai (default 2 ghante).
+HN_COMMENT_REFRESH_INTERVAL_SECONDS = _env_int_safe("HN_COMMENT_REFRESH_INTERVAL_SECONDS", 7200)
+# Story ke created_utc ke baad kitne din tak uske comments track hon.
+HN_COMMENT_TRACK_DAYS = _env_int_safe("HN_COMMENT_TRACK_DAYS", 14)
+# Ek story doc mein max kitne comments (Mongo 16MB document limit se bachne ke liye).
+HN_MAX_COMMENTS_PER_STORY = _env_int_safe("HN_MAX_COMMENTS_PER_STORY", 200)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -1027,6 +1055,8 @@ _MYSQL_INSERT_SQL = (
 _mysql_local = threading.local()          # one connection PER THREAD
 _mysql_table_ready = False
 _mysql_table_lock = threading.Lock()
+_mysql_hn_col_ready = False               # hn_comments column maujood hai (ya ban gaya)
+_mysql_hn_col_last_try = 0.0              # fail hone par har 60s se zyada retry nahi
 
 
 # ── Embedding <-> BLOB (float32, little-endian, flat bytes) ──────────────────
@@ -1139,19 +1169,54 @@ def _with_mysql(fn):
     raise last
 
 
+def _ensure_hn_comments_column(conn):
+    """information_schema check ke baad, column na ho to hi ek guarded
+    `ALTER TABLE ... ADD COLUMN hn_comments JSON NULL`. Never DROP, kabhi
+    kisi maujooda column ko nahi chhedta. Duplicate-column (1060) race ko
+    theek maanta hai. Fail par raise karta hai (caller log karta hai)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'flintel_signals' "
+            "AND COLUMN_NAME = 'hn_comments'"
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            return
+        try:
+            cur.execute("ALTER TABLE flintel_signals ADD COLUMN hn_comments JSON NULL")
+            log.info("[MYSQL] column flintel_signals.hn_comments added")
+        except Exception as exc:
+            if pymysql is not None and isinstance(exc, pymysql.err.Error) \
+                    and exc.args and exc.args[0] == 1060:
+                return  # kisi aur process ne abhi abhi add kar diya
+            raise
+
+
 def _ensure_mysql_table(conn):
-    """CREATE TABLE IF NOT EXISTS (never DROP/ALTER). Runs once per
-    process, lazily on first use if startup init didn't manage it."""
-    global _mysql_table_ready
-    if _mysql_table_ready:
+    """CREATE TABLE IF NOT EXISTS (never DROP). Runs once per process,
+    lazily on first use if startup init didn't manage it. Uske baad (ek
+    baar, guarded) `hn_comments JSON NULL` column add hota hai agar pehle
+    se nahi hai. Column wala step fail ho to sirf warning (table ready
+    rehta hai, reddit/twitter saves par koi asar nahi) aur 60s baad dobara try."""
+    global _mysql_table_ready, _mysql_hn_col_ready, _mysql_hn_col_last_try
+    if _mysql_table_ready and (
+        _mysql_hn_col_ready or time.time() - _mysql_hn_col_last_try < 60
+    ):
         return
     with _mysql_table_lock:
-        if _mysql_table_ready:
-            return
-        with conn.cursor() as cur:
-            cur.execute(_MYSQL_CREATE_TABLE_SQL)
-        _mysql_table_ready = True
-        log.info("[MYSQL] table flintel_signals ready")
+        if not _mysql_table_ready:
+            with conn.cursor() as cur:
+                cur.execute(_MYSQL_CREATE_TABLE_SQL)
+            _mysql_table_ready = True
+            log.info("[MYSQL] table flintel_signals ready")
+        if not _mysql_hn_col_ready and time.time() - _mysql_hn_col_last_try >= 60:
+            _mysql_hn_col_last_try = time.time()
+            try:
+                _ensure_hn_comments_column(conn)
+                _mysql_hn_col_ready = True
+            except Exception as exc:
+                log.warning(f"[MYSQL] hn_comments column check/add failed (will retry later) | {exc}")
 
 
 def init_mysql() -> bool:
@@ -1395,6 +1460,10 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         if _save_to_mysql(mysql_doc):
             inserted = True
 
+    # Additive hook: sirf NAYI HN story par (platform == "hackernews").
+    if inserted and platform == "hackernews":
+        _hn_after_story_insert(topic_key, mid, post, matched_keyword)
+
     return inserted
 
 
@@ -1530,6 +1599,456 @@ def _attach_comment_to_post(topic_key: str, matched_keyword: str, comment_post_i
         if _attach_comment_to_post_mysql(topic_key, comment_post_id, comment_text, comment_created_dt):
             attached = True
     return attached
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HACKER NEWS — keyword-matched comments, nested in the STORY's own document
+# under `hn_comments` (additive; Reddit/Twitter paths are untouched).
+#
+#   hn_comments = list of {comment_id, author, text, created_utc, embedding,
+#                          embedding_dim, embedding_model}
+#
+#   - Field is ABSENT (Mongo) / NULL (MySQL) until the first matching comment
+#     arrives ($push on an absent field creates the array).
+#   - Dedupe is ONLY on comment_id. The story's own `text` is never touched.
+#   - ONE embedding per comment, generated once, shared by both sinks.
+#     A comment that already has an embedding is NEVER embedded again; a
+#     comment stored with embedding=None is retried (only that one).
+#   - Mongo: embedding = list of floats. MySQL (JSON): embedding = base64 of
+#     the float32 little-endian bytes (same bytes as _embedding_to_blob),
+#     created_utc = ISO-8601 UTC string.
+#   - At most HN_MAX_COMMENTS_PER_STORY comments per story (16MB Mongo limit).
+#   - Nothing here ever raises: failures are logged and we move on.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HN_STORY_ID_PREFIX = "hackernews_"
+
+_hn_sync_locks = {}                    # message_id -> Lock (ek story par ek waqt mein ek sync)
+_hn_sync_locks_guard = threading.Lock()
+
+
+def _hn_story_lock(message_id: str):
+    """Hook (worker thread) aur refresher ek hi story par ek saath chalen to
+    dono ek hi comment ka embedding na banayein — isliye per-story lock."""
+    with _hn_sync_locks_guard:
+        lock = _hn_sync_locks.get(message_id)
+        if lock is None:
+            lock = _hn_sync_locks[message_id] = threading.Lock()
+        return lock
+
+
+def _hn_as_utc(value):
+    """datetime / ISO string -> tz-aware UTC datetime (naive ko UTC maana jata hai). Bad -> None."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _hn_has_embedding(vec) -> bool:
+    return vec is not None and len(vec) > 0
+
+
+def _hn_json_list(raw) -> list:
+    """MySQL JSON value (str / bytes / list / None) -> list. Kuch bhi bura ho to []."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    return raw if isinstance(raw, list) else []
+
+
+# ── rec <-> sink entry conversions ───────────────────────────────────────────
+# `rec` = {"comment_id", "author", "text", "created_utc" (aware UTC datetime),
+#          "embedding" (list[float] | None)}
+
+def _hn_mongo_entry(rec: dict) -> dict:
+    emb = rec.get("embedding")
+    has = _hn_has_embedding(emb)
+    return {
+        "comment_id":      rec["comment_id"],
+        "author":          rec.get("author"),
+        "text":            rec["text"],
+        "created_utc":     rec["created_utc"],
+        "embedding":       list(emb) if has else None,
+        "embedding_dim":   len(emb) if has else None,
+        "embedding_model": EMBEDDING_MODEL if has else None,
+    }
+
+
+def _hn_mysql_entry(rec: dict) -> dict:
+    emb = rec.get("embedding")
+    b64 = dim = model = None
+    if _hn_has_embedding(emb):
+        try:
+            b64 = base64.b64encode(_embedding_to_blob(emb)).decode("ascii")
+            dim = len(emb)
+            model = _clip(EMBEDDING_MODEL, 64)
+        except ValueError as exc:
+            log.warning(f"[MYSQL] hn comment embedding rejected, storing NULL | comment_id={rec.get('comment_id')} | {exc}")
+            b64 = dim = model = None
+    return {
+        "comment_id":      rec["comment_id"],
+        "author":          rec.get("author"),
+        "text":            rec["text"],
+        "created_utc":     rec["created_utc"].astimezone(timezone.utc).isoformat(),
+        "embedding":       b64,
+        "embedding_dim":   dim,
+        "embedding_model": model,
+    }
+
+
+def _hn_rec_from_mongo(entry):
+    if not isinstance(entry, dict) or not entry.get("comment_id"):
+        return None
+    emb = entry.get("embedding")
+    return {
+        "comment_id":  str(entry["comment_id"]),
+        "author":      entry.get("author"),
+        "text":        entry.get("text") or "",
+        "created_utc": _hn_as_utc(entry.get("created_utc")),
+        "embedding":   list(emb) if isinstance(emb, (list, tuple)) and len(emb) > 0 else None,
+    }
+
+
+def _hn_rec_from_mysql(entry):
+    if not isinstance(entry, dict) or not entry.get("comment_id"):
+        return None
+    emb = None
+    raw = entry.get("embedding")
+    if isinstance(raw, str) and raw:
+        try:
+            emb = _blob_to_embedding(base64.b64decode(raw))
+        except ValueError as exc:  # binascii.Error bhi ValueError hai
+            log.warning(f"[MYSQL] hn comment embedding unreadable, treating as missing | comment_id={entry.get('comment_id')} | {exc}")
+    return {
+        "comment_id":  str(entry["comment_id"]),
+        "author":      entry.get("author"),
+        "text":        entry.get("text") or "",
+        "created_utc": _hn_as_utc(entry.get("created_utc")),
+        "embedding":   emb,
+    }
+
+
+# ── Mongo sink ───────────────────────────────────────────────────────────────
+
+def _hn_read_comments_mongo(message_id: str):
+    """list of rec (khali ho sakti hai) | None agar story is sink mein nahi / read fail."""
+    try:
+        doc = db.flintel_signals.find_one({"message_id": message_id}, {"_id": 1, "hn_comments": 1})
+    except Exception as exc:
+        log.error(f"[MONGO] hn_comments read failed | message_id={message_id} | {exc}")
+        return None
+    if doc is None:
+        return None
+    raw = doc.get("hn_comments")
+    if not isinstance(raw, list):
+        return []
+    return [r for r in (_hn_rec_from_mongo(e) for e in raw) if r is not None]
+
+
+def _hn_append_mongo(message_id: str, rec: dict) -> bool:
+    """Atomic: $push SIRF tab jab is comment_id wala entry pehle se na ho
+    (absent field par bhi filter match karta hai, $push array bana deta hai)."""
+    try:
+        res = db.flintel_signals.update_one(
+            {"message_id": message_id, "hn_comments.comment_id": {"$ne": rec["comment_id"]}},
+            {"$push": {"hn_comments": _hn_mongo_entry(rec)}},
+        )
+        return bool(getattr(res, "modified_count", 0))
+    except Exception as exc:
+        log.error(f"[MONGO] hn_comments append failed | message_id={message_id} | comment_id={rec.get('comment_id')} | {exc}")
+        return False
+
+
+def _hn_set_embedding_mongo(message_id: str, comment_id: str, vec) -> bool:
+    """Atomic: sirf us entry ka embedding set hota hai jis ka embedding abhi None hai
+    (jis mein embedding hai usse kabhi overwrite nahi hota)."""
+    try:
+        res = db.flintel_signals.update_one(
+            {"message_id": message_id,
+             "hn_comments": {"$elemMatch": {"comment_id": comment_id, "embedding": None}}},
+            {"$set": {
+                "hn_comments.$.embedding":       list(vec),
+                "hn_comments.$.embedding_dim":   len(vec),
+                "hn_comments.$.embedding_model": EMBEDDING_MODEL,
+            }},
+        )
+        return bool(getattr(res, "modified_count", 0))
+    except Exception as exc:
+        log.error(f"[MONGO] hn_comments embedding update failed | message_id={message_id} | comment_id={comment_id} | {exc}")
+        return False
+
+
+# ── MySQL sink ───────────────────────────────────────────────────────────────
+
+def _hn_read_comments_mysql(message_id: str):
+    """list of rec | None (story is sink mein nahi / read fail)."""
+    def op(conn):
+        _ensure_mysql_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT hn_comments FROM flintel_signals WHERE message_id=%s", (message_id,))
+            return cur.fetchone()
+    try:
+        row = _with_mysql(op)
+    except Exception as exc:
+        log.error(f"[MYSQL] hn_comments read failed | message_id={message_id} | {exc}")
+        return None
+    if row is None:
+        return None
+    return [r for r in (_hn_rec_from_mysql(e) for e in _hn_json_list(row[0])) if r is not None]
+
+
+def _hn_mysql_modify(message_id: str, mutate) -> bool:
+    """SELECT ... FOR UPDATE -> mutate(list) -> (sirf changed ho to) UPDATE.
+    Pattern _attach_comment_to_post_mysql wala. Kabhi raise nahi karta."""
+    def op(conn):
+        _ensure_mysql_table(conn)
+        conn.begin()
+        try:
+            changed = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT hn_comments FROM flintel_signals WHERE message_id=%s FOR UPDATE",
+                    (message_id,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    current = _hn_json_list(row[0])
+                    if mutate(current):
+                        cur.execute(
+                            "UPDATE flintel_signals SET hn_comments=%s WHERE message_id=%s",
+                            (json.dumps(current, ensure_ascii=False), message_id),
+                        )
+                        changed = True
+            conn.commit()
+            return changed
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    try:
+        return bool(_with_mysql(op))
+    except Exception as exc:
+        log.error(f"[MYSQL] hn_comments update failed | message_id={message_id} | {exc}")
+        return False
+
+
+def _hn_append_mysql(message_id: str, rec: dict) -> bool:
+    entry = _hn_mysql_entry(rec)
+
+    def mutate(current: list) -> bool:
+        if any(isinstance(c, dict) and c.get("comment_id") == entry["comment_id"] for c in current):
+            return False
+        current.append(entry)
+        return True
+
+    return _hn_mysql_modify(message_id, mutate)
+
+
+def _hn_set_embedding_mysql(message_id: str, comment_id: str, vec) -> bool:
+    try:
+        b64 = base64.b64encode(_embedding_to_blob(vec)).decode("ascii")
+    except ValueError as exc:
+        log.warning(f"[MYSQL] hn comment embedding rejected | comment_id={comment_id} | {exc}")
+        return False
+
+    def mutate(current: list) -> bool:
+        for c in current:
+            if isinstance(c, dict) and c.get("comment_id") == comment_id and not c.get("embedding"):
+                c["embedding"] = b64
+                c["embedding_dim"] = len(vec)
+                c["embedding_model"] = _clip(EMBEDDING_MODEL, 64)
+                return True
+        return False
+
+    return _hn_mysql_modify(message_id, mutate)
+
+
+def _hn_enabled_sinks() -> list:
+    """[(name, read, append, set_embedding)] sirf enabled sinks ke liye (live-checked)."""
+    sinks = []
+    if _is_mongodb_data_enabled():
+        sinks.append(("mongo", _hn_read_comments_mongo, _hn_append_mongo, _hn_set_embedding_mongo))
+    if _is_mysql_data_enabled():
+        sinks.append(("mysql", _hn_read_comments_mysql, _hn_append_mysql, _hn_set_embedding_mysql))
+    return sinks
+
+
+# ── the shared sync ──────────────────────────────────────────────────────────
+
+def _sync_hn_story_comments(topic_key: str, message_id: str, story_id, keyword: str) -> dict:
+    """Ek HN story ke keyword-matched comments ko dono enabled sinks mein sync karta hai.
+    _save_signal ka hook AUR 2-ghante ka refresher dono yahi function chalate hain.
+
+      a) stored comments padho (har enabled sink); since_ts = max stored created_utc
+      b) fetch_story_comments(story_id, keyword, since_ts)
+      c) comment_id se DEDUPE PEHLE (stored par embedding call NAHI)
+      d) sirf bilkul naye comments par generate_embedding (1 comment = 1 call,
+         calls ke beech EMBEDDING_BACKFILL_GAP_SECONDS), phir dono sinks mein append
+         (ek hi vector shared)
+      e) RETRY: stored comments jin ki embedding None hai — sirf unhi ki, aur
+         jis mein embedding hai wo kabhi dobara nahi. Ek sink mein vector ho aur
+         doosre mein na ho (ya comment hi na ho) to vector copy hota hai, naya call nahi.
+
+    Naya comment nahi + retry nahi -> koi write / embedding call nahi.
+    Returns {"new", "embedded", "retried", "filled"}. Kabhi raise nahi karta.
+    """
+    result = {"new": 0, "embedded": 0, "retried": 0, "filled": 0}
+    try:
+        if not _is_hn_nested_comments_enabled():
+            return result
+        if fetch_story_comments is None:
+            log.warning("[HN-COMMENTS] hackernews package unavailable, skipping")
+            return result
+        with _hn_story_lock(message_id):
+            _sync_hn_story_comments_locked(topic_key, message_id, story_id, keyword, result)
+    except Exception as exc:
+        log.error(f"[HN-COMMENTS] sync failed | message_id={message_id} | {exc}")
+    return result
+
+
+def _sync_hn_story_comments_locked(topic_key, message_id, story_id, keyword, result: dict):
+    sinks = _hn_enabled_sinks()
+    if not sinks:
+        _warn_no_sinks()
+        return
+
+    # a) stored comments (per sink). None = story is sink mein nahi -> us sink ko skip.
+    stored = {}
+    for name, read, _append, _set_emb in sinks:
+        recs = read(message_id)
+        if recs is not None:
+            stored[name] = {r["comment_id"]: r for r in recs}
+    active = [s for s in sinks if s[0] in stored]
+    if not active:
+        return
+
+    # Union by comment_id; jis sink mein vector ho wo prefer hota hai.
+    known = {}
+    for by_id in stored.values():
+        for cid, r in by_id.items():
+            cur = known.get(cid)
+            if cur is None or (not _hn_has_embedding(cur.get("embedding")) and _hn_has_embedding(r.get("embedding"))):
+                known[cid] = dict(r)
+
+    stamps = [r["created_utc"] for r in known.values() if r.get("created_utc") is not None]
+    since_ts = int(max(stamps).timestamp()) if stamps else None
+
+    embed_state = {"calls": 0}
+
+    def embed(text):
+        """Ek text = ek call. Disabled / failure -> None (kabhi raise nahi)."""
+        if not _is_embedding_enabled():
+            return None
+        if embed_state["calls"] > 0 and EMBEDDING_BACKFILL_GAP_SECONDS > 0:
+            time.sleep(EMBEDDING_BACKFILL_GAP_SECONDS)
+        embed_state["calls"] += 1
+        vec = generate_embedding(text)
+        return vec if _hn_has_embedding(vec) else None
+
+    cap = max(0, HN_MAX_COMMENTS_PER_STORY)
+
+    # b) fetch (cap par pahunch chuke hon to Algolia call bhi nahi — naya kuch store nahi hoga)
+    fetched = []
+    if len(known) >= cap:
+        log.info(f"[HN-COMMENTS] cap reached ({len(known)}/{cap}) | message_id={message_id} | no new comments will be stored")
+    else:
+        fetched = fetch_story_comments(story_id, keyword, since_ts) or []
+
+    # c) dedupe pehle (comment_id par)
+    fresh = [c for c in fetched if c["comment_id"] not in known]
+    room = cap - len(known)
+    if len(fresh) > room:
+        log.info(
+            f"[HN-COMMENTS] cap {cap} reached | message_id={message_id} | "
+            f"storing {max(room, 0)}, skipping {len(fresh) - max(room, 0)}"
+        )
+        fresh = fresh[:max(room, 0)]
+
+    # e) retry: sirf wo stored comments jin ki embedding kisi bhi sink mein nahi hai
+    for cid, rec in sorted(known.items(), key=lambda kv: kv[1].get("created_utc") or datetime.min.replace(tzinfo=timezone.utc)):
+        if _hn_has_embedding(rec.get("embedding")):
+            continue
+        vec = embed(rec["text"])
+        if vec is None:
+            continue
+        rec["embedding"] = vec
+        for name, _read, _append, set_emb in active:
+            mine = stored[name].get(cid)
+            if mine is not None and not _hn_has_embedding(mine.get("embedding")):
+                if set_emb(message_id, cid, vec):
+                    mine["embedding"] = vec
+        result["retried"] += 1
+
+    # sinks ko barabar karo: ek mein comment/vector ho aur doosre mein na ho -> copy (koi naya call nahi)
+    for name, _read, append, set_emb in active:
+        for cid, rec in known.items():
+            mine = stored[name].get(cid)
+            if mine is None:
+                if append(message_id, rec):
+                    stored[name][cid] = dict(rec)
+                    result["filled"] += 1
+            elif not _hn_has_embedding(mine.get("embedding")) and _hn_has_embedding(rec.get("embedding")):
+                if set_emb(message_id, cid, rec["embedding"]):
+                    mine["embedding"] = rec["embedding"]
+                    result["filled"] += 1
+
+    # d) bilkul naye comments: embed (1 call each) -> turant dono sinks mein append
+    for c in fresh:
+        vec = embed(c["text"])
+        rec = {
+            "comment_id":  c["comment_id"],
+            "author":      c.get("author"),
+            "text":        c["text"],
+            "created_utc": c["created_utc"],
+            "embedding":   vec,
+        }
+        appended = False
+        for name, _read, append, _set_emb in active:
+            if append(message_id, rec):
+                stored[name][rec["comment_id"]] = dict(rec)
+                appended = True
+        if appended:
+            known[rec["comment_id"]] = rec
+            result["new"] += 1
+            if vec is not None:
+                result["embedded"] += 1
+
+    if result["new"] or result["retried"] or result["filled"]:
+        log.info(
+            f"[HN-COMMENTS] synced | topic_key={topic_key} | message_id={message_id} | "
+            f"new={result['new']} | embedded={result['embedded']} | "
+            f"retried={result['retried']} | filled={result['filled']}"
+        )
+
+
+def _hn_after_story_insert(topic_key: str, message_id: str, post: dict, matched_keyword: str):
+    """_save_signal ka hook: sirf NAYI HN story par (platform == "hackernews")
+    chalta hai. HN_NESTED_COMMENTS_ENABLED=False par kuch nahi. Kabhi raise nahi karta."""
+    try:
+        if not _is_hn_nested_comments_enabled():
+            return
+        story_id = str(post.get("id") or "").strip()
+        if not story_id or not matched_keyword:
+            return
+        _sync_hn_story_comments(topic_key, message_id, story_id, matched_keyword)
+    except Exception as exc:
+        log.error(f"[HN-COMMENTS] hook failed | message_id={message_id} | {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1696,6 +2215,123 @@ def run_reddit_poller():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HACKER NEWS — har HN_COMMENT_REFRESH_INTERVAL_SECONDS (default 2 ghante)
+# naye keyword-matched comments ka refresher (daemon thread).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hn_refresh_targets() -> list:
+    """Pichhle HN_COMMENT_TRACK_DAYS ke andar ki HN stories (platform == "hackernews").
+    Mongo enabled ho to Mongo se, warna MySQL se (Mongo read fail ho to MySQL fallback).
+    Returns [{"message_id", "topic_key", "search_keyword", "story_id"}]."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HN_COMMENT_TRACK_DAYS)
+    mongo_on = _is_mongodb_data_enabled()
+    mysql_on = _is_mysql_data_enabled()
+
+    def build(rows):
+        targets, seen = [], set()
+        for mid, topic_key, keyword in rows:
+            mid = str(mid or "")
+            if not mid.startswith(_HN_STORY_ID_PREFIX) or mid in seen:
+                continue
+            story_id = mid[len(_HN_STORY_ID_PREFIX):]
+            if not story_id or not keyword:
+                continue
+            seen.add(mid)
+            targets.append({
+                "message_id": mid, "topic_key": topic_key,
+                "search_keyword": keyword, "story_id": story_id,
+            })
+        return targets
+
+    if mongo_on:
+        try:
+            cursor = db.flintel_signals.find(
+                {"platform": "hackernews", "created_utc": {"$gte": cutoff}},
+                {"message_id": 1, "topic_key": 1, "search_keyword": 1},
+            )
+            return build((d.get("message_id"), d.get("topic_key"), d.get("search_keyword")) for d in cursor)
+        except Exception as exc:
+            log.error(f"[HN-REFRESH] mongo target list failed | {exc}")
+
+    if mysql_on:
+        def op(conn):
+            _ensure_mysql_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT message_id, topic_key, search_keyword FROM flintel_signals "
+                    "WHERE platform=%s AND created_utc>=%s",
+                    ("hackernews", _to_utc_naive(cutoff)),
+                )
+                return cur.fetchall()
+        try:
+            return build(_with_mysql(op) or [])
+        except Exception as exc:
+            log.error(f"[HN-REFRESH] mysql target list failed | {exc}")
+
+    return []
+
+
+def _run_hn_refresh_cycle() -> dict:
+    """Ek refresh cycle. Har story par wahi _sync_hn_story_comments; ek story fail ho
+    to baqi chalti rahein; stories ke beech HN_KEYWORD_GAP_SECONDS. Kabhi raise nahi karta."""
+    summary = {"stories": 0, "new": 0, "retried": 0, "filled": 0}
+    try:
+        targets = _hn_refresh_targets()
+        summary["stories"] = len(targets)
+        gap = hn_config.HN_KEYWORD_GAP_SECONDS if hn_config else 0
+
+        for i, t in enumerate(targets):
+            if not hn_config.is_hackernews_enabled() or not _is_hn_nested_comments_enabled():
+                log.info("[HN-REFRESH] switched off mid-cycle, stopping this cycle")
+                break
+            if i > 0 and gap > 0:
+                time.sleep(gap)
+            try:
+                res = _sync_hn_story_comments(
+                    t["topic_key"], t["message_id"], t["story_id"], t["search_keyword"]
+                )
+                for k in ("new", "retried", "filled"):
+                    summary[k] += res.get(k, 0)
+            except Exception as exc:
+                log.error(f"[HN-REFRESH] story failed | message_id={t['message_id']} | {exc}")
+    except Exception as exc:
+        log.error(f"[HN-REFRESH] cycle failed | {exc}")
+    return summary
+
+
+def run_hn_comment_refresher():
+    """Daemon thread (RedditPoller ki tarah start hota hai). Har cycle HACKERNEWS_ENABLED
+    aur HN_NESTED_COMMENTS_ENABLED live check hota hai (off ho to thread zinda, kaam nahi).
+    Pehli cycle turant chalti hai, is liye purani already-saved stories ka backfill khud ho jata hai."""
+    interval = max(1, HN_COMMENT_REFRESH_INTERVAL_SECONDS)
+    log.info(
+        f"[HN-REFRESH] started | interval={interval}s | track_days={HN_COMMENT_TRACK_DAYS} | "
+        f"max_comments_per_story={HN_MAX_COMMENTS_PER_STORY}"
+    )
+    if hn_config is None or fetch_story_comments is None:
+        log.warning("[HN-REFRESH] hackernews package unavailable, refresher not running")
+        return
+
+    while True:
+        cycle_start = time.time()
+        try:
+            if not hn_config.is_hackernews_enabled():
+                log.info("[HN-REFRESH] HACKERNEWS_ENABLED=False | skipping this cycle")
+            elif not _is_hn_nested_comments_enabled():
+                log.info("[HN-REFRESH] HN_NESTED_COMMENTS_ENABLED=False | skipping this cycle")
+            else:
+                s = _run_hn_refresh_cycle()
+                log.info(
+                    f"[HN-REFRESH] cycle done | stories_checked={s['stories']} | "
+                    f"new_comments={s['new']} | retried={s['retried']} | filled={s['filled']}"
+                )
+        except Exception as exc:
+            log.error(f"[HN-REFRESH] unexpected error: {exc}")
+
+        time.sleep(max(0.0, interval - (time.time() - cycle_start)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB PROCESSING — now Twitter-only. Reddit is handled entirely by the
 # always-on poller above, independent of any single job's lifecycle.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1837,6 +2473,12 @@ def start_all():
     reddit_thread.start()
     threads.append(reddit_thread)
 
+    hn_comment_thread = threading.Thread(
+        target=run_hn_comment_refresher, daemon=True, name="HNCommentRefresher"
+    )
+    hn_comment_thread.start()
+    threads.append(hn_comment_thread)
+
     threads.extend(start_worker_pool())
 
     for t in threads:
@@ -1867,6 +2509,7 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
     log.info(f"  Hacker News       : {'ENABLED' if (hn_config and hn_config.is_hackernews_enabled()) else 'DISABLED'} (HACKERNEWS_ENABLED, live-checked, job-driven via Algolia API)")
+    log.info(f"  HN story comments : {'ENABLED' if _is_hn_nested_comments_enabled() else 'DISABLED (HN_NESTED_COMMENTS_ENABLED=False)'} (HN_NESTED_COMMENTS_ENABLED, live-checked) | refresh every {HN_COMMENT_REFRESH_INTERVAL_SECONDS}s | track {HN_COMMENT_TRACK_DAYS}d | max {HN_MAX_COMMENTS_PER_STORY} comments/story")
     log.info(f"  Embeddings        : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved document)")
     log.info(f"  Mongo signals save : {'ENABLED' if _is_mongodb_data_enabled() else 'DISABLED'} (MONGODB_DATA)")
     log.info(f"  MySQL signals save : {'ENABLED' if _is_mysql_data_enabled() else 'DISABLED'} (MYSQL_DATA) | host={MYSQL_HOST or '-'} db={MYSQL_DATABASE or '-'}")
