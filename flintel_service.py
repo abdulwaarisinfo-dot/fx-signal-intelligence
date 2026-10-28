@@ -179,6 +179,7 @@ import sys
 import json
 import html
 import time
+import random
 import array
 import base64
 import logging
@@ -271,7 +272,7 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 # How often the ALWAYS-ON Reddit poller re-fetches the r/all RSS feeds and
 # re-reads the current keyword list from flintel_search_jobs. This loop
 # never stops and never waits on any job's "pending" status.
-REDDIT_POLL_INTERVAL_SECONDS = int(os.getenv("REDDIT_POLL_INTERVAL_SECONDS", "30"))
+REDDIT_POLL_INTERVAL_SECONDS = int(os.getenv("REDDIT_POLL_INTERVAL_SECONDS", "90"))
 
 # Master ON/OFF switch for Reddit fetching. REDDIT_ENABLED=True (default)
 # -> the poller keeps fetching/matching every cycle, same as always.
@@ -311,7 +312,8 @@ KEYWORD_GAP_SECONDS   = float(os.getenv("KEYWORD_GAP_SECONDS", "1.0"))
 SUBREDDIT_GAP_SECONDS = float(os.getenv("SUBREDDIT_GAP_SECONDS", "1.0"))
 
 REDDIT_USER_AGENT = os.getenv(
-    "REDDIT_USER_AGENT", "flintel-fetch-service/1.0 (contact: ops@example.com)"
+    "REDDIT_USER_AGENT",
+    "flintel-fetch/1.0 (+https://github.com/abdulwaarisinfo-dot/fx-signal-intelligence)",
 )
 
 # Site-wide RSS feed — r/all aggregates new posts across (most) subreddits.
@@ -638,6 +640,72 @@ def _match_any_keyword(text: str, keywords: list):
     return None
 
 
+# ── Polite Reddit GET: shared session, ETag/If-Modified-Since, and an
+# exponential backoff cooldown after 429/403 (per URL). Returns the raw
+# response bytes, or None when skipped / cooling down / not modified /
+# blocked / network error. Never raises. Only the HTTP layer changed —
+# parsing, matching and saving are untouched. ──
+_reddit_session = requests.Session()
+_reddit_http_state = {}   # url -> {"etag", "modified", "blocked_until", "fails"}
+_reddit_http_lock = threading.Lock()
+
+
+def _reddit_get(url: str):
+    with _reddit_http_lock:
+        st = _reddit_http_state.setdefault(
+            url, {"etag": None, "modified": None, "blocked_until": 0.0, "fails": 0}
+        )
+
+    now = time.time()
+    if now < st["blocked_until"]:
+        log.info(f"[REDDIT-HTTP] cooling down {int(st['blocked_until'] - now)}s | {url}")
+        return None
+
+    headers = {
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/atom+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    if st["etag"]:
+        headers["If-None-Match"] = st["etag"]
+    if st["modified"]:
+        headers["If-Modified-Since"] = st["modified"]
+
+    try:
+        resp = _reddit_session.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
+    except Exception as exc:
+        log.warning(f"[REDDIT-HTTP] request error | {url} | {exc}")
+        return None
+
+    if resp.status_code == 304:
+        return None
+
+    if resp.status_code in (429, 403):
+        st["fails"] += 1
+        retry_after = (resp.headers.get("Retry-After") or "").strip()
+        if retry_after.isdigit():
+            wait = int(retry_after)
+        else:
+            wait = min(60 * (2 ** (st["fails"] - 1)), 1800)   # 60,120,240,... max 30 min
+        wait += random.randint(0, 20)
+        st["blocked_until"] = time.time() + wait
+        log.warning(
+            f"[REDDIT-HTTP] {resp.status_code} -> backing off {wait}s "
+            f"(strike {st['fails']}) | {url}"
+        )
+        return None
+
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning(f"[REDDIT-HTTP] bad status | {url} | {exc}")
+        return None
+
+    st["fails"] = 0
+    st["etag"] = resp.headers.get("ETag")
+    st["modified"] = resp.headers.get("Last-Modified")
+    return resp.content
+
+
 def _fetch_reddit_rss_feed() -> list:
     """Fetches the SITE-WIDE r/all "new posts" RSS feed — ONE request, no
     query/keyword parameter (plain RSS doesn't support one). Every job's
@@ -651,9 +719,10 @@ def _fetch_reddit_rss_feed() -> list:
 
     entries = []
     try:
-        resp = requests.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
+        content = _reddit_get(url)
+        if content is None:
+            return entries
+        feed = feedparser.parse(content)
 
         if feed.bozo and not feed.entries:
             log.warning(f"[REDDIT-RSS] feed parse issue: {feed.bozo_exception}")
@@ -713,9 +782,10 @@ def _fetch_reddit_comments_rss_feed() -> list:
 
     entries = []
     try:
-        resp = requests.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
+        content = _reddit_get(url)
+        if content is None:
+            return entries
+        feed = feedparser.parse(content)
 
         if feed.bozo and not feed.entries:
             log.warning(f"[REDDIT-COMMENTS-RSS] feed parse issue: {feed.bozo_exception}")
