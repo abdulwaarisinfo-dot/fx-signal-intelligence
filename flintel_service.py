@@ -648,6 +648,11 @@ def _match_any_keyword(text: str, keywords: list):
 _reddit_session = requests.Session()
 _reddit_http_state = {}   # url -> {"etag", "modified", "blocked_until", "fails"}
 _reddit_http_lock = threading.Lock()
+_reddit_last_request_ts = 0.0
+# Reddit's RSS throttles to roughly one feed per minute; two feeds fired
+# back-to-back is what triggers the 429s. Minimum gap between ANY two
+# Reddit requests (seconds). Override via .env if needed.
+REDDIT_MIN_REQUEST_GAP_SECONDS = float(os.getenv("REDDIT_MIN_REQUEST_GAP_SECONDS", "65"))
 
 
 def _reddit_get(url: str):
@@ -670,7 +675,16 @@ def _reddit_get(url: str):
     if st["modified"]:
         headers["If-Modified-Since"] = st["modified"]
 
+    # Space out requests globally (posts feed vs comments feed).
+    global _reddit_last_request_ts
+    with _reddit_http_lock:
+        gap = REDDIT_MIN_REQUEST_GAP_SECONDS - (time.time() - _reddit_last_request_ts)
+    if gap > 0:
+        time.sleep(gap)
+
     try:
+        with _reddit_http_lock:
+            _reddit_last_request_ts = time.time()
         resp = _reddit_session.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
     except Exception as exc:
         log.warning(f"[REDDIT-HTTP] request error | {url} | {exc}")
@@ -682,10 +696,8 @@ def _reddit_get(url: str):
     if resp.status_code in (429, 403):
         st["fails"] += 1
         retry_after = (resp.headers.get("Retry-After") or "").strip()
-        if retry_after.isdigit():
-            wait = int(retry_after)
-        else:
-            wait = min(60 * (2 ** (st["fails"] - 1)), 1800)   # 60,120,240,... max 30 min
+        exp_wait = min(60 * (2 ** (st["fails"] - 1)), 1800)   # 60,120,240,... max 30 min
+        wait = max(int(retry_after) if retry_after.isdigit() else 0, exp_wait)
         wait += random.randint(0, 20)
         st["blocked_until"] = time.time() + wait
         log.warning(
