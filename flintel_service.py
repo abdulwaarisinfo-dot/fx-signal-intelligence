@@ -654,6 +654,11 @@ _reddit_last_request_ts = 0.0
 # Reddit requests (seconds). Override via .env if needed.
 REDDIT_MIN_REQUEST_GAP_SECONDS = float(os.getenv("REDDIT_MIN_REQUEST_GAP_SECONDS", "65"))
 
+# OPTIONAL proxy for Reddit requests ONLY (Twitter/HN/DB are never proxied).
+# Leave REDDIT_PROXY empty/unset = direct connection (same as before).
+# Format: http://user:pass@host:port   (password is never logged)
+REDDIT_PROXY = os.getenv("REDDIT_PROXY", "").strip()
+
 
 def _reddit_get(url: str):
     with _reddit_http_lock:
@@ -685,7 +690,10 @@ def _reddit_get(url: str):
     try:
         with _reddit_http_lock:
             _reddit_last_request_ts = time.time()
-        resp = _reddit_session.get(url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT)
+        _proxies = {"http": REDDIT_PROXY, "https": REDDIT_PROXY} if REDDIT_PROXY else None
+        resp = _reddit_session.get(
+            url, headers=headers, timeout=REDDIT_REQUEST_TIMEOUT, proxies=_proxies
+        )
     except Exception as exc:
         log.warning(f"[REDDIT-HTTP] request error | {url} | {exc}")
         return None
