@@ -41,16 +41,21 @@ services:
       - key: EMBEDDING_MODEL
         value: text-embedding-3-small
 
-      # ── Reddit (RSS, free) ────────────────────
+      # ── Reddit (RapidAPI reddit34) ────────────
+      # RSS is being shut down by Reddit on 13 Nov 2026 and already returns
+      # 429/403. The source is now the reddit34 RapidAPI (own key, separate
+      # from the Twitter RAPID_API_KEY). Set REDDIT_SOURCE=rss to go back.
       - key: REDDIT_ENABLED
         value: "true"
       - key: REDDIT_SOURCE
-        value: rss
+        value: rapidapi
+      - key: REDDIT_API_KEY
+        sync: false
       - key: REDDIT_POLL_INTERVAL_SECONDS
         value: "30"
+      # only used when REDDIT_SOURCE=rss:
       - key: REDDIT_USER_AGENT
-        value: FlintelSignalBot/6.0
-      # optional, only if Reddit blocks (429/403): http://user:pass@host:port
+        value: flintel-fetch/1.0 (+https://github.com/abdulwaarisinfo-dot/fx-signal-intelligence)
       - key: REDDIT_PROXY
         sync: false
 
