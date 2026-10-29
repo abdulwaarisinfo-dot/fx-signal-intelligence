@@ -36,9 +36,12 @@ def apify_enabled() -> bool:
 _TERMINAL = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 
 
-def _run_actor(actor_id: str, run_input: dict) -> list:
+def _run_actor(actor_id: str, run_input: dict, expect_items: int = 0) -> list:
     """Starts the actor ASYNC, polls until it finishes (or our deadline hits),
-    then reads the run's dataset. Unlike run-sync-get-dataset-items, a run that
+    then reads the run's dataset. If expect_items > 0, the run is ABORTED as
+    soon as the dataset holds that many items (some actors keep running after
+    reaching maxItems and just burn compute until timeout). Unlike
+    run-sync-get-dataset-items, a run that
     TIMES OUT still returns whatever results it already produced (those are
     billed anyway), and we are not limited by the sync endpoint's 300s cap."""
     token = os.getenv("APIFY_TOKEN", "")
@@ -66,23 +69,33 @@ def _run_actor(actor_id: str, run_input: dict) -> list:
         # Poll (long-poll up to 30s per call) until finished or our deadline.
         deadline = time.time() + timeout + 20
         status = run.get("status")
+        reached_target = False
         while status not in _TERMINAL and time.time() < deadline:
             g = requests.get(
                 f"{APIFY_BASE}/actor-runs/{run_id}",
-                params={"waitForFinish": 30},
-                headers=headers, timeout=45,
+                params={"waitForFinish": 10},
+                headers=headers, timeout=25,
             )
             if g.status_code >= 400:
                 log.warning(f"[APIFY] poll failed | run={run_id} | HTTP {g.status_code} | body={g.text[:300]!r}")
                 break
             status = ((g.json() or {}).get("data") or {}).get("status")
+            if expect_items and status not in _TERMINAL:
+                try:
+                    di = requests.get(f"{APIFY_BASE}/datasets/{dataset_id}", headers=headers, timeout=15)
+                    count = int(((di.json() or {}).get("data") or {}).get("itemCount") or 0)
+                except Exception:
+                    count = 0
+                if count >= expect_items:
+                    reached_target = True
+                    break
 
-        if status not in _TERMINAL:  # our own deadline hit -> stop it so it stops billing
+        if status not in _TERMINAL:  # target reached or our deadline hit -> stop it so it stops billing
             try:
                 requests.post(f"{APIFY_BASE}/actor-runs/{run_id}/abort", headers=headers, timeout=15)
             except Exception:
                 pass
-            status = "ABORTED"
+            status = "SUCCEEDED" if reached_target else "ABORTED"
 
         # Read whatever the run produced - even on TIMED-OUT / ABORTED / FAILED.
         d = requests.get(
@@ -139,7 +152,7 @@ def fetch_twitter_search(keyword: str) -> list:
         "searchTerms": [keyword],
         "maxItems": max_items,
         "sort": "Latest",
-    })
+    }, expect_items=max_items)
     posts = []
     for t in items:
         if not isinstance(t, dict) or t.get("noResults"):
@@ -179,7 +192,7 @@ def fetch_reddit_search(keyword: str) -> list:
         "skipUserPosts": True,
         "skipComments": True,
         "proxy": {"useApifyProxy": True},
-    })
+    }, expect_items=max_items)
     posts = []
     for r in items:
         if not isinstance(r, dict):
