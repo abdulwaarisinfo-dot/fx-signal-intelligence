@@ -11,7 +11,7 @@ Env vars:
   TWITTER_PROVIDER         "apify" to use Apify for Twitter (default: rapidapi)
   APIFY_TWITTER_ACTOR      default: apidojo~tweet-scraper
   APIFY_REDDIT_ACTOR       default: trudax~reddit-scraper-lite
-  APIFY_TIMEOUT_SECONDS    default: 120
+  APIFY_TIMEOUT_SECONDS    default: 180 (max run time per actor call)
   APIFY_MAX_ITEMS          default: 50
 
 Actor ids use "~" instead of "/" in the API URL (user~actor-name).
@@ -19,6 +19,7 @@ Never raises: any failure just returns [] (same contract as the other fetchers).
 """
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -32,32 +33,73 @@ def apify_enabled() -> bool:
     return bool(os.getenv("APIFY_TOKEN", ""))
 
 
+_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
+
+
 def _run_actor(actor_id: str, run_input: dict) -> list:
-    """Run an actor and return its dataset items (run-sync-get-dataset-items)."""
+    """Starts the actor ASYNC, polls until it finishes (or our deadline hits),
+    then reads the run's dataset. Unlike run-sync-get-dataset-items, a run that
+    TIMES OUT still returns whatever results it already produced (those are
+    billed anyway), and we are not limited by the sync endpoint's 300s cap."""
     token = os.getenv("APIFY_TOKEN", "")
     if not token:
         return []
-    timeout = int(os.getenv("APIFY_TIMEOUT_SECONDS", "120"))
-    url = f"{APIFY_BASE}/acts/{actor_id}/run-sync-get-dataset-items"
+    timeout = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
+    headers = {"Authorization": f"Bearer {token}"}
+    run_id = None
     try:
-        resp = requests.post(
-            url,
+        r = requests.post(
+            f"{APIFY_BASE}/acts/{actor_id}/runs",
             params={"timeout": timeout},
-            headers={"Authorization": f"Bearer {token}"},
-            json=run_input,
-            timeout=timeout + 15,
+            headers=headers, json=run_input, timeout=30,
         )
-        if resp.status_code >= 400:
-            # Apify puts the real reason (invalid input field, quota, ...) in the body.
-            log.warning(
-                f"[APIFY] actor failed | actor={actor_id} | HTTP {resp.status_code} | "
-                f"body={resp.text[:500]!r}"
-            )
+        if r.status_code >= 400:
+            log.warning(f"[APIFY] start failed | actor={actor_id} | HTTP {r.status_code} | body={r.text[:500]!r}")
             return []
-        data = resp.json()
-        return data if isinstance(data, list) else []
+        run = (r.json() or {}).get("data") or {}
+        run_id = run.get("id")
+        dataset_id = run.get("defaultDatasetId")
+        if not run_id or not dataset_id:
+            log.warning(f"[APIFY] unexpected start response | actor={actor_id} | {r.text[:300]!r}")
+            return []
+
+        # Poll (long-poll up to 30s per call) until finished or our deadline.
+        deadline = time.time() + timeout + 20
+        status = run.get("status")
+        while status not in _TERMINAL and time.time() < deadline:
+            g = requests.get(
+                f"{APIFY_BASE}/actor-runs/{run_id}",
+                params={"waitForFinish": 30},
+                headers=headers, timeout=45,
+            )
+            if g.status_code >= 400:
+                log.warning(f"[APIFY] poll failed | run={run_id} | HTTP {g.status_code} | body={g.text[:300]!r}")
+                break
+            status = ((g.json() or {}).get("data") or {}).get("status")
+
+        if status not in _TERMINAL:  # our own deadline hit -> stop it so it stops billing
+            try:
+                requests.post(f"{APIFY_BASE}/actor-runs/{run_id}/abort", headers=headers, timeout=15)
+            except Exception:
+                pass
+            status = "ABORTED"
+
+        # Read whatever the run produced - even on TIMED-OUT / ABORTED / FAILED.
+        d = requests.get(
+            f"{APIFY_BASE}/datasets/{dataset_id}/items",
+            params={"format": "json", "clean": "true"},
+            headers=headers, timeout=60,
+        )
+        if d.status_code >= 400:
+            log.warning(f"[APIFY] dataset read failed | run={run_id} | HTTP {d.status_code} | body={d.text[:300]!r}")
+            return []
+        items = d.json()
+        items = items if isinstance(items, list) else []
+        if status != "SUCCEEDED":
+            log.warning(f"[APIFY] run ended {status} | actor={actor_id} | run={run_id} | partial_items={len(items)}")
+        return items
     except Exception as exc:
-        log.warning(f"[APIFY] actor failed | actor={actor_id} | {exc}")
+        log.warning(f"[APIFY] actor failed | actor={actor_id} | run={run_id} | {exc}")
         return []
 
 
