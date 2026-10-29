@@ -47,7 +47,13 @@ def _run_actor(actor_id: str, run_input: dict) -> list:
             json=run_input,
             timeout=timeout + 15,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Apify puts the real reason (invalid input field, quota, ...) in the body.
+            log.warning(
+                f"[APIFY] actor failed | actor={actor_id} | HTTP {resp.status_code} | "
+                f"body={resp.text[:500]!r}"
+            )
+            return []
         data = resp.json()
         return data if isinstance(data, list) else []
     except Exception as exc:
@@ -124,10 +130,13 @@ def fetch_reddit_search(keyword: str) -> list:
     max_items = int(os.getenv("APIFY_MAX_ITEMS", "50"))
     items = _run_actor(actor, {
         "searches": [keyword],
-        "type": "posts",
+        "searchPosts": True,
+        "searchComments": False,
         "sort": "new",
         "maxItems": max_items,
+        "skipUserPosts": True,
         "skipComments": True,
+        "proxy": {"useApifyProxy": True},
     })
     posts = []
     for r in items:
