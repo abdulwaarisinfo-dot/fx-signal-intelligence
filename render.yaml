@@ -30,6 +30,22 @@ services:
       - key: TWITTER_BEARER_TOKEN
         sync: false
  
+      # ── Apify ─────────────────────────────────
+      - key: APIFY_TOKEN
+        sync: false
+      # "apify" = Twitter via Apify actor, otherwise RapidAPI
+      - key: TWITTER_PROVIDER
+        value: apify
+      - key: APIFY_MAX_ITEMS
+        value: "50"
+      # Reddit via Apify (keyword search, throttled for cost)
+      - key: REDDIT_SOURCE
+        value: apify
+      - key: APIFY_REDDIT_MIN_INTERVAL_SECONDS
+        value: "900"
+      - key: APIFY_REDDIT_MAX_KEYWORDS
+        value: "20"
+
       # ── MongoDB ───────────────────────────────
       - key: MONGODB_URI
         sync: false
