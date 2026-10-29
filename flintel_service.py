@@ -727,189 +727,204 @@ def _reddit_get(url: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTIONAL ALTERNATE REDDIT SOURCE — Google SERP via RapidAPI (no request is
-# ever sent to reddit.com in this mode).
+# OPTIONAL ALTERNATE REDDIT SOURCE — RapidAPI "reddit34" (getPopularPosts).
 #
-#   REDDIT_SOURCE=rss   (DEFAULT) -> exactly the behaviour above, untouched.
-#   REDDIT_SOURCE=serp            -> _fetch_reddit_rss_feed() returns entries
-#                                    built from Google results for
-#                                    `site:reddit.com ("kw1" OR "kw2" ...)`.
+#   REDDIT_SOURCE=rss       (DEFAULT) -> RSS exactly as above, untouched.
+#   REDDIT_SOURCE=rapidapi            -> _fetch_reddit_rss_feed() calls
+#       https://reddit34.p.rapidapi.com/getPopularPosts?sort=new (ONE call per
+#       poller cycle) and turns the posts into entries in the EXACT same dict
+#       shape as the RSS ones.
 #
-# ONLY the data SOURCE changes. Entries come back in the EXACT same dict shape
-# as the RSS ones, so _match_and_save_entries() / _match_any_keyword() /
-# _save_signal() (matching, dedupe, embeddings, Mongo/MySQL save) run
-# completely unchanged. Entry id is "t3_<postid>" — the same id format the RSS
-# path produces — so a post already stored via RSS is NOT stored twice.
+# Everything downstream is unchanged and works as at the very start: the
+# poller loads every job's keywords from flintel_search_jobs, matches every
+# entry against every job (_match_and_save_entries / _match_any_keyword), and
+# _save_signal() dedupes, embeds and saves to Mongo/MySQL. Entry id is
+# "t3_<postid>" (same format as RSS) so already-stored posts are never stored
+# twice.
 #
-# Differences vs RSS (inherent to SERP data): text = Google title + snippet
-# (not full post body), author = "unknown", created_utc = None (stored as
-# fetch time), and the comments feed returns nothing in this mode.
-# Cost control: rotating keyword cursor, REDDIT_SERP_BATCH keywords per call,
-# REDDIT_SERP_MAX_CALLS_PER_CYCLE, and a hard REDDIT_SERP_MAX_CALLS_PER_HOUR.
-# Applies on restart (read once at startup).
+# Uses its OWN key: REDDIT_API_KEY (the Twitter RAPID_API_KEY is never touched).
+# The comments feed has no site-wide equivalent here -> returns nothing.
+# The response format is read defensively (several shapes/field names are
+# understood); set REDDIT_API_DEBUG=true to log a raw sample of the first
+# response if posts_in_response comes out as 0.
 # ─────────────────────────────────────────────────────────────────────────────
 REDDIT_SOURCE = (os.getenv("REDDIT_SOURCE", "rss") or "rss").strip().lower()
-REDDIT_SERP_RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
-REDDIT_SERP_HOST = os.getenv("RAPIDAPI_SEARCH_HOST", "google-search116.p.rapidapi.com").strip()
-REDDIT_SERP_BATCH = max(1, int(os.getenv("REDDIT_SERP_BATCH", "5")))
-REDDIT_SERP_RESULTS_PER_KEYWORD = max(1, int(os.getenv("REDDIT_SERP_RESULTS_PER_KEYWORD", "10")))
-REDDIT_SERP_MAX_CALLS_PER_CYCLE = max(1, int(os.getenv("REDDIT_SERP_MAX_CALLS_PER_CYCLE", "1")))
-REDDIT_SERP_MAX_CALLS_PER_HOUR = max(1, int(os.getenv("REDDIT_SERP_MAX_CALLS_PER_HOUR", "20")))
-REDDIT_SERP_TIMEOUT_SECONDS = int(os.getenv("REDDIT_SERP_TIMEOUT_SECONDS", "60"))
+REDDIT_RAPIDAPI_KEY = os.getenv("REDDIT_API_KEY", "").strip()
+REDDIT_RAPIDAPI_HOST = os.getenv("REDDIT_API_HOST", "reddit34.p.rapidapi.com").strip()
+REDDIT_RAPIDAPI_ENDPOINT = "/" + os.getenv("REDDIT_API_ENDPOINT", "getPopularPosts").strip().lstrip("/")
+REDDIT_RAPIDAPI_SORT = os.getenv("REDDIT_API_SORT", "new").strip()
+REDDIT_RAPIDAPI_TIMEOUT = int(os.getenv("REDDIT_API_TIMEOUT_SECONDS", "30"))
+REDDIT_RAPIDAPI_DEBUG = os.getenv("REDDIT_API_DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
+_rapi_blocked_until = 0.0
+_rapi_sample_logged = False
 
-_SERP_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"}
-_SERP_POST_PATH_RE = re.compile(r"^/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)(?:/([^/]+))?")
-_SERP_LIST_KEYS = ["results", "organic_results", "organic", "items", "data", "response", "hits"]
-_serp_lock = threading.Lock()
-_serp_cursor = 0
-_serp_call_times = []
-_serp_blocked_until = 0.0
+_RAPI_LIST_KEYS = ["posts", "children", "data", "results", "items", "response", "hits"]
+_RAPI_TITLE_KEYS = ["title", "postTitle", "post_title"]
 
 
-def _serp_dig_list(obj) -> list:
-    if isinstance(obj, list):
-        return obj
-    if not isinstance(obj, dict):
+def _rapi_unwrap(item):
+    """{"data": {...post...}} / {"kind":"t3","data":{...}} -> the inner post dict."""
+    if isinstance(item, dict):
+        inner = item.get("data")
+        if isinstance(inner, dict) and not any(k in item for k in _RAPI_TITLE_KEYS):
+            return inner
+    return item
+
+
+def _rapi_find_posts(obj, depth=0):
+    """First list (anywhere in the JSON) whose items look like posts."""
+    if depth > 4:
         return []
-    for key in _SERP_LIST_KEYS:
-        val = obj.get(key)
-        if isinstance(val, list):
-            return val
-        if isinstance(val, dict):
-            for inner in _SERP_LIST_KEYS:
-                iv = val.get(inner)
-                if isinstance(iv, list):
-                    return iv
+    if isinstance(obj, list):
+        items = [_rapi_unwrap(x) for x in obj if isinstance(x, dict)]
+        if items and any(any(k in it for k in _RAPI_TITLE_KEYS) for it in items):
+            return items
+        for x in obj:
+            r = _rapi_find_posts(x, depth + 1)
+            if r:
+                return r
+        return []
+    if isinstance(obj, dict):
+        for key in _RAPI_LIST_KEYS:
+            if key in obj:
+                r = _rapi_find_posts(obj[key], depth + 1)
+                if r:
+                    return r
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                r = _rapi_find_posts(v, depth + 1)
+                if r:
+                    return r
     return []
 
 
-def _serp_item_to_entry(item: dict):
-    """One Google result -> one entry in the SAME shape as the RSS entries,
-    or None if it is not a Reddit POST url."""
-    from urllib.parse import urlparse
-    url = (item.get("url") or item.get("link") or "").strip()
-    if not url:
+def _rapi_first(d: dict, keys):
+    for k in keys:
+        v = d.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _rapi_name(v):
+    """str, or dict like {"name": ...}/{"displayName": ...} -> str."""
+    if isinstance(v, dict):
+        v = _rapi_first(v, ["name", "displayName", "display_name", "username", "title"])
+    return str(v).strip() if v is not None else ""
+
+
+def _rapi_created(v):
+    if v is None or v == "":
         return None
     try:
-        parsed = urlparse(url)
-    except Exception:
+        f = float(v)
+        if f > 1e12:
+            f /= 1000.0     # milliseconds
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
         return None
-    if (parsed.hostname or "").lower() not in _SERP_HOSTS:
-        return None
-    m = _SERP_POST_PATH_RE.match(parsed.path or "")
-    if not m:
-        return None
-    sub, post_id, slug = m.group(1), m.group(2), m.group(3)
-    canonical = f"https://www.reddit.com/r/{sub}/comments/{post_id}/" + (f"{slug}/" if slug else "")
-    title = html.unescape(str(item.get("title") or "")).strip()
-    snippet = html.unescape(str(
-        item.get("snippet") or item.get("description") or item.get("text") or item.get("body") or ""
-    )).strip()
-    if not title and not snippet:
-        return None
+
+
+def _rapi_post_to_entry(post: dict):
+    title = html.unescape(_rapi_name(_rapi_first(post, _RAPI_TITLE_KEYS))).strip()
     if not title:
-        title, snippet = snippet, ""
-    selftext = snippet if snippet and snippet.lower() != title.lower() else ""
+        return None
+    permalink = _rapi_name(_rapi_first(post, ["permalink", "postUrl", "post_url", "url", "link"]))
+    m = re.search(r"/comments/([A-Za-z0-9]+)", permalink)
+    raw_id = _rapi_name(_rapi_first(post, ["id", "postId", "post_id", "name"]))
+    pid = raw_id.split("_")[-1] if raw_id else (m.group(1) if m else "")
+    if not pid:
+        return None
+
+    if permalink.startswith("/"):
+        post_url = "https://www.reddit.com" + permalink
+    elif permalink.startswith("http"):
+        post_url = permalink
+    else:
+        post_url = ""
+
+    sub = _rapi_name(_rapi_first(post, ["subreddit", "subredditName", "subreddit_name",
+                                        "subreddit_name_prefixed", "community"]))
+    sub = re.sub(r"^/?r/", "", sub)
+    if not sub:
+        ms = re.search(r"/r/([^/]+)/", permalink)
+        sub = ms.group(1) if ms else "unknown"
+
+    selftext = html.unescape(_rapi_name(_rapi_first(post, ["selftext", "text", "body", "content", "description"]))).strip()
+    if selftext.lower() == title.lower():
+        selftext = ""
+
+    author = _rapi_name(_rapi_first(post, ["author", "authorName", "author_name", "username", "user"])).lstrip("u/").strip() or "unknown"
+
+    def _num(keys):
+        try:
+            return int(float(_rapi_first(post, keys) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     return {
-        "id":            f"t3_{post_id}",   # same id format as the RSS path
+        "id":            f"t3_{pid}",   # same id format as the RSS path
         "title":         title,
         "selftext":      selftext,
-        "author":        "unknown",
+        "author":        author,
         "subreddit":     sub,
-        "post_url":      canonical,
-        "created_utc":   None,
-        "score":         0,
-        "num_comments":  0,
+        "post_url":      post_url,
+        "created_utc":   _rapi_created(_rapi_first(post, ["created_utc", "createdUtc", "created", "createdAt", "created_at", "timestamp", "date"])),
+        "score":         _num(["score", "ups", "upvotes"]),
+        "num_comments":  _num(["num_comments", "numComments", "commentCount", "comments"]),
     }
 
 
-def _fetch_reddit_serp_entries() -> list:
-    """Never raises; a failure just means zero entries this cycle."""
-    global _serp_cursor, _serp_blocked_until
+def _fetch_reddit_rapidapi_entries() -> list:
+    """ONE RapidAPI call per cycle. Never raises; a failure just means zero
+    entries this cycle (the poller carries on)."""
+    global _rapi_blocked_until, _rapi_sample_logged
     entries = []
-    if not REDDIT_SERP_RAPIDAPI_KEY:
-        log.warning("[REDDIT-SERP] REDDIT_SOURCE=serp but RAPIDAPI_KEY is not set — nothing fetched.")
+    if not REDDIT_RAPIDAPI_KEY:
+        log.warning("[REDDIT-API] REDDIT_SOURCE=rapidapi but REDDIT_API_KEY is not set — nothing fetched.")
         return entries
-    if time.time() < _serp_blocked_until:
-        log.info(f"[REDDIT-SERP] cooling down {int(_serp_blocked_until - time.time())}s")
+    if time.time() < _rapi_blocked_until:
+        log.info(f"[REDDIT-API] cooling down {int(_rapi_blocked_until - time.time())}s")
         return entries
     try:
-        keywords, seen_kw = [], set()
-        for job in _load_all_jobs_keyword_map():
-            if job["targeting_platform"] not in ("reddit", "all"):
-                continue
-            for kw in job["keywords"]:
-                k = (kw or "").replace('"', " ").strip()
-                if k and k.lower() not in seen_kw:
-                    seen_kw.add(k.lower())
-                    keywords.append(k)
-        if not keywords:
+        r = requests.get(
+            f"https://{REDDIT_RAPIDAPI_HOST}{REDDIT_RAPIDAPI_ENDPOINT}",
+            headers={"x-rapidapi-key": REDDIT_RAPIDAPI_KEY, "x-rapidapi-host": REDDIT_RAPIDAPI_HOST},
+            params={"sort": REDDIT_RAPIDAPI_SORT},
+            timeout=REDDIT_RAPIDAPI_TIMEOUT,
+        )
+        if r.status_code != 200:
+            if r.status_code in (429, 403, 401):
+                _rapi_blocked_until = time.time() + 300   # quota / subscription problem — pause 5 min
+            log.warning(f"[REDDIT-API] HTTP {r.status_code} | {r.text[:200]!r}")
+            return entries
+        try:
+            data = r.json()
+        except ValueError:
+            log.warning(f"[REDDIT-API] non-JSON response | {r.text[:200]!r}")
             return entries
 
-        seen_ids = set()
-        for _ in range(REDDIT_SERP_MAX_CALLS_PER_CYCLE):
-            now = time.time()
-            with _serp_lock:
-                _serp_call_times[:] = [t for t in _serp_call_times if now - t < 3600]
-                if len(_serp_call_times) >= REDDIT_SERP_MAX_CALLS_PER_HOUR:
-                    log.info(f"[REDDIT-SERP] hourly cap reached ({REDDIT_SERP_MAX_CALLS_PER_HOUR} calls/h) — waiting")
-                    break
-                _serp_call_times.append(now)
-
-            start = _serp_cursor % len(keywords)
-            n = min(REDDIT_SERP_BATCH, len(keywords))
-            batch = [keywords[(start + i) % len(keywords)] for i in range(n)]
-            query = "site:reddit.com (" + " OR ".join(f'"{k}"' for k in batch) + ")"
-
-            try:
-                r = requests.get(
-                    "https://google-search116.p.rapidapi.com/" if REDDIT_SERP_HOST == "google-search116.p.rapidapi.com"
-                    else f"https://{REDDIT_SERP_HOST}/",
-                    headers={
-                        "x-rapidapi-key": REDDIT_SERP_RAPIDAPI_KEY,
-                        "x-rapidapi-host": REDDIT_SERP_HOST,
-                        "Content-Type": "application/json",
-                    },
-                    params={"query": query, "limit": str(REDDIT_SERP_RESULTS_PER_KEYWORD * n)},
-                    timeout=REDDIT_SERP_TIMEOUT_SECONDS,
-                )
-            except Exception as exc:
-                log.warning(f"[REDDIT-SERP] request error: {exc}")
-                break
-
-            if r.status_code != 200:
-                if r.status_code in (429, 403, 401):
-                    _serp_blocked_until = time.time() + 300
-                log.warning(f"[REDDIT-SERP] HTTP {r.status_code} — keyword batch NOT advanced, retrying later | {r.text[:150]!r}")
-                break
-            try:
-                data = r.json()
-            except ValueError:
-                log.warning("[REDDIT-SERP] non-JSON response — keyword batch NOT advanced")
-                break
-
-            items = _serp_dig_list(data)
-            if (not items and isinstance(data, dict) and ("message" in data or "error" in data)
-                    and not any(isinstance(data.get(k), list) for k in _SERP_LIST_KEYS)):
-                log.warning(f"[REDDIT-SERP] API error payload — batch NOT advanced | {str(data)[:150]!r}")
-                _serp_blocked_until = time.time() + 300
-                break
-
-            _serp_cursor = (start + n) % len(keywords)
-            added = 0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                e = _serp_item_to_entry(item)
-                if e is None or e["id"] in seen_ids:
-                    continue
-                seen_ids.add(e["id"])
+        posts = _rapi_find_posts(data)
+        seen = set()
+        for post in posts:
+            e = _rapi_post_to_entry(post)
+            if e and e["id"] not in seen:
+                seen.add(e["id"])
                 entries.append(e)
-                added += 1
-            log.info(f"[REDDIT-SERP] call ok | keywords:{n} | results:{len(items)} | post_entries:{added} | cursor:{_serp_cursor}/{len(keywords)}")
-            time.sleep(1.5)
+
+        if (REDDIT_RAPIDAPI_DEBUG or not entries) and not _rapi_sample_logged:
+            _rapi_sample_logged = True
+            log.info(f"[REDDIT-API] sample of raw response (for format check): {json.dumps(data)[:600]}")
+        log.info(f"[REDDIT-API] call ok | posts_in_response:{len(posts)} | entries:{len(entries)}")
     except Exception as exc:
-        log.warning(f"[REDDIT-SERP] fetch failed: {exc}")
+        log.warning(f"[REDDIT-API] fetch failed: {exc}")
     return entries
 
 
@@ -921,8 +936,8 @@ def _fetch_reddit_rss_feed() -> list:
     no subreddit targeting is needed — r/all already spans (most)
     subreddits in one feed. Never raises — a failure here just means zero
     entries this round; it never blocks the poller's next cycle."""
-    if REDDIT_SOURCE == "serp":
-        return _fetch_reddit_serp_entries()
+    if REDDIT_SOURCE in ("rapidapi", "api"):
+        return _fetch_reddit_rapidapi_entries()
 
     url = f"{REDDIT_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
     headers = {"User-Agent": REDDIT_USER_AGENT}
@@ -987,8 +1002,8 @@ def _fetch_reddit_comments_rss_feed() -> list:
     actually wrote, same as it does for post title+selftext. Never raises
     — a failure here just means zero comment entries this round; it never
     blocks the poller's next cycle or the posts fetch."""
-    if REDDIT_SOURCE == "serp":
-        return []   # comments feed is RSS-only; nothing to fetch in SERP mode
+    if REDDIT_SOURCE in ("rapidapi", "api"):
+        return []   # no site-wide comments endpoint in this mode
 
     url = f"{REDDIT_COMMENTS_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
     headers = {"User-Agent": REDDIT_USER_AGENT}
