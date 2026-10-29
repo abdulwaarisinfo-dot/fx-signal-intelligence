@@ -347,16 +347,7 @@ RAPID_API_KEY          = os.getenv("RAPID_API_KEY", "")
 # service is running takes effect on the very next job, no restart needed.
 def _is_twitter_enabled() -> bool:
     load_dotenv(override=True)
-    if not _env_bool("TWITTER_ENABLED", True):
-        return False
-    if _twitter_provider() == "apify":
-        return bool(os.getenv("APIFY_TOKEN", ""))
-    return bool(os.getenv("RAPID_API_KEY", ""))
-
-
-def _twitter_provider() -> str:
-    """"apify" -> Twitter via Apify actor; anything else -> RapidAPI (default)."""
-    return os.getenv("TWITTER_PROVIDER", "rapidapi").strip().lower()
+    return _env_bool("TWITTER_ENABLED", True) and bool(os.getenv("RAPID_API_KEY", ""))
 
 
 TWITTER_HOST           = "twitter-api45.p.rapidapi.com"
@@ -937,64 +928,6 @@ def _fetch_reddit_rapidapi_entries() -> list:
     return entries
 
 
-_apify_reddit_last_run = 0.0
-
-
-def _fetch_reddit_apify_entries() -> list:
-    """REDDIT_SOURCE=apify. Apify searches PER KEYWORD (not a site-wide feed),
-    so we collect every unique keyword from flintel_search_jobs (reddit/all
-    jobs), run one Apify search per keyword, and hand the merged, de-duplicated
-    entries to the poller, which still matches/saves them exactly as before.
-
-    Cost control: Apify bills per run/result, so this only actually calls
-    Apify every APIFY_REDDIT_MIN_INTERVAL_SECONDS (default 900s) and at most
-    APIFY_REDDIT_MAX_KEYWORDS keywords (default 20) per call; in-between
-    poller cycles return [] (nothing new to do). Never raises."""
-    global _apify_reddit_last_run
-    try:
-        from apify_source import apify_enabled, fetch_reddit_search_many
-    except Exception as exc:
-        log.warning(f"[REDDIT-APIFY] apify_source import failed: {exc}")
-        return []
-    if not apify_enabled():
-        log.warning("[REDDIT-APIFY] REDDIT_SOURCE=apify but APIFY_TOKEN is not set - nothing fetched.")
-        return []
-
-    min_gap = _env_int_safe("APIFY_REDDIT_MIN_INTERVAL_SECONDS", 900)
-    if time.time() - _apify_reddit_last_run < min_gap:
-        return []
-    _apify_reddit_last_run = time.time()
-
-    max_kw = _env_int_safe("APIFY_REDDIT_MAX_KEYWORDS", 0)          # 0 = ALL keywords
-    per_run = max(1, _env_int_safe("APIFY_REDDIT_KEYWORDS_PER_RUN", 20))
-    keywords, seen_kw = [], set()
-    for job in _load_all_jobs_keyword_map():
-        if job["targeting_platform"] not in ("reddit", "all"):
-            continue
-        for kw in job["keywords"]:
-            k = str(kw).strip()
-            if k and k.lower() not in seen_kw:
-                seen_kw.add(k.lower())
-                keywords.append(k)
-    total_kw = len(keywords)
-    if max_kw > 0:
-        keywords = keywords[:max_kw]
-
-    entries, seen_ids, runs = [], set(), 0
-    for i in range(0, len(keywords), per_run):
-        chunk = keywords[i:i + per_run]
-        runs += 1
-        for e in fetch_reddit_search_many(chunk):
-            if e["id"] not in seen_ids:
-                seen_ids.add(e["id"])
-                entries.append(e)
-    log.info(
-        f"[REDDIT-APIFY] call ok | keywords={len(keywords)}/{total_kw} | "
-        f"apify_runs={runs} | entries={len(entries)}"
-    )
-    return entries
-
-
 def _fetch_reddit_rss_feed() -> list:
     """Fetches the SITE-WIDE r/all "new posts" RSS feed — ONE request, no
     query/keyword parameter (plain RSS doesn't support one). Every job's
@@ -1003,8 +936,6 @@ def _fetch_reddit_rss_feed() -> list:
     no subreddit targeting is needed — r/all already spans (most)
     subreddits in one feed. Never raises — a failure here just means zero
     entries this round; it never blocks the poller's next cycle."""
-    if REDDIT_SOURCE == "apify":
-        return _fetch_reddit_apify_entries()
     if REDDIT_SOURCE in ("rapidapi", "api"):
         return _fetch_reddit_rapidapi_entries()
 
@@ -1071,8 +1002,8 @@ def _fetch_reddit_comments_rss_feed() -> list:
     actually wrote, same as it does for post title+selftext. Never raises
     — a failure here just means zero comment entries this round; it never
     blocks the poller's next cycle or the posts fetch."""
-    if REDDIT_SOURCE in ("rapidapi", "api", "apify"):
-        return []   # no site-wide comments endpoint in these modes
+    if REDDIT_SOURCE in ("rapidapi", "api"):
+        return []   # no site-wide comments endpoint in this mode
 
     url = f"{REDDIT_COMMENTS_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
     headers = {"User-Agent": REDDIT_USER_AGENT}
@@ -1148,10 +1079,6 @@ def _fetch_twitter_search(keyword: str) -> list:
     keyword; it never blocks the rest of the job."""
     if not _is_twitter_enabled():
         return []
-
-    if _twitter_provider() == "apify":
-        from apify_source import fetch_twitter_search as _apify_twitter
-        return _apify_twitter(keyword)
 
     url = f"https://{TWITTER_HOST}/search.php"
     params = {
