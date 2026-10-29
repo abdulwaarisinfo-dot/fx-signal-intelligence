@@ -50,6 +50,7 @@ def _run_actor(actor_id: str, run_input: dict, expect_items: int = 0) -> list:
     timeout = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
     headers = {"Authorization": f"Bearer {token}"}
     run_id = None
+    t0 = time.time()
     try:
         r = requests.post(
             f"{APIFY_BASE}/acts/{actor_id}/runs",
@@ -110,6 +111,11 @@ def _run_actor(actor_id: str, run_input: dict, expect_items: int = 0) -> list:
         items = items if isinstance(items, list) else []
         if status != "SUCCEEDED":
             log.warning(f"[APIFY] run ended {status} | actor={actor_id} | run={run_id} | partial_items={len(items)}")
+        else:
+            log.info(
+                f"[APIFY] 200 OK | actor={actor_id} | run={run_id} | status={status} | "
+                f"items={len(items)} | {time.time() - t0:.1f}s"
+            )
         return items
     except Exception as exc:
         log.warning(f"[APIFY] actor failed | actor={actor_id} | run={run_id} | {exc}")
@@ -180,11 +186,18 @@ def fetch_twitter_search(keyword: str) -> list:
     return posts
 
 
-def fetch_reddit_search(keyword: str) -> list:
+def fetch_reddit_search_many(keywords: list) -> list:
+    """ONE actor run for MANY keywords (the actor accepts a `searches` array).
+    maxItems = APIFY_MAX_ITEMS per keyword, as a TOTAL cap for the run; the run
+    is aborted early as soon as that many items exist. Never raises."""
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+    if not keywords:
+        return []
     actor = os.getenv("APIFY_REDDIT_ACTOR", "trudax~reddit-scraper-lite")
-    max_items = int(os.getenv("APIFY_MAX_ITEMS", "50"))
+    per_kw = int(os.getenv("APIFY_MAX_ITEMS", "50"))
+    max_items = per_kw * len(keywords)
     items = _run_actor(actor, {
-        "searches": [keyword],
+        "searches": keywords,
         "searchPosts": True,
         "searchComments": False,
         "sort": "new",
@@ -216,3 +229,7 @@ def fetch_reddit_search(keyword: str) -> list:
             "num_comments": _first(r, ["numberOfComments", "num_comments"], 0) or 0,
         })
     return posts
+
+
+def fetch_reddit_search(keyword: str) -> list:
+    return fetch_reddit_search_many([keyword])
