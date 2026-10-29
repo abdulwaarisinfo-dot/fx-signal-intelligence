@@ -952,7 +952,7 @@ def _fetch_reddit_apify_entries() -> list:
     poller cycles return [] (nothing new to do). Never raises."""
     global _apify_reddit_last_run
     try:
-        from apify_source import apify_enabled, fetch_reddit_search
+        from apify_source import apify_enabled, fetch_reddit_search_many
     except Exception as exc:
         log.warning(f"[REDDIT-APIFY] apify_source import failed: {exc}")
         return []
@@ -965,7 +965,8 @@ def _fetch_reddit_apify_entries() -> list:
         return []
     _apify_reddit_last_run = time.time()
 
-    max_kw = _env_int_safe("APIFY_REDDIT_MAX_KEYWORDS", 20)
+    max_kw = _env_int_safe("APIFY_REDDIT_MAX_KEYWORDS", 0)          # 0 = ALL keywords
+    per_run = max(1, _env_int_safe("APIFY_REDDIT_KEYWORDS_PER_RUN", 20))
     keywords, seen_kw = [], set()
     for job in _load_all_jobs_keyword_map():
         if job["targeting_platform"] not in ("reddit", "all"):
@@ -975,16 +976,22 @@ def _fetch_reddit_apify_entries() -> list:
             if k and k.lower() not in seen_kw:
                 seen_kw.add(k.lower())
                 keywords.append(k)
-    keywords = keywords[:max_kw]
+    total_kw = len(keywords)
+    if max_kw > 0:
+        keywords = keywords[:max_kw]
 
-    entries, seen_ids = [], set()
-    for kw in keywords:
-        for e in fetch_reddit_search(kw):
+    entries, seen_ids, runs = [], set(), 0
+    for i in range(0, len(keywords), per_run):
+        chunk = keywords[i:i + per_run]
+        runs += 1
+        for e in fetch_reddit_search_many(chunk):
             if e["id"] not in seen_ids:
                 seen_ids.add(e["id"])
                 entries.append(e)
-        time.sleep(KEYWORD_GAP_SECONDS)
-    log.info(f"[REDDIT-APIFY] call ok | keywords={len(keywords)} | entries={len(entries)}")
+    log.info(
+        f"[REDDIT-APIFY] call ok | keywords={len(keywords)}/{total_kw} | "
+        f"apify_runs={runs} | entries={len(entries)}"
+    )
     return entries
 
 
