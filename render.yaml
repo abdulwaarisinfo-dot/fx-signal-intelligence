@@ -3,91 +3,71 @@ services:
     name: flintel-worker
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python flintel_service.py
     envVars:
 
-      # ── Anthropic ─────────────────────────────
-      - key: ANTHROPIC_API_KEY
-        sync: false
-
-      # ── Reddit ────────────────────────────────
-      - key: REDDIT_CLIENT_ID
-        sync: false
-      - key: REDDIT_CLIENT_SECRET
-        sync: false
-      - key: REDDIT_USERNAME
-        sync: false
-      - key: REDDIT_PASSWORD
-        sync: false
-      - key: REDDIT_USER_AGENT
-        value: FlintelSignalBot/6.0
-
-      # ── Twitter / X ───────────────────────────
-      - key: TWITTER_API_KEY
-        sync: false
-      - key: TWITTER_API_SECRET
-        sync: false
-      - key: TWITTER_BEARER_TOKEN
-        sync: false
- 
-      # ── Apify ─────────────────────────────────
-      - key: APIFY_TOKEN
-        sync: false
-      # "apify" = Twitter via Apify actor, otherwise RapidAPI
-      - key: TWITTER_PROVIDER
-        value: apify
-      - key: APIFY_MAX_ITEMS
-        value: "50"
-      # Reddit via Apify (keyword search, throttled for cost)
-      - key: REDDIT_SOURCE
-        value: apify
-      - key: APIFY_REDDIT_MIN_INTERVAL_SECONDS
-        value: "900"
-      - key: APIFY_REDDIT_MAX_KEYWORDS
-        value: "20"
-
-      # ── MongoDB ───────────────────────────────
+      # ── Databases ─────────────────────────────
+      # MongoDB: signals + jobs/status
       - key: MONGODB_URI
         sync: false
       - key: MONGODB_DB
-        value: fx_signals
-
-      # ── Delivery ──────────────────────────────
-      - key: SLACK_WEBHOOK_URL
+        value: flintel_bot
+      - key: MONGODB1_URI
         sync: false
-      - key: HUBSPOT_API_KEY
+      - key: MONGODB1_DB
+        value: flintel_bot
+      - key: MONGODB_DATA
+        value: "true"
+
+      # MySQL sink
+      - key: MYSQL_DATA
+        value: "true"
+      - key: MYSQL_HOST
         sync: false
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_DATABASE
+        value: flintel
 
-      # ── Client ────────────────────────────────
-      - key: CLIENT_ID
-        value: settla
+      # ── Embeddings (OpenAI) ───────────────────
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: EMBEDDING_ENABLED
+        value: "true"
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
 
-      # ── Score thresholds ──────────────────────
-      - key: MIN_SCORE_MEDIUM
-        value: "6"
-      - key: MIN_SCORE_HIGH
-        value: "8"
-
-      # ── Batch settings ────────────────────────
-      - key: REDDIT_BATCH_SIZE
-        value: "10"
-      - key: TWITTER_BATCH_SIZE
-        value: "50"
-      - key: BATCH_GAP_SECONDS
+      # ── Reddit (RSS, free) ────────────────────
+      - key: REDDIT_ENABLED
+        value: "true"
+      - key: REDDIT_SOURCE
+        value: rss
+      - key: REDDIT_POLL_INTERVAL_SECONDS
         value: "30"
+      - key: REDDIT_USER_AGENT
+        value: FlintelSignalBot/6.0
+      # optional, only if Reddit blocks (429/403): http://user:pass@host:port
+      - key: REDDIT_PROXY
+        sync: false
 
-      # ── Twitter polling ───────────────────────
-      - key: TWITTER_POLL_INTERVAL
-        value: "60"
-      # Set to "true" only if you have Twitter Basic plan ($100/mo)
-      # Free tier: uses mentions timeline only (default: false)
-      - key: TWITTER_USE_SEARCH
+      # ── Twitter / X (RapidAPI) ────────────────
+      - key: TWITTER_ENABLED
+        value: "true"
+      - key: RAPID_API_KEY
+        sync: false
+      - key: TWITTER_RESULTS_PER_QUERY
+        value: "50"
+
+      # ── Hacker News ───────────────────────────
+      - key: HACKERNEWS_ENABLED
         value: "false"
 
-      # ── Schedulers ────────────────────────────
-      - key: DAILY_DIGEST_HOUR
-        value: "8"
-      - key: WEEKLY_REPORT_DAY
-        value: "0"
-      - key: WEEKLY_REPORT_HOUR
-        value: "9"
+      # ── Worker settings ───────────────────────
+      - key: WORKER_CONCURRENCY
+        value: "20"
+      - key: LOOKBACK_DAYS
+        value: "180"
