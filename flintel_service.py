@@ -748,7 +748,7 @@ def _reddit_get(url: str):
 # understood); set REDDIT_API_DEBUG=true to log a raw sample of the first
 # response if posts_in_response comes out as 0.
 # ─────────────────────────────────────────────────────────────────────────────
-REDDIT_SOURCE = (os.getenv("REDDIT_SOURCE", "rss") or "rss").strip().lower()
+REDDIT_SOURCE = "rss"   # FORCED: Reddit always uses the RSS feeds (env override disabled)
 REDDIT_RAPIDAPI_KEY = os.getenv("REDDIT_API_KEY", "").strip()
 REDDIT_RAPIDAPI_HOST = os.getenv("REDDIT_API_HOST", "reddit34.p.rapidapi.com").strip()
 REDDIT_RAPIDAPI_ENDPOINT = "/" + os.getenv("REDDIT_API_ENDPOINT", "getPopularPosts").strip().lstrip("/")
