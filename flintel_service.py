@@ -928,6 +928,171 @@ def _fetch_reddit_rapidapi_entries() -> list:
     return entries
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL ALTERNATE REDDIT SOURCE — SearXNG meta-search via RapidAPI.
+#
+#   REDDIT_SOURCE=rss        -> RSS, untouched.
+#   REDDIT_SOURCE=rapidapi   -> reddit34 getPopularPosts, untouched.
+#   REDDIT_SOURCE=searx      -> _fetch_reddit_rss_feed() returns entries built
+#       from https://searx-search-api.p.rapidapi.com/search results for
+#       "site:reddit.com (kw1 OR kw2 ...)". Reddit itself is never contacted.
+#
+# Everything downstream (job loading, matching, dedupe, embedding, Mongo/MySQL
+# save) is completely unchanged — same as the very start. Entry id is
+# "t3_<postid>" (same format as RSS/rapidapi) so already-stored posts are
+# never stored twice. Uses its OWN key: SEARX_API_KEY (reddit34's REDDIT_API_KEY
+# and Twitter's RAPID_API_KEY are never touched).
+# Cost control: rotating keyword cursor, SEARX_BATCH keywords per call,
+# SEARX_MAX_CALLS_PER_CYCLE, SEARX_MAX_CALLS_PER_HOUR.
+# Differences vs RSS/rapidapi (inherent to search-engine data): text = search
+# result title + snippet (not the full post body), author = "unknown",
+# created_utc = None, and there is no site-wide comments feed in this mode.
+# ─────────────────────────────────────────────────────────────────────────────
+SEARX_API_KEY = os.getenv("SEARX_API_KEY", "").strip()
+SEARX_HOST = os.getenv("SEARX_API_HOST", "searx-search-api.p.rapidapi.com").strip()
+SEARX_BATCH = max(1, int(os.getenv("SEARX_BATCH", "5")))
+SEARX_MAX_CALLS_PER_CYCLE = max(1, int(os.getenv("SEARX_MAX_CALLS_PER_CYCLE", "1")))
+SEARX_MAX_CALLS_PER_HOUR = max(1, int(os.getenv("SEARX_MAX_CALLS_PER_HOUR", "20")))
+SEARX_TIMEOUT_SECONDS = int(os.getenv("SEARX_TIMEOUT_SECONDS", "30"))
+
+_SEARX_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"}
+_SEARX_POST_PATH_RE = re.compile(r"^/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)(?:/([^/]+))?")
+_SEARX_LIST_KEYS = ["results", "data", "items", "hits", "organic_results"]
+_searx_lock = threading.Lock()
+_searx_cursor = 0
+_searx_call_times = []
+_searx_blocked_until = 0.0
+
+
+def _searx_dig_list(obj) -> list:
+    if isinstance(obj, list):
+        return obj
+    if not isinstance(obj, dict):
+        return []
+    for key in _SEARX_LIST_KEYS:
+        val = obj.get(key)
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def _searx_item_to_entry(item: dict):
+    from urllib.parse import urlparse
+    url = (item.get("url") or item.get("link") or "").strip()
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if (parsed.hostname or "").lower() not in _SEARX_HOSTS:
+        return None
+    m = _SEARX_POST_PATH_RE.match(parsed.path or "")
+    if not m:
+        return None
+    sub, post_id, slug = m.group(1), m.group(2), m.group(3)
+    canonical = f"https://www.reddit.com/r/{sub}/comments/{post_id}/" + (f"{slug}/" if slug else "")
+    title = html.unescape(str(item.get("title") or "")).strip()
+    snippet = html.unescape(str(
+        item.get("content") or item.get("snippet") or item.get("description") or ""
+    )).strip()
+    if not title and not snippet:
+        return None
+    if not title:
+        title, snippet = snippet, ""
+    selftext = snippet if snippet and snippet.lower() != title.lower() else ""
+    return {
+        "id":            f"t3_{post_id}",   # same id format as RSS/rapidapi
+        "title":         title,
+        "selftext":      selftext,
+        "author":        "unknown",
+        "subreddit":     sub,
+        "post_url":      canonical,
+        "created_utc":   None,
+        "score":         0,
+        "num_comments":  0,
+    }
+
+
+def _fetch_reddit_searx_entries() -> list:
+    """Never raises; a failure just means zero entries this cycle."""
+    global _searx_cursor, _searx_blocked_until
+    entries = []
+    if not SEARX_API_KEY:
+        log.warning("[REDDIT-SEARX] REDDIT_SOURCE=searx but SEARX_API_KEY is not set — nothing fetched.")
+        return entries
+    if time.time() < _searx_blocked_until:
+        log.info(f"[REDDIT-SEARX] cooling down {int(_searx_blocked_until - time.time())}s")
+        return entries
+    try:
+        keywords, seen_kw = [], set()
+        for job in _load_all_jobs_keyword_map():
+            if job["targeting_platform"] not in ("reddit", "all"):
+                continue
+            for kw in job["keywords"]:
+                k = (kw or "").strip()
+                if k and k.lower() not in seen_kw:
+                    seen_kw.add(k.lower())
+                    keywords.append(k)
+        if not keywords:
+            return entries
+
+        seen_ids = set()
+        for _ in range(SEARX_MAX_CALLS_PER_CYCLE):
+            now = time.time()
+            with _searx_lock:
+                _searx_call_times[:] = [t for t in _searx_call_times if now - t < 3600]
+                if len(_searx_call_times) >= SEARX_MAX_CALLS_PER_HOUR:
+                    log.info(f"[REDDIT-SEARX] hourly cap reached ({SEARX_MAX_CALLS_PER_HOUR} calls/h) — waiting")
+                    break
+                _searx_call_times.append(now)
+
+            start = _searx_cursor % len(keywords)
+            n = min(SEARX_BATCH, len(keywords))
+            batch = [keywords[(start + i) % len(keywords)] for i in range(n)]
+            query = "site:reddit.com (" + " OR ".join(batch) + ")"
+
+            try:
+                r = requests.get(
+                    f"https://{SEARX_HOST}/search",
+                    headers={"x-rapidapi-key": SEARX_API_KEY, "x-rapidapi-host": SEARX_HOST},
+                    params={"q": query, "format": "json"},
+                    timeout=SEARX_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                log.warning(f"[REDDIT-SEARX] request error: {exc}")
+                break
+
+            if r.status_code != 200:
+                if r.status_code in (429, 403, 401):
+                    _searx_blocked_until = time.time() + 300
+                log.warning(f"[REDDIT-SEARX] HTTP {r.status_code} — keyword batch NOT advanced | {r.text[:150]!r}")
+                break
+            try:
+                data = r.json()
+            except ValueError:
+                log.warning("[REDDIT-SEARX] non-JSON response — keyword batch NOT advanced")
+                break
+
+            items = _searx_dig_list(data)
+            _searx_cursor = (start + n) % len(keywords)
+            added = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                e = _searx_item_to_entry(item)
+                if e is None or e["id"] in seen_ids:
+                    continue
+                seen_ids.add(e["id"])
+                entries.append(e)
+                added += 1
+            log.info(f"[REDDIT-SEARX] call ok | keywords:{n} | results:{len(items)} | post_entries:{added} | cursor:{_searx_cursor}/{len(keywords)}")
+            time.sleep(1.5)
+    except Exception as exc:
+        log.warning(f"[REDDIT-SEARX] fetch failed: {exc}")
+    return entries
+
+
 def _fetch_reddit_rss_feed() -> list:
     """Fetches the SITE-WIDE r/all "new posts" RSS feed — ONE request, no
     query/keyword parameter (plain RSS doesn't support one). Every job's
@@ -938,6 +1103,9 @@ def _fetch_reddit_rss_feed() -> list:
     entries this round; it never blocks the poller's next cycle."""
     if REDDIT_SOURCE in ("rapidapi", "api"):
         return _fetch_reddit_rapidapi_entries()
+
+    if REDDIT_SOURCE == "searx":
+        return _fetch_reddit_searx_entries()
 
     url = f"{REDDIT_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
     headers = {"User-Agent": REDDIT_USER_AGENT}
@@ -1004,6 +1172,9 @@ def _fetch_reddit_comments_rss_feed() -> list:
     blocks the poller's next cycle or the posts fetch."""
     if REDDIT_SOURCE in ("rapidapi", "api"):
         return []   # no site-wide comments endpoint in this mode
+
+    if REDDIT_SOURCE == "searx":
+        return []   # comments not available via search-engine mode
 
     url = f"{REDDIT_COMMENTS_RSS_URL}?limit={REDDIT_RESULTS_PER_QUERY}"
     headers = {"User-Agent": REDDIT_USER_AGENT}
