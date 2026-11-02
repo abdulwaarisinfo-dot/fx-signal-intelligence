@@ -218,6 +218,12 @@ except Exception:  # pragma: no cover
     run_hackernews_for_job = None
     hn_config = None
 
+try:
+    from hackernews.config import HNLimitReached
+except Exception:  # pragma: no cover
+    class HNLimitReached(Exception):
+        pass
+
 try:  # HN story ke keyword-matched comments (hackernews package flintel_service ko import nahi karta)
     from hackernews.fetcher import fetch_story_comments
 except Exception:  # pragma: no cover
@@ -489,6 +495,8 @@ def get_database():
         hn_coll.create_index([("topic_key", ASCENDING)], name="hn_signals_topic_key")
         hn_coll.create_index([("search_keyword", ASCENDING)], name="hn_signals_search_keyword")
         hn_coll.create_index([("created_utc", ASCENDING)], name="hn_signals_created_utc")
+        # HN daily-limit counter "time" dekhta hai (fetched_at) -> is par index.
+        hn_coll.create_index([("fetched_at", ASCENDING)], name="hn_signals_fetched_at")
 
         log.info(f"MongoDB (signals) connected | db={MONGODB_DB} | hn_collection={HN_MONGO_COLLECTION}")
 
@@ -2941,7 +2949,7 @@ def process_job(job: dict) -> int:
 
     if run_hackernews_for_job is not None:
         try:
-            matched_count += run_hackernews_for_job(job, _save_signal, cutoff)
+            matched_count += run_hackernews_for_job(job, _save_signal_hn_limited, cutoff)
         except Exception as exc:
             log.error(f"[JOB] hackernews error | topic_key={topic_key} | {exc}")
 
@@ -3124,6 +3132,136 @@ def run_jobs_overview_logger():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HACKER NEWS DAILY / WINDOW MESSAGE LIMIT
+# HN_DAILY_LIMIT (default 20000, 0 = unlimited) messages (stories + comments, yaani
+# Mongo `hacker_news_signals` ke documents) per HN_LIMIT_WINDOW_HOURS (default 24).
+#
+# Count Mongo mein SIRF TIME (`fetched_at`) dekh kar nikala jata hai; baqi sab kuch
+# (schema, save, dedupe, embeddings) jaisa tha waisa hi hai.
+#
+# Window ka "start time" = HN collection ka sabse purana fetched_at (collection khali
+# ho to service ka pehla HN save). Windows isi start se har HN_LIMIT_WINDOW_HOURS baad
+# lagatar chalti hain: start, start+24h, start+48h ...
+# Agar limit window ke beech (jaise 12 ghante mein) poori ho jaye to HN fetching ruk
+# jati hai aur window KHATAM hone par (start + 24h) naya count 0 se shuru hota hai.
+# Counter RAM mein chalta hai (real-time); restart par Mongo se time ke hisaab se
+# dobara nikalta hai. Nested story-comments (`hn_comments` ke andar) alag document
+# nahi hain, isliye is count mein nahi ginte.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_hn_limit_lock = threading.Lock()
+_hn_limit_state = {"anchor": None, "window_start": None, "count": 0, "announced_full": False}
+
+
+def _hn_daily_limit() -> int:
+    try:
+        return max(0, int(os.getenv("HN_DAILY_LIMIT", "20000")))
+    except (TypeError, ValueError):
+        return 20000
+
+
+def _hn_window_seconds() -> int:
+    try:
+        hours = float(os.getenv("HN_LIMIT_WINDOW_HOURS", "24"))
+    except (TypeError, ValueError):
+        hours = 24.0
+    return int(max(1.0, hours) * 3600)
+
+
+def _hn_limit_log_every() -> int:
+    try:
+        return max(1, int(os.getenv("HN_LIMIT_LOG_EVERY", "100")))
+    except (TypeError, ValueError):
+        return 100
+
+
+def _as_utc(dt):
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _hn_refresh_window_locked(now=None):
+    """Window ka start nikalta hai; nayi window ho to counter Mongo (time) se dobara
+    nikalta hai. _hn_limit_lock ke andar hi call karein."""
+    st = _hn_limit_state
+    now = now or datetime.now(timezone.utc)
+    if st["anchor"] is None:
+        anchor = None
+        try:
+            doc = db[HN_MONGO_COLLECTION].find_one(
+                {}, {"fetched_at": 1, "_id": 0}, sort=[("fetched_at", ASCENDING)]
+            )
+            if doc and doc.get("fetched_at"):
+                anchor = _as_utc(doc["fetched_at"])
+        except Exception as exc:
+            log.warning(f"[HN-LIMIT] could not read first fetched_at from Mongo: {exc}")
+        st["anchor"] = anchor or now
+
+    w = _hn_window_seconds()
+    elapsed = max(0.0, (now - st["anchor"]).total_seconds())
+    window_start = st["anchor"] + timedelta(seconds=int(elapsed // w) * w)
+
+    if st["window_start"] != window_start:
+        first = st["window_start"] is None
+        st["window_start"] = window_start
+        st["announced_full"] = False
+        count = 0
+        try:
+            count = db[HN_MONGO_COLLECTION].count_documents({"fetched_at": {"$gte": window_start}})
+        except Exception as exc:
+            log.warning(f"[HN-LIMIT] could not count window docs from Mongo (starting at 0): {exc}")
+        st["count"] = count
+        limit = _hn_daily_limit()
+        log.info(
+            f"[HN-LIMIT] {'window loaded' if first else 'NEW window started'} | "
+            f"start={window_start.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
+            f"ends={(window_start + timedelta(seconds=w)).strftime('%Y-%m-%d %H:%M:%S')} UTC | "
+            f"count={count}/{limit if limit else 'unlimited'}"
+        )
+
+
+def _hn_limit_reached() -> bool:
+    limit = _hn_daily_limit()
+    if limit <= 0:
+        return False
+    with _hn_limit_lock:
+        _hn_refresh_window_locked()
+        return _hn_limit_state["count"] >= limit
+
+
+def _hn_seconds_until_window_end() -> float:
+    with _hn_limit_lock:
+        _hn_refresh_window_locked()
+        end = _hn_limit_state["window_start"] + timedelta(seconds=_hn_window_seconds())
+        return max(1.0, (end - datetime.now(timezone.utc)).total_seconds())
+
+
+def _hn_count_saved():
+    """Ek naya HN message save hone par counter +1 aur real-time progress log:
+    pehle 10 (1..10) har ek par, phir har HN_LIMIT_LOG_EVERY (100, 200, ...) par."""
+    limit = _hn_daily_limit()
+    with _hn_limit_lock:
+        _hn_refresh_window_locked()
+        _hn_limit_state["count"] += 1
+        c = _hn_limit_state["count"]
+        if c <= 10 or c % _hn_limit_log_every() == 0 or (limit and c == limit):
+            log.info(f"[HN-COUNT] {c}/{limit if limit else 'unlimited'} | window_start={_hn_limit_state['window_start'].strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+
+def _save_signal_hn_limited(topic_key: str, matched_keyword: str, platform: str, post: dict) -> bool:
+    """HN fetcher ko _save_signal ki jagah ye diya jata hai: limit poori ho to
+    HNLimitReached raise (fetcher job rok deta hai), warna normal _save_signal chalta
+    hai aur nayi save hui HN post par counter badhta hai."""
+    if _hn_limit_reached():
+        raise HNLimitReached("HN_DAILY_LIMIT reached")
+    saved = _save_signal(topic_key, matched_keyword, platform, post)
+    if saved and platform in _HN_PLATFORMS:
+        _hn_count_saved()
+    return saved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HACKER NEWS ALWAYS-ON POLLER
 # Pehle HN sirf tab fetch hota tha jab koi job status="pending" hota (process_job
 # ke andar, ek baar). Jobs "done" hone ke baad HN dobara kabhi nahi chalta tha,
@@ -3158,6 +3296,9 @@ def run_hn_poller():
         log.warning(f"[HN-POLLER] cannot import hackernews.database, poller not running: {exc}")
         return
 
+    if _hn_daily_limit() > 0:
+        _hn_limit_reached()  # window + current count Mongo (time) se load, log ek baar
+
     while True:
         try:
             if not _is_hn_poll_enabled():
@@ -3177,7 +3318,17 @@ def run_hn_poller():
             for job in jobs:
                 if not _is_hn_poll_enabled():
                     break
-                total_saved += run_hackernews_for_job(job, _save_signal, cutoff)
+                if _hn_limit_reached():
+                    wait = _hn_seconds_until_window_end()
+                    log.info(
+                        f"[HN-LIMIT] {_hn_daily_limit()}/{_hn_daily_limit()} reached | HN fetching paused "
+                        f"until window ends in ~{int(wait // 3600)}h {int((wait % 3600) // 60)}m "
+                        f"(new window starts then, count resets to 0)"
+                    )
+                    while _hn_limit_reached() and _is_hn_poll_enabled():
+                        time.sleep(min(60.0, _hn_seconds_until_window_end()))
+                    log.info("[HN-LIMIT] new window | HN fetching resumed")
+                total_saved += run_hackernews_for_job(job, _save_signal_hn_limited, cutoff)
                 jobs_run += 1
 
             log.info(
@@ -3248,6 +3399,7 @@ if __name__ == "__main__":
     log.info(f"  Hacker News       : {'ENABLED' if (hn_config and hn_config.is_hackernews_enabled()) else 'DISABLED'} (HACKERNEWS_ENABLED, live-checked, job-driven via Algolia API)")
     log.info(f"  HN story comments : {'ENABLED' if _is_hn_nested_comments_enabled() else 'DISABLED (HN_NESTED_COMMENTS_ENABLED=False)'} (HN_NESTED_COMMENTS_ENABLED, live-checked) | refresh every {HN_COMMENT_REFRESH_INTERVAL_SECONDS}s | track {HN_COMMENT_TRACK_DAYS}d | max {HN_MAX_COMMENTS_PER_STORY} comments/story")
     log.info(f"  Embeddings        : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved document)")
+    log.info(f"  HN message limit  : {_hn_daily_limit() or 'unlimited'} per {_hn_window_seconds() // 3600}h window (HN_DAILY_LIMIT / HN_LIMIT_WINDOW_HOURS) | progress logged as [HN-COUNT]")
     log.info(f"  Mongo signals save : {'ENABLED' if _is_mongodb_data_enabled() else 'DISABLED'} (MONGODB_DATA)")
     log.info(f"  MySQL signals save : {'ENABLED' if _is_mysql_data_enabled() else 'DISABLED'} (MYSQL_DATA) | host={MYSQL_HOST or '-'} db={MYSQL_DATABASE or '-'}")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
