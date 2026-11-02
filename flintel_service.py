@@ -3181,40 +3181,82 @@ def _as_utc(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def _hn_refresh_window_locked(now=None):
-    """Window ka start nikalta hai; nayi window ho to counter Mongo (time) se dobara
-    nikalta hai. _hn_limit_lock ke andar hi call karein."""
-    st = _hn_limit_state
-    now = now or datetime.now(timezone.utc)
-    if st["anchor"] is None:
-        anchor = None
-        try:
+def _hn_first_fetched_at():
+    """HN collection/table ka sabse purana `fetched_at` (SIRF time). Source: MONGODB_DATA on
+    ho to Mongo `hacker_news_signals`; warna MYSQL_DATA on ho to MySQL `hacker_news`.
+    Returns (ok, datetime_utc_or_None). ok=False -> lookup fail hua (DB down etc.)."""
+    try:
+        if _is_mongodb_data_enabled():
             doc = db[HN_MONGO_COLLECTION].find_one(
                 {}, {"fetched_at": 1, "_id": 0}, sort=[("fetched_at", ASCENDING)]
             )
-            if doc and doc.get("fetched_at"):
-                anchor = _as_utc(doc["fetched_at"])
-        except Exception as exc:
-            log.warning(f"[HN-LIMIT] could not read first fetched_at from Mongo: {exc}")
-        st["anchor"] = anchor or now
+            return True, (_as_utc(doc["fetched_at"]) if doc and doc.get("fetched_at") else None)
+        if _is_mysql_data_enabled():
+            def op(conn):
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT MIN(fetched_at) FROM {HN_MYSQL_TABLE}")
+                    row = cur.fetchone()
+                    return row[0] if row and not isinstance(row, dict) else (list(row.values())[0] if row else None)
+            val = _with_mysql(op)
+            return True, _as_utc(val) if val else None
+        return True, None  # koi sink on nahi -> RAM counter hi chalega
+    except Exception as exc:
+        log.warning(f"[HN-LIMIT] could not read first fetched_at: {exc}")
+        return False, None
+
+
+def _hn_count_since(window_start):
+    """Window start ke baad ke HN documents/rows ki ginti (SIRF time `fetched_at` par).
+    Returns (ok, count)."""
+    try:
+        if _is_mongodb_data_enabled():
+            return True, db[HN_MONGO_COLLECTION].count_documents({"fetched_at": {"$gte": window_start}})
+        if _is_mysql_data_enabled():
+            naive = window_start.astimezone(timezone.utc).replace(tzinfo=None)
+
+            def op(conn):
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {HN_MYSQL_TABLE} WHERE fetched_at >= %s", (naive,))
+                    row = cur.fetchone()
+                    return int(row[0] if not isinstance(row, dict) else list(row.values())[0])
+            return True, _with_mysql(op)
+        return True, 0
+    except Exception as exc:
+        log.warning(f"[HN-LIMIT] could not count window messages: {exc}")
+        return False, 0
+
+
+def _hn_refresh_window_locked(now=None):
+    """Window ka start nikalta hai; nayi window ho to counter DB (time) se dobara
+    nikalta hai. _hn_limit_lock ke andar hi call karein."""
+    st = _hn_limit_state
+    now = now or datetime.now(timezone.utc)
+
+    # Anchor (window ka pehla start). Lookup fail ho to cache nahi karte, 60s baad dobara try.
+    if st["anchor"] is None or (not st.get("anchor_ok", True) and now >= st.get("retry_at", now)):
+        ok, first = _hn_first_fetched_at()
+        if ok:
+            st["anchor"] = first or st["anchor"] or now
+            st["anchor_ok"] = True
+        else:
+            st["anchor"] = st["anchor"] or now
+            st["anchor_ok"] = False
+            st["retry_at"] = now + timedelta(seconds=60)
 
     w = _hn_window_seconds()
     elapsed = max(0.0, (now - st["anchor"]).total_seconds())
     window_start = st["anchor"] + timedelta(seconds=int(elapsed // w) * w)
 
     if st["window_start"] != window_start:
-        first = st["window_start"] is None
+        first_load = st["window_start"] is None
         st["window_start"] = window_start
         st["announced_full"] = False
-        count = 0
-        try:
-            count = db[HN_MONGO_COLLECTION].count_documents({"fetched_at": {"$gte": window_start}})
-        except Exception as exc:
-            log.warning(f"[HN-LIMIT] could not count window docs from Mongo (starting at 0): {exc}")
+        ok, count = _hn_count_since(window_start)
         st["count"] = count
         limit = _hn_daily_limit()
+        src = "Mongo" if _is_mongodb_data_enabled() else ("MySQL" if _is_mysql_data_enabled() else "RAM")
         log.info(
-            f"[HN-LIMIT] {'window loaded' if first else 'NEW window started'} | "
+            f"[HN-LIMIT] {'window loaded' if first_load else 'NEW window started'} | source={src} | "
             f"start={window_start.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
             f"ends={(window_start + timedelta(seconds=w)).strftime('%Y-%m-%d %H:%M:%S')} UTC | "
             f"count={count}/{limit if limit else 'unlimited'}"
