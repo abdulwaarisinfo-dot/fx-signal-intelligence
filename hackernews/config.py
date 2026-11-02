@@ -195,3 +195,10 @@ def job_targets_hackernews(targeting_platform) -> bool:
     if not value:
         value = "all"
     return value == "all" or value == HN_TARGETING_VALUE
+
+
+class HNLimitReached(Exception):
+    """HN ka daily/window message limit (HN_DAILY_LIMIT) poora ho chuka hai.
+    flintel_service ka limited-save wrapper ye raise karta hai; fetcher isay pakad
+    kar job ko bina spam ke rok deta hai (state aage nahi badhta, isliye koi post
+    hamesha ke liye miss nahi hoti — agli window mein dobara fetch hogi)."""
