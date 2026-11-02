@@ -196,7 +196,7 @@ def test_f10_blank_inputs_no_request(http):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class FakeCollection:
-    """Mongo `flintel_signals` fake: find_one / find / insert_one / update_one with the
+    """Mongo collection fake (`hacker_news_signals` / `flintel_signals`): find_one / find / insert_one / update_one with the
     exact operators the HN code uses ($ne on array path, $elemMatch, $push, $set with `$`)."""
 
     def __init__(self):
@@ -277,15 +277,21 @@ class FakeCollection:
 
 
 class FakeMongoDb:
+    """`flintel_signals` (Reddit/Twitter) and `hacker_news_signals` (HN) are separate collections."""
+
     def __init__(self):
         self.flintel_signals = FakeCollection()
+        self.hacker_news_signals = FakeCollection()
+
+    def __getitem__(self, name):
+        return getattr(self, name)
 
 
 class FakeMySQLStore:
-    def __init__(self, has_hn_col=True):
-        self.rows = {}
-        self.has_hn_col = has_hn_col
+    def __init__(self):
+        self.rows = {}          # message_id -> row dict (each row remembers its "_table")
         self.alters = []
+        self.created = []       # table names from CREATE TABLE statements
         self.update_calls = 0
         self.statements = []
 
@@ -306,33 +312,36 @@ class FakeCursor:
         self.s.statements.append(q)
         mod = sys.modules["flintel_service"]
         if q.startswith("CREATE TABLE"):
-            pass
-        elif q.startswith("SELECT COUNT(*) FROM INFORMATION_SCHEMA"):
-            self._res = [(1 if self.s.has_hn_col else 0,)]
-        elif q.startswith("ALTER TABLE FLINTEL_SIGNALS ADD COLUMN HN_COMMENTS JSON NULL"):
+            self.s.created.append(q.split()[5].split("(")[0])
+        elif q.startswith("ALTER TABLE"):  # nothing should ALTER any more
             self.s.alters.append(q)
-            self.s.has_hn_col = True
-        elif q.startswith("SELECT 1 FROM FLINTEL_SIGNALS"):
-            self._res = [(1,)] if params[0] in self.s.rows else []
+        elif q.startswith("SELECT 1 FROM "):
+            table = q.split()[3]
+            r = self.s.rows.get(params[0])
+            self._res = [(1,)] if r and r["_table"] == table else []
         elif q.startswith("INSERT INTO"):
-            row = dict(zip(mod._MYSQL_COLUMNS, params))
+            table = q.split()[2]
+            cols = mod._MYSQL_COLUMNS_HN if table == "HACKER_NEWS" else mod._MYSQL_COLUMNS
+            row = dict(zip(cols, params))
             if row["message_id"] in self.s.rows:
                 raise pymysql.err.IntegrityError(1062, "Duplicate entry")
-            row["hn_comments"] = None
+            row["_table"] = table
+            if table == "HACKER_NEWS":
+                row["hn_comments"] = None
             self.s.rows[row["message_id"]] = row
-        elif q.startswith("SELECT HN_COMMENTS FROM FLINTEL_SIGNALS WHERE MESSAGE_ID=%S"):
+        elif q.startswith("SELECT HN_COMMENTS FROM HACKER_NEWS WHERE MESSAGE_ID=%S"):
             r = self.s.rows.get(params[0])
             self._res = [(r["hn_comments"],)] if r else []
-        elif q.startswith("UPDATE FLINTEL_SIGNALS SET HN_COMMENTS"):
+        elif q.startswith("UPDATE HACKER_NEWS SET HN_COMMENTS"):
             payload, mid = params
             self.s.update_calls += 1
             self.s.rows[mid]["hn_comments"] = payload
-        elif q.startswith("SELECT MESSAGE_ID, TOPIC_KEY, SEARCH_KEYWORD"):
+        elif q.startswith("SELECT MESSAGE_ID, TOPIC_KEY, SEARCH_KEYWORD FROM HACKER_NEWS"):
             platform, cutoff = params
             self._res = [
                 (r["message_id"], r["topic_key"], r["search_keyword"])
                 for r in self.s.rows.values()
-                if r["platform"] == platform and r["created_utc"] >= cutoff
+                if r["_table"] == "HACKER_NEWS" and r["platform"] == platform and r["created_utc"] >= cutoff
             ]
         else:  # pragma: no cover
             raise AssertionError(f"unexpected SQL: {sql}")
@@ -387,8 +396,7 @@ def fs(monkeypatch):
     monkeypatch.setattr(mod, "_mysql_connect", lambda: FakeConn(store))
     mod._mysql_local = threading.local()
     mod._mysql_table_ready = False
-    mod._mysql_hn_col_ready = False
-    mod._mysql_hn_col_last_try = 0.0
+    mod._mysql_hn_table_ready = False
     mod._last_no_sink_warn = 0.0
     mod.store = store
 
@@ -444,7 +452,7 @@ def comment(cid, text=None, ts=T0, author="alice"):
 
 
 def mongo_doc(fs, sid="100"):
-    return fs.db.flintel_signals.find_one({"message_id": f"hackernews_{sid}"})
+    return fs.db.hacker_news_signals.find_one({"message_id": f"hackernews_{sid}"})
 
 
 def mysql_comments(fs, sid="100"):
@@ -535,10 +543,10 @@ def test_s4_dedupe_on_comment_id_already_embedded_never_reembedded(fs, monkeypat
     assert [c["comment_id"] for c in mysql_comments(fs)] == ["1", "2", "3"]
 
     # bilkul wahi list dobara -> koi embedding call / koi write nahi
-    n_embed, m_upd, s_upd = len(fs.emb.calls), fs.db.flintel_signals.update_calls, fs.store.update_calls
+    n_embed, m_upd, s_upd = len(fs.emb.calls), fs.db.hacker_news_signals.update_calls, fs.store.update_calls
     res = fs._sync_hn_story_comments("nike", mid, "100", "nike")
     assert res == {"new": 0, "embedded": 0, "retried": 0, "filled": 0}
-    assert (len(fs.emb.calls), fs.db.flintel_signals.update_calls, fs.store.update_calls) == (n_embed, m_upd, s_upd)
+    assert (len(fs.emb.calls), fs.db.hacker_news_signals.update_calls, fs.store.update_calls) == (n_embed, m_upd, s_upd)
 
 
 def test_s5_retry_only_comments_with_none_embedding(fs, monkeypatch):
@@ -619,11 +627,11 @@ def test_s8_cap_stops_at_limit_without_crash(fs, monkeypatch, caplog):
 
     # cap par: na Algolia call, na embedding, na write
     fs.fetch.calls.clear(); fs.emb.calls.clear()
-    m_upd, s_upd = fs.db.flintel_signals.update_calls, fs.store.update_calls
+    m_upd, s_upd = fs.db.hacker_news_signals.update_calls, fs.store.update_calls
     fs.fetch.result = [comment(9, ts=T0 + 99)]
     res = fs._sync_hn_story_comments("nike", "hackernews_100", "100", "nike")
     assert res["new"] == 0 and fs.fetch.calls == [] and fs.emb.calls == []
-    assert (fs.db.flintel_signals.update_calls, fs.store.update_calls) == (m_upd, s_upd)
+    assert (fs.db.hacker_news_signals.update_calls, fs.store.update_calls) == (m_upd, s_upd)
 
 
 def test_s9_default_cap_is_200(fs):
@@ -736,37 +744,54 @@ def test_a3_mysql_append_dedupes_and_never_writes_when_unchanged(fs, monkeypatch
 # PART 5 — MySQL column migration (guarded ALTER, never DROP)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_m1_alter_runs_once_when_column_missing(fs, monkeypatch):
+def test_m1_no_alter_anywhere_and_hn_table_has_hn_comments_from_start(fs, monkeypatch):
     sinks(monkeypatch, False, True)
-    fs.store.has_hn_col = False
     fs._save_signal("nike", "nike", "reddit", story(sid="r1"))
-    fs._save_signal("nike", "nike", "reddit", story(sid="r2"))
-    assert len(fs.store.alters) == 1
-    assert "HN_COMMENTS JSON NULL" in fs.store.alters[0]
+    fs._save_signal("nike", "nike", "hackernews", story(sid="100"))
+    assert fs.store.alters == []                              # flintel_signals is never ALTERed
     assert not any("DROP" in s for s in fs.store.statements)
-    assert "hn_comments" not in fs._MYSQL_INSERT_SQL      # reddit/twitter INSERT unchanged
+    assert sorted(fs.store.created) == ["FLINTEL_SIGNALS", "HACKER_NEWS"]
+    assert "hn_comments" in fs._MYSQL_CREATE_HN_TABLE_SQL
+    assert "hn_comments" not in fs._MYSQL_INSERT_SQL          # reddit/twitter INSERT unchanged
     assert fs._MYSQL_COLUMNS[-1] == "reddit_comments" and "hn_comments" not in fs._MYSQL_COLUMNS
+    assert "subreddit" not in fs._MYSQL_COLUMNS_HN and "reddit_comments" not in fs._MYSQL_COLUMNS_HN
 
 
-def test_m2_no_alter_when_column_exists(fs, monkeypatch):
+def test_m2_mysql_routing_hn_to_hacker_news_reddit_to_flintel_signals(fs, monkeypatch):
     sinks(monkeypatch, False, True)
-    fs.store.has_hn_col = True
+    assert fs.HN_MYSQL_TABLE == "hacker_news"
     fs._save_signal("nike", "nike", "reddit", story(sid="r1"))
-    assert fs.store.alters == []
+    fs._save_signal("nike", "nike", "twitter", story(sid="t1"))
+    fs._save_signal("nike", "nike", "hackernews", story(sid="100"))
+    fs._save_signal("nike", "nike", "hackernews_comment", story(sid="200"))
+    tables = {mid: r["_table"] for mid, r in fs.store.rows.items()}
+    assert tables == {
+        "reddit_r1": "FLINTEL_SIGNALS", "twitter_t1": "FLINTEL_SIGNALS",
+        "hackernews_100": "HACKER_NEWS", "hackernews_comment_200": "HACKER_NEWS",
+    }
+    assert "subreddit" not in fs.store.rows["hackernews_100"]
 
 
-def test_m3_alter_failure_does_not_break_saves(fs, monkeypatch, caplog):
-    sinks(monkeypatch, False, True)
-    fs.store.has_hn_col = False
+def test_m3_mongo_routing_hn_to_hacker_news_signals_reddit_to_flintel_signals(fs, monkeypatch):
+    sinks(monkeypatch, True, False)
+    assert fs.HN_MONGO_COLLECTION == "hacker_news_signals"
+    fs._save_signal("nike", "nike", "reddit", story(sid="r1"))
+    fs._save_signal("nike", "nike", "twitter", story(sid="t1"))
+    fs._save_signal("nike", "nike", "hackernews", story(sid="100"))
+    fs._save_signal("nike", "nike", "hackernews_comment", story(sid="200"))
+    ids = lambda c: sorted(d["message_id"] for d in c.docs)
+    assert ids(fs.db.flintel_signals) == ["reddit_r1", "twitter_t1"]
+    assert ids(fs.db.hacker_news_signals) == ["hackernews_100", "hackernews_comment_200"]
+    assert "subreddit" not in fs.db.hacker_news_signals.docs[0]
+    assert "reddit_comments" not in fs.db.hacker_news_signals.docs[0]
+    assert fs.db.flintel_signals.docs[0]["reddit_comments"] == 0   # Reddit doc shape unchanged
 
-    def boom(conn):
-        raise RuntimeError("no ALTER privilege")
 
-    monkeypatch.setattr(fs, "_ensure_hn_comments_column", boom)
-    with caplog.at_level("WARNING"):
-        assert fs._save_signal("nike", "nike", "reddit", story(sid="r1")) is True
-    assert "reddit_r1" in fs.store.rows
-    assert any("hn_comments column" in r.getMessage() for r in caplog.records)
+def test_m4_same_story_dedupes_per_destination_only(fs, monkeypatch):
+    sinks(monkeypatch, True, True)
+    assert fs._save_signal("nike", "nike", "hackernews", story(sid="100")) is True
+    assert fs._save_signal("nike", "nike", "hackernews", story(sid="100")) is False
+    assert len(fs.db.hacker_news_signals.docs) == 1 and len(fs.db.flintel_signals.docs) == 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -789,12 +814,12 @@ def test_r1_no_new_comment_means_no_embedding_and_no_write(fs, monkeypatch):
     seed_story(fs, monkeypatch)
     fs.fetch.result = []
     fs.emb.calls.clear()
-    m_upd, s_upd = fs.db.flintel_signals.update_calls, fs.store.update_calls
+    m_upd, s_upd = fs.db.hacker_news_signals.update_calls, fs.store.update_calls
     summary = fs._run_hn_refresh_cycle()
     assert summary["stories"] == 1 and summary["new"] == 0
     assert fs.fetch.calls == [("100", "nike", None)]       # story ka apna search_keyword
     assert fs.emb.calls == []
-    assert (fs.db.flintel_signals.update_calls, fs.store.update_calls) == (m_upd, s_upd)
+    assert (fs.db.hacker_news_signals.update_calls, fs.store.update_calls) == (m_upd, s_upd)
 
 
 def test_r2_new_comment_one_embedding_both_sinks(fs, monkeypatch):
