@@ -387,7 +387,7 @@ def test_16_race_duplicate_on_insert_is_caught(fs, monkeypatch):
     Mongo DuplicateKeyError on insert and must return False, not crash."""
     flags(monkeypatch, True, True)
     assert fs._save_signal("nike", "nike", "reddit", make_post()) is True
-    monkeypatch.setattr(fs, "_mysql_post_exists", lambda mid: False)
+    monkeypatch.setattr(fs, "_mysql_post_exists", lambda mid, platform=None: False)
     monkeypatch.setattr(fs.db.flintel_signals, "find_one", lambda *a, **k: None)
     assert fs._save_signal("nike", "nike", "reddit", make_post()) is False
     assert fs.db.flintel_signals.insert_calls == 2 and fs.store.insert_calls == 2
