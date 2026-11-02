@@ -3030,6 +3030,8 @@ def start_worker_pool():
 JOBS_OVERVIEW_INTERVAL_SECONDS = int(os.getenv("JOBS_OVERVIEW_INTERVAL_SECONDS", "300"))
 JOBS_OVERVIEW_CHECK_SECONDS = int(os.getenv("JOBS_OVERVIEW_CHECK_SECONDS", "30"))
 _JOBS_OVERVIEW_MAX_KEYWORDS = 8
+# False (default) -> logs mein sirf counts. True -> poori job list + keywords bhi.
+JOBS_OVERVIEW_VERBOSE = os.getenv("JOBS_OVERVIEW_VERBOSE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _fmt_job_line(job: dict) -> str:
@@ -3068,6 +3070,8 @@ def _collect_jobs_overview():
 
 
 def _log_jobs_overview(jobs: list):
+    """Sirf NUMBERS dikhata hai (platform-wise job counts). Job list / keywords
+    tab hi aati hain jab JOBS_OVERVIEW_VERBOSE=True ho (default False)."""
     by_status = {}
     for j in jobs:
         by_status[j["status"]] = by_status.get(j["status"], 0) + 1
@@ -3077,26 +3081,24 @@ def _log_jobs_overview(jobs: list):
     twitter_jobs = [j for j in jobs if j["targeting_platform"] in ("x_twitter", "all")]
     hn_jobs = [j for j in jobs if j["targeting_platform"] in ("hackernews", "all")]
 
+    def _kw(js):
+        return sum(len(j["keywords"]) for j in js)
+
     hn_on = bool(hn_config and hn_config.is_hackernews_enabled())
-    lines = [
-        f"[JOBS] OVERVIEW | total_jobs={len(jobs)} | {status_txt}",
-        f"  REDDIT jobs      = {len(reddit_jobs)}  "
-        f"({'ENABLED' if _is_reddit_enabled() else 'DISABLED — REDDIT_ENABLED=False'})",
-    ]
-    lines += [_fmt_job_line(j) for j in reddit_jobs]
-    lines.append(
-        f"  TWITTER/X jobs   = {len(twitter_jobs)}  "
-        f"({'ENABLED' if _is_twitter_enabled() else 'DISABLED — TWITTER_ENABLED/RAPID_API_KEY'})"
+    reddit_state = "ON" if _is_reddit_enabled() else "OFF"
+    twitter_state = "ON" if _is_twitter_enabled() else "OFF"
+    hn_state = "ON" if hn_on else "OFF"
+
+    log.info(
+        f"[JOBS] total={len(jobs)} ({status_txt}) | "
+        f"REDDIT[{reddit_state}] jobs={len(reddit_jobs)} keywords={_kw(reddit_jobs)} | "
+        f"TWITTER/X[{twitter_state}] jobs={len(twitter_jobs)} keywords={_kw(twitter_jobs)} | "
+        f"HACKERNEWS[{hn_state}] jobs={len(hn_jobs)} keywords={_kw(hn_jobs)}"
     )
-    lines += [_fmt_job_line(j) for j in twitter_jobs]
-    lines.append(
-        f"  HACKERNEWS jobs  = {len(hn_jobs)}  "
-        f"({'ENABLED' if hn_on else 'DISABLED — HACKERNEWS_ENABLED=False'})"
-    )
-    lines += [_fmt_job_line(j) for j in hn_jobs]
-    if not jobs:
-        lines.append("  (flintel_search_jobs khali hai — koi job/keyword nahi mila)")
-    log.info("\n".join(lines))
+
+    if JOBS_OVERVIEW_VERBOSE:
+        for title, js in (("REDDIT", reddit_jobs), ("TWITTER/X", twitter_jobs), ("HACKERNEWS", hn_jobs)):
+            log.info(f"[JOBS] {title} job list ({len(js)}):\n" + "\n".join(_fmt_job_line(j) for j in js))
 
 
 def run_jobs_overview_logger():
