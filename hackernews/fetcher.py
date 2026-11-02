@@ -221,6 +221,7 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
             cutoff = cutoff.replace(tzinfo=timezone.utc)
         cutoff_ts = cutoff.timestamp()
 
+        limit_hit = False  # HN_DAILY_LIMIT poori ho gayi ho to True -> job rok do
         for keyword in keywords:
             try:
                 for kind in kinds:
@@ -251,6 +252,12 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
                         try:
                             if save_fn(topic_key, keyword, platform, post):
                                 total_saved += 1
+                        except config.HNLimitReached:
+                            # Limit poori: checkpoint aage nahi badhega (save_failed), taake
+                            # baqi posts agli window mein dobara fetch hon. Spam nahi.
+                            limit_hit = True
+                            save_failed = True
+                            break
                         except Exception as save_exc:
                             # Is batch ka state aage nahi badhayenge, taake agli baar dobara
                             # koshish ho (dedupe pehle se saved posts ko sambhal leta hai).
@@ -268,10 +275,20 @@ def run_hackernews_for_job(job: dict, save_fn, cutoff: datetime) -> int:
 
                     if max_ts is not None and not save_failed:
                         database.set_last_seen_ts(topic_key, keyword, kind, int(max_ts))
+
+                    if limit_hit:
+                        break
             except Exception as kw_exc:
                 log.warning(
                     f"[HACKERNEWS] keyword failed | topic_key={topic_key} | keyword='{keyword}' | {kw_exc}"
                 )
+
+            if limit_hit:
+                log.info(
+                    f"[HACKERNEWS] daily limit reached | topic_key={topic_key} | "
+                    f"job stopped early, saved_so_far={total_saved} (baqi agli window mein)"
+                )
+                break
 
             # Har keyword ke baad gap (Algolia par burst traffic se bachne ke liye).
             try:
