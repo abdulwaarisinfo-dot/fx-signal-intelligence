@@ -3019,6 +3019,108 @@ def start_worker_pool():
     return threads
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# JOBS OVERVIEW LOGGER — har platform ke liye kaun se jobs/keywords active hain,
+# wo logs mein dikhata hai (Reddit / Twitter-X / Hacker News alag alag).
+# Pehle logs mein "[JOB] START" sirf tab aata tha jab koi job status="pending"
+# hota — warna logs bilkul khamosh. Ye thread us khamoshi ko khatam karta hai.
+# Log sirf tab aata hai jab jobs badlen, ya har JOBS_OVERVIEW_INTERVAL_SECONDS baad.
+# ─────────────────────────────────────────────────────────────────────────────
+
+JOBS_OVERVIEW_INTERVAL_SECONDS = int(os.getenv("JOBS_OVERVIEW_INTERVAL_SECONDS", "300"))
+JOBS_OVERVIEW_CHECK_SECONDS = int(os.getenv("JOBS_OVERVIEW_CHECK_SECONDS", "30"))
+_JOBS_OVERVIEW_MAX_KEYWORDS = 8
+
+
+def _fmt_job_line(job: dict) -> str:
+    kws = job.get("keywords") or []
+    shown = ", ".join(str(k) for k in kws[:_JOBS_OVERVIEW_MAX_KEYWORDS])
+    more = f" +{len(kws) - _JOBS_OVERVIEW_MAX_KEYWORDS} more" if len(kws) > _JOBS_OVERVIEW_MAX_KEYWORDS else ""
+    return (
+        f"      - {job.get('topic_key')} | status={job.get('status')} | "
+        f"targeting_platform={job.get('targeting_platform')} | "
+        f"{len(kws)} keyword(s): [{shown}{more}]"
+    )
+
+
+def _collect_jobs_overview():
+    """Returns (jobs, signature). jobs = list of dicts with topic_key, keywords,
+    targeting_platform, status. Never raises."""
+    jobs = []
+    try:
+        for doc in db1.flintel_search_jobs.find(
+            {}, {"topic_key": 1, "keywords": 1, "targeting_platform": 1, "status": 1}
+        ):
+            jobs.append({
+                "topic_key": doc.get("topic_key", ""),
+                "keywords": doc.get("keywords") or [],
+                "targeting_platform": (doc.get("targeting_platform") or "all").strip().lower(),
+                "status": doc.get("status", "-"),
+            })
+    except Exception as exc:
+        log.warning(f"[JOBS] failed to read flintel_search_jobs: {exc}")
+        return [], None
+    jobs.sort(key=lambda j: j["topic_key"])
+    signature = tuple(
+        (j["topic_key"], j["targeting_platform"], j["status"], tuple(j["keywords"])) for j in jobs
+    )
+    return jobs, signature
+
+
+def _log_jobs_overview(jobs: list):
+    by_status = {}
+    for j in jobs:
+        by_status[j["status"]] = by_status.get(j["status"], 0) + 1
+    status_txt = " ".join(f"{k}={v}" for k, v in sorted(by_status.items())) or "none"
+
+    reddit_jobs = [j for j in jobs if j["targeting_platform"] in ("reddit", "all")]
+    twitter_jobs = [j for j in jobs if j["targeting_platform"] in ("x_twitter", "all")]
+    hn_jobs = [j for j in jobs if j["targeting_platform"] in ("hackernews", "all")]
+
+    hn_on = bool(hn_config and hn_config.is_hackernews_enabled())
+    lines = [
+        f"[JOBS] OVERVIEW | total_jobs={len(jobs)} | {status_txt}",
+        f"  REDDIT jobs      = {len(reddit_jobs)}  "
+        f"({'ENABLED' if _is_reddit_enabled() else 'DISABLED — REDDIT_ENABLED=False'})",
+    ]
+    lines += [_fmt_job_line(j) for j in reddit_jobs]
+    lines.append(
+        f"  TWITTER/X jobs   = {len(twitter_jobs)}  "
+        f"({'ENABLED' if _is_twitter_enabled() else 'DISABLED — TWITTER_ENABLED/RAPID_API_KEY'})"
+    )
+    lines += [_fmt_job_line(j) for j in twitter_jobs]
+    lines.append(
+        f"  HACKERNEWS jobs  = {len(hn_jobs)}  "
+        f"({'ENABLED' if hn_on else 'DISABLED — HACKERNEWS_ENABLED=False'})"
+    )
+    lines += [_fmt_job_line(j) for j in hn_jobs]
+    if not jobs:
+        lines.append("  (flintel_search_jobs khali hai — koi job/keyword nahi mila)")
+    log.info("\n".join(lines))
+
+
+def run_jobs_overview_logger():
+    log.info(
+        f"[JOBS] overview logger started | check every {JOBS_OVERVIEW_CHECK_SECONDS}s | "
+        f"full refresh every {JOBS_OVERVIEW_INTERVAL_SECONDS}s | logs immediately on any job change"
+    )
+    last_sig = object()
+    last_logged = 0.0
+    while True:
+        try:
+            jobs, sig = _collect_jobs_overview()
+            if sig is not None:
+                changed = sig != last_sig
+                due = (time.time() - last_logged) >= JOBS_OVERVIEW_INTERVAL_SECONDS
+                if changed or due:
+                    _log_jobs_overview(jobs)
+                    last_sig = sig
+                    last_logged = time.time()
+        except Exception as exc:
+            log.warning(f"[JOBS] overview logger error: {exc}")
+        time.sleep(max(1, JOBS_OVERVIEW_CHECK_SECONDS))
+
+
 def start_all():
     """Starts the always-on Reddit poller (one thread, runs forever,
     independent of the job queue) AND the Twitter/job-status worker pool,
@@ -3028,6 +3130,12 @@ def start_all():
     reddit_thread = threading.Thread(target=run_reddit_poller, daemon=True, name="RedditPoller")
     reddit_thread.start()
     threads.append(reddit_thread)
+
+    jobs_overview_thread = threading.Thread(
+        target=run_jobs_overview_logger, daemon=True, name="JobsOverviewLogger"
+    )
+    jobs_overview_thread.start()
+    threads.append(jobs_overview_thread)
 
     hn_comment_thread = threading.Thread(
         target=run_hn_comment_refresher, daemon=True, name="HNCommentRefresher"
