@@ -308,6 +308,11 @@ REDDIT_POLL_INTERVAL_SECONDS = int(os.getenv("REDDIT_POLL_INTERVAL_SECONDS", "90
 # effect on the very next cycle, no restart needed. Flip it back to
 # True and the next cycle rebuilds the keyword list from scratch and
 # starts matching again, exactly as if freshly started.
+# While REDDIT_ENABLED=False the poller sits idle and only re-reads .env this
+# often (seconds) to notice if it was turned back on. Nothing is logged or
+# written to the DB during this idle wait.
+REDDIT_DISABLED_RECHECK_SECONDS = int(os.getenv("REDDIT_DISABLED_RECHECK_SECONDS", "15"))
+
 def _is_reddit_enabled() -> bool:
     load_dotenv(override=True)
     return _env_bool("REDDIT_ENABLED", True)
@@ -2694,6 +2699,23 @@ def run_reddit_poller():
 
     try:
         while True:
+            # ── Master switch OFF → idle quietly ──
+            # Checked LIVE (fresh from .env). When disabled we log ONCE
+            # (not every cycle), mark the status flag False, then just
+            # wait in a cheap idle loop — no fetching, no matching, no
+            # log spam, no DB writes. The moment REDDIT_ENABLED flips back
+            # to True we log ONCE and fall straight through to a normal
+            # cycle (keyword list rebuilt from scratch). No restart needed.
+            if not _is_reddit_enabled():
+                log.info(
+                    "[REDDIT-POLLER] REDDIT_ENABLED=False | fetching paused "
+                    f"(idle, re-checking every {REDDIT_DISABLED_RECHECK_SECONDS}s, will not log again until re-enabled)"
+                )
+                _set_service_status("reddit_poller", False)
+                while not _is_reddit_enabled():
+                    time.sleep(REDDIT_DISABLED_RECHECK_SECONDS)
+                log.info("[REDDIT-POLLER] REDDIT_ENABLED=True | fetching resumed")
+
             # Mark alive at the top of every cycle — as long as this loop
             # keeps turning, flintel_service_status.reddit_poller.running
             # stays True.
@@ -2701,16 +2723,6 @@ def run_reddit_poller():
 
             cycle_start = time.time()
             try:
-                if not _is_reddit_enabled():
-                    # Master switch is off (checked LIVE, fresh from .env,
-                    # every cycle) — thread stays alive (heartbeat keeps
-                    # updating) but no fetching/matching happens at all
-                    # until this flips back to True. As soon as it does,
-                    # the very next cycle below runs _load_all_jobs_keyword_map()
-                    # fresh and starts matching again from scratch.
-                    log.info("[REDDIT-POLLER] REDDIT_ENABLED=False | fetching stopped this cycle")
-                    time.sleep(REDDIT_POLL_INTERVAL_SECONDS)
-                    continue
 
                 # Both save targets off -> warn every cycle, keep running.
                 if not _is_mongodb_data_enabled() and not _is_mysql_data_enabled():
@@ -3050,7 +3062,7 @@ if __name__ == "__main__":
     log.info("  Platform          : Reddit (site-wide RSS — posts + comments, ALWAYS-ON poller) + Twitter/X (via RapidAPI, job-driven)")
     log.info(f"  Reddit fetch mode : continuous poller, every {REDDIT_POLL_INTERVAL_SECONDS}s, keyword list rebuilt from ALL jobs each cycle, posts AND comments both fetched")
     log.info("  Keywords source   : MongoDB1 (flintel_search_jobs) — no hardcoded list, re-read live every cycle")
-    log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller alive but not fetching)'} (checked live from .env every cycle, no restart needed to change)")
+    log.info(f"  Reddit fetching   : {'ENABLED' if _is_reddit_enabled() else 'DISABLED (REDDIT_ENABLED=False — poller idle, logs once, no repeated cycles)'} (checked live from .env every cycle, no restart needed to change)")
     log.info(f"  Twitter/X         : {'ENABLED' if _is_twitter_enabled() else 'DISABLED (set RAPID_API_KEY + TWITTER_ENABLED=True to enable)'} (checked live from .env every job, no restart needed to change)")
     log.info(f"  Hacker News       : {'ENABLED' if (hn_config and hn_config.is_hackernews_enabled()) else 'DISABLED'} (HACKERNEWS_ENABLED, live-checked, job-driven via Algolia API)")
     log.info(f"  HN story comments : {'ENABLED' if _is_hn_nested_comments_enabled() else 'DISABLED (HN_NESTED_COMMENTS_ENABLED=False)'} (HN_NESTED_COMMENTS_ENABLED, live-checked) | refresh every {HN_COMMENT_REFRESH_INTERVAL_SECONDS}s | track {HN_COMMENT_TRACK_DAYS}d | max {HN_MAX_COMMENTS_PER_STORY} comments/story")
