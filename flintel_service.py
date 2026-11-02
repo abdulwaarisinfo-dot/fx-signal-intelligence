@@ -3123,6 +3123,73 @@ def run_jobs_overview_logger():
         time.sleep(max(1, JOBS_OVERVIEW_CHECK_SECONDS))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HACKER NEWS ALWAYS-ON POLLER
+# Pehle HN sirf tab fetch hota tha jab koi job status="pending" hota (process_job
+# ke andar, ek baar). Jobs "done" hone ke baad HN dobara kabhi nahi chalta tha,
+# aur "reddit"/"x_twitter" jobs HN skip karte hain. Ye poller Reddit poller ki
+# tarah har HN_POLL_INTERVAL_SECONDS baad HN ko ("hackernews"/"all" jobs ke) saare
+# keywords par dobara chalata hai. Incremental state (flintel_hn_state) ki wajah se
+# har keyword sirf last-seen ke baad ki NAYI posts/comments laata hai; duplicates
+# _save_signal dedupe kar leta hai.
+# Switches (live-checked): HACKERNEWS_ENABLED, HN_POLL_ENABLED (default True).
+# ─────────────────────────────────────────────────────────────────────────────
+
+HN_POLL_INTERVAL_SECONDS = int(os.getenv("HN_POLL_INTERVAL_SECONDS", "600"))
+HN_POLL_DISABLED_RECHECK_SECONDS = int(os.getenv("HN_POLL_DISABLED_RECHECK_SECONDS", "15"))
+
+
+def _is_hn_poll_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("HN_POLL_ENABLED", True) and bool(hn_config and hn_config.is_hackernews_enabled())
+
+
+def run_hn_poller():
+    log.info(
+        f"[HN-POLLER] started | interval={HN_POLL_INTERVAL_SECONDS}s | "
+        f"lookback_days={hn_config.HN_LOOKBACK_DAYS if hn_config else '-'}"
+    )
+    if hn_config is None or run_hackernews_for_job is None:
+        log.warning("[HN-POLLER] hackernews package unavailable, poller not running")
+        return
+    try:
+        from hackernews import database as hn_database
+    except Exception as exc:
+        log.warning(f"[HN-POLLER] cannot import hackernews.database, poller not running: {exc}")
+        return
+
+    while True:
+        try:
+            if not _is_hn_poll_enabled():
+                log.info("[HN-POLLER] disabled (HACKERNEWS_ENABLED / HN_POLL_ENABLED = False) | idle, logs once")
+                while not _is_hn_poll_enabled():
+                    time.sleep(HN_POLL_DISABLED_RECHECK_SECONDS)
+                log.info("[HN-POLLER] enabled again | fetching resumed")
+
+            if not _is_mongodb_data_enabled() and not _is_mysql_data_enabled():
+                _warn_no_sinks(force=True)
+
+            cycle_start = time.time()
+            jobs = hn_database.load_hackernews_jobs()
+            cutoff = datetime.now(timezone.utc) - timedelta(days=hn_config.HN_LOOKBACK_DAYS)
+            total_saved = 0
+            jobs_run = 0
+            for job in jobs:
+                if not _is_hn_poll_enabled():
+                    break
+                total_saved += run_hackernews_for_job(job, _save_signal, cutoff)
+                jobs_run += 1
+
+            log.info(
+                f"[HN-POLLER] cycle done | hn_jobs={len(jobs)} | jobs_run={jobs_run} | "
+                f"new_messages_saved={total_saved} | took={int(time.time() - cycle_start)}s"
+            )
+        except Exception as exc:
+            log.error(f"[HN-POLLER] unexpected error: {exc}")
+
+        time.sleep(max(1, HN_POLL_INTERVAL_SECONDS))
+
+
 def start_all():
     """Starts the always-on Reddit poller (one thread, runs forever,
     independent of the job queue) AND the Twitter/job-status worker pool,
@@ -3138,6 +3205,10 @@ def start_all():
     )
     jobs_overview_thread.start()
     threads.append(jobs_overview_thread)
+
+    hn_poller_thread = threading.Thread(target=run_hn_poller, daemon=True, name="HNPoller")
+    hn_poller_thread.start()
+    threads.append(hn_poller_thread)
 
     hn_comment_thread = threading.Thread(
         target=run_hn_comment_refresher, daemon=True, name="HNCommentRefresher"
