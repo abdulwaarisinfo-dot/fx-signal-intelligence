@@ -112,6 +112,14 @@ DUAL-MONGODB NOTE (unchanged):
     queue) and `flintel_service_status` (the poller/worker heartbeat) —
     still lives on the SECOND MongoDB connection (`MONGODB1_URI` /
     `MONGODB1_DB`).
+
+HACKER NEWS STORAGE (separate from Reddit/Twitter):
+  - HN stories (platform "hackernews"), standalone HN comments
+    ("hackernews_comment") and each story's nested `hn_comments` are stored in:
+        Mongo : collection `hacker_news_signals`  (same DB as flintel_signals)
+        MySQL : table      `hacker_news`          (same MYSQL_DATABASE)
+    Names can be overridden with HN_MONGO_COLLECTION / HN_MYSQL_TABLE.
+  - Reddit and Twitter keep using `flintel_signals` exactly as before.
 ──────────────────────────────────────────────────────────────────────────
 
 ──────────────────────────────────────────────────────────────────────────
@@ -265,6 +273,20 @@ MYSQL_SSL_CA          = os.getenv("MYSQL_SSL_CA", "")  # optional CA file when M
 MYSQL_CONNECT_TIMEOUT = int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10"))
 MYSQL_READ_TIMEOUT    = int(os.getenv("MYSQL_READ_TIMEOUT", "30"))
 MYSQL_WRITE_TIMEOUT   = int(os.getenv("MYSQL_WRITE_TIMEOUT", "30"))
+
+# ── Hacker News storage (SEPARATE from Reddit/Twitter `flintel_signals`) ──
+# HN stories + HN comments go to their own Mongo collection (same DB as
+# `flintel_signals`, i.e. MONGODB_DB) and their own MySQL table (same
+# MYSQL_DATABASE). Reddit / Twitter keep using `flintel_signals` untouched.
+_HN_PLATFORMS = ("hackernews", "hackernews_comment")
+HN_MONGO_COLLECTION = os.getenv("HN_MONGO_COLLECTION", "hacker_news_signals").strip() or "hacker_news_signals"
+HN_MYSQL_TABLE = os.getenv("HN_MYSQL_TABLE", "hacker_news").strip() or "hacker_news"
+if not re.fullmatch(r"[A-Za-z0-9_]+", HN_MYSQL_TABLE):  # table name SQL mein jata hai -> safe identifier hi
+    HN_MYSQL_TABLE = "hacker_news"
+
+
+def _is_hn_platform(platform) -> bool:
+    return platform in _HN_PLATFORMS
 
 # How often the worker checks for a new pending job when idle.
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
@@ -454,7 +476,16 @@ def get_database():
             [("created_utc", ASCENDING)], name="signals_created_utc"
         )
 
-        log.info(f"MongoDB (signals) connected | db={MONGODB_DB}")
+        # Hacker News has its own collection in the same DB (same indexes).
+        hn_coll = db[HN_MONGO_COLLECTION]
+        hn_coll.create_index(
+            [("message_id", ASCENDING)], unique=True, name="hn_signals_message_id_unique"
+        )
+        hn_coll.create_index([("topic_key", ASCENDING)], name="hn_signals_topic_key")
+        hn_coll.create_index([("search_keyword", ASCENDING)], name="hn_signals_search_keyword")
+        hn_coll.create_index([("created_utc", ASCENDING)], name="hn_signals_created_utc")
+
+        log.info(f"MongoDB (signals) connected | db={MONGODB_DB} | hn_collection={HN_MONGO_COLLECTION}")
 
         client1 = MongoClient(MONGODB1_URI, serverSelectionTimeoutMS=5000)
         client1.server_info()
@@ -1390,6 +1421,16 @@ def generate_embedding(text: str):
         return None
 
 
+def _hn_coll():
+    """Mongo collection for Hacker News stories (+ their nested hn_comments)."""
+    return db[HN_MONGO_COLLECTION]
+
+
+def _signals_coll(platform=None):
+    """HN platforms -> HN collection; everything else -> flintel_signals (unchanged)."""
+    return db[HN_MONGO_COLLECTION] if _is_hn_platform(platform) else db.flintel_signals
+
+
 def backfill_missing_embeddings():
     """ONE-TIME / ON-DEMAND helper — NOT called automatically anywhere in
     the normal poller/worker startup path. Run it manually when you want
@@ -1437,9 +1478,11 @@ def backfill_missing_embeddings():
 
     log.info("[EMBEDDING-BACKFILL] starting one-time backfill of missing embeddings...")
 
-    while True:
+    # flintel_signals (Reddit/Twitter) AND the Hacker News collection.
+    for coll in (db.flintel_signals, db[HN_MONGO_COLLECTION]):
+      while True:
         batch = list(
-            db.flintel_signals.find(query, {"_id": 1, "text": 1}).limit(EMBEDDING_BACKFILL_BATCH_SIZE)
+            coll.find(query, {"_id": 1, "text": 1}).limit(EMBEDDING_BACKFILL_BATCH_SIZE)
         )
         if not batch:
             break
@@ -1450,7 +1493,7 @@ def backfill_missing_embeddings():
 
             if embedding is not None:
                 try:
-                    db.flintel_signals.update_one(
+                    coll.update_one(
                         {"_id": doc["_id"]},
                         {"$set": {"embedding": embedding}},
                     )
@@ -1521,11 +1564,49 @@ _MYSQL_INSERT_SQL = (
     + ") VALUES (" + ", ".join(["%s"] * len(_MYSQL_COLUMNS)) + ")"
 )
 
+# Hacker News table (HN_MYSQL_TABLE, default `hacker_news`): same columns as
+# flintel_signals minus the Reddit-only ones (`subreddit`, `reddit_comments`),
+# plus `hn_comments` JSON (nested keyword-matched comments of the story).
+_MYSQL_CREATE_HN_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {HN_MYSQL_TABLE} (
+    id               BIGINT        NOT NULL AUTO_INCREMENT,
+    message_id       VARCHAR(191)  NOT NULL,
+    topic_key        VARCHAR(255)  NOT NULL,
+    search_keyword   VARCHAR(255)  NULL,
+    platform         VARCHAR(32)   NOT NULL,
+    username         VARCHAR(255)  NULL,
+    title            MEDIUMTEXT    NULL,
+    text             MEDIUMTEXT    NULL,
+    post_url         VARCHAR(1024) NULL,
+    score            INT           DEFAULT 0,
+    num_comments     INT           DEFAULT 0,
+    created_utc      DATETIME(3)   NOT NULL,
+    fetched_at       DATETIME(3)   NOT NULL,
+    embedding        BLOB          NULL,
+    embedding_dim    SMALLINT      NULL,
+    embedding_model  VARCHAR(64)   NULL,
+    hn_comments      JSON          NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_hn_message_id (message_id),
+    KEY idx_hn_topic_key (topic_key),
+    KEY idx_hn_search_keyword (search_keyword),
+    KEY idx_hn_created_utc (created_utc),
+    KEY idx_hn_fetched_at (fetched_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+# INSERT columns for the HN table (hn_comments stays NULL until a comment matches).
+_MYSQL_COLUMNS_HN = [c for c in _MYSQL_COLUMNS if c not in ("subreddit", "reddit_comments")]
+_MYSQL_INSERT_HN_SQL = (
+    f"INSERT INTO {HN_MYSQL_TABLE} ("
+    + ", ".join(f"`{c}`" for c in _MYSQL_COLUMNS_HN)
+    + ") VALUES (" + ", ".join(["%s"] * len(_MYSQL_COLUMNS_HN)) + ")"
+)
+
 _mysql_local = threading.local()          # one connection PER THREAD
 _mysql_table_ready = False
 _mysql_table_lock = threading.Lock()
-_mysql_hn_col_ready = False               # hn_comments column maujood hai (ya ban gaya)
-_mysql_hn_col_last_try = 0.0              # fail hone par har 60s se zyada retry nahi
+_mysql_hn_table_ready = False             # HN table ban chuka hai (process mein ek baar)
 
 
 # ── Embedding <-> BLOB (float32, little-endian, flat bytes) ──────────────────
@@ -1638,40 +1719,12 @@ def _with_mysql(fn):
     raise last
 
 
-def _ensure_hn_comments_column(conn):
-    """information_schema check ke baad, column na ho to hi ek guarded
-    `ALTER TABLE ... ADD COLUMN hn_comments JSON NULL`. Never DROP, kabhi
-    kisi maujooda column ko nahi chhedta. Duplicate-column (1060) race ko
-    theek maanta hai. Fail par raise karta hai (caller log karta hai)."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'flintel_signals' "
-            "AND COLUMN_NAME = 'hn_comments'"
-        )
-        row = cur.fetchone()
-        if row and row[0]:
-            return
-        try:
-            cur.execute("ALTER TABLE flintel_signals ADD COLUMN hn_comments JSON NULL")
-            log.info("[MYSQL] column flintel_signals.hn_comments added")
-        except Exception as exc:
-            if pymysql is not None and isinstance(exc, pymysql.err.Error) \
-                    and exc.args and exc.args[0] == 1060:
-                return  # kisi aur process ne abhi abhi add kar diya
-            raise
-
-
 def _ensure_mysql_table(conn):
-    """CREATE TABLE IF NOT EXISTS (never DROP). Runs once per process,
-    lazily on first use if startup init didn't manage it. Uske baad (ek
-    baar, guarded) `hn_comments JSON NULL` column add hota hai agar pehle
-    se nahi hai. Column wala step fail ho to sirf warning (table ready
-    rehta hai, reddit/twitter saves par koi asar nahi) aur 60s baad dobara try."""
-    global _mysql_table_ready, _mysql_hn_col_ready, _mysql_hn_col_last_try
-    if _mysql_table_ready and (
-        _mysql_hn_col_ready or time.time() - _mysql_hn_col_last_try < 60
-    ):
+    """CREATE TABLE IF NOT EXISTS flintel_signals (never DROP). Runs once per
+    process, lazily on first use if startup init didn't manage it.
+    (Reddit/Twitter table; Hacker News has its own table, see below.)"""
+    global _mysql_table_ready
+    if _mysql_table_ready:
         return
     with _mysql_table_lock:
         if not _mysql_table_ready:
@@ -1679,13 +1732,24 @@ def _ensure_mysql_table(conn):
                 cur.execute(_MYSQL_CREATE_TABLE_SQL)
             _mysql_table_ready = True
             log.info("[MYSQL] table flintel_signals ready")
-        if not _mysql_hn_col_ready and time.time() - _mysql_hn_col_last_try >= 60:
-            _mysql_hn_col_last_try = time.time()
-            try:
-                _ensure_hn_comments_column(conn)
-                _mysql_hn_col_ready = True
-            except Exception as exc:
-                log.warning(f"[MYSQL] hn_comments column check/add failed (will retry later) | {exc}")
+
+
+def _ensure_hn_mysql_table(conn):
+    """CREATE TABLE IF NOT EXISTS <HN_MYSQL_TABLE> (never DROP), once per process."""
+    global _mysql_hn_table_ready
+    if _mysql_hn_table_ready:
+        return
+    with _mysql_table_lock:
+        if not _mysql_hn_table_ready:
+            with conn.cursor() as cur:
+                cur.execute(_MYSQL_CREATE_HN_TABLE_SQL)
+            _mysql_hn_table_ready = True
+            log.info(f"[MYSQL] table {HN_MYSQL_TABLE} ready")
+
+
+def _ensure_all_mysql_tables(conn):
+    _ensure_mysql_table(conn)
+    _ensure_hn_mysql_table(conn)
 
 
 def init_mysql() -> bool:
@@ -1695,7 +1759,7 @@ def init_mysql() -> bool:
     if not _is_mysql_data_enabled():
         return False
     try:
-        _with_mysql(_ensure_mysql_table)
+        _with_mysql(_ensure_all_mysql_tables)
         log.info(f"[MYSQL] connected | host={MYSQL_HOST} db={MYSQL_DATABASE}")
         return True
     except Exception as exc:
@@ -1759,14 +1823,18 @@ def _build_mysql_row(doc: dict) -> tuple:
     )
 
 
-def _mysql_post_exists(message_id: str) -> bool:
-    """Cheap existence check. On any MySQL failure returns False (the
-    insert attempt will then log the real error)."""
+def _mysql_post_exists(message_id: str, platform=None) -> bool:
+    """Cheap existence check (HN platforms -> HN table, rest -> flintel_signals).
+    On any MySQL failure returns False (the insert attempt will then log the
+    real error)."""
+    hn = _is_hn_platform(platform)
+    table = HN_MYSQL_TABLE if hn else "flintel_signals"
+
     def op(conn):
-        _ensure_mysql_table(conn)
+        (_ensure_hn_mysql_table if hn else _ensure_mysql_table)(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM flintel_signals WHERE message_id=%s LIMIT 1", (message_id,)
+                f"SELECT 1 FROM {table} WHERE message_id=%s LIMIT 1", (message_id,)
             )
             return cur.fetchone() is not None
     try:
@@ -1779,7 +1847,7 @@ def _mysql_post_exists(message_id: str) -> bool:
 def _save_to_mongo(doc: dict) -> bool:
     """True only if a NEW Mongo document was inserted."""
     try:
-        db.flintel_signals.insert_one(doc)
+        _signals_coll(doc.get("platform")).insert_one(doc)
         return True
     except DuplicateKeyError:
         # Already fetched before (possibly for a different topic/keyword
@@ -1794,11 +1862,16 @@ def _save_to_mysql(doc: dict) -> bool:
     """True only if a NEW MySQL row was inserted. Never raises."""
     try:
         row = _build_mysql_row(doc)
+        hn = _is_hn_platform(doc.get("platform"))
+        if hn:  # HN table has no `subreddit` / `reddit_comments` columns
+            keep = set(_MYSQL_COLUMNS_HN)
+            row = tuple(v for c, v in zip(_MYSQL_COLUMNS, row) if c in keep)
+        sql = _MYSQL_INSERT_HN_SQL if hn else _MYSQL_INSERT_SQL
 
         def op(conn):
-            _ensure_mysql_table(conn)
+            (_ensure_hn_mysql_table if hn else _ensure_mysql_table)(conn)
             with conn.cursor() as cur:
-                cur.execute(_MYSQL_INSERT_SQL, row)
+                cur.execute(sql, row)
             return True
 
         return bool(_with_mysql(op))
@@ -1876,6 +1949,8 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         "created_utc":      created_dt,
         "fetched_at":       datetime.now(timezone.utc),
     }
+    if _is_hn_platform(platform):
+        doc.pop("subreddit", None)  # Reddit-only field
     mid = doc["message_id"]
 
     # ── 1. existence checks (cheap, no embedding yet) ──
@@ -1883,7 +1958,7 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
     mongo_embedding = None
     if mongo_on:
         try:
-            found = db.flintel_signals.find_one({"message_id": mid}, {"_id": 1, "embedding": 1})
+            found = _signals_coll(platform).find_one({"message_id": mid}, {"_id": 1, "embedding": 1})
             if found is not None:
                 mongo_exists = True
                 emb = found.get("embedding")
@@ -1892,7 +1967,7 @@ def _save_signal(topic_key: str, matched_keyword: str, platform: str, post: dict
         except Exception as exc:
             log.error(f"[MONGO] existence check failed | message_id={mid} | {exc}")
 
-    mysql_exists = _mysql_post_exists(mid) if mysql_on else False
+    mysql_exists = _mysql_post_exists(mid, platform) if mysql_on else False
 
     need_mongo = mongo_on and not mongo_exists
     need_mysql = mysql_on and not mysql_exists
@@ -2215,7 +2290,7 @@ def _hn_rec_from_mysql(entry):
 def _hn_read_comments_mongo(message_id: str):
     """list of rec (khali ho sakti hai) | None agar story is sink mein nahi / read fail."""
     try:
-        doc = db.flintel_signals.find_one({"message_id": message_id}, {"_id": 1, "hn_comments": 1})
+        doc = _hn_coll().find_one({"message_id": message_id}, {"_id": 1, "hn_comments": 1})
     except Exception as exc:
         log.error(f"[MONGO] hn_comments read failed | message_id={message_id} | {exc}")
         return None
@@ -2231,7 +2306,7 @@ def _hn_append_mongo(message_id: str, rec: dict) -> bool:
     """Atomic: $push SIRF tab jab is comment_id wala entry pehle se na ho
     (absent field par bhi filter match karta hai, $push array bana deta hai)."""
     try:
-        res = db.flintel_signals.update_one(
+        res = _hn_coll().update_one(
             {"message_id": message_id, "hn_comments.comment_id": {"$ne": rec["comment_id"]}},
             {"$push": {"hn_comments": _hn_mongo_entry(rec)}},
         )
@@ -2245,7 +2320,7 @@ def _hn_set_embedding_mongo(message_id: str, comment_id: str, vec) -> bool:
     """Atomic: sirf us entry ka embedding set hota hai jis ka embedding abhi None hai
     (jis mein embedding hai usse kabhi overwrite nahi hota)."""
     try:
-        res = db.flintel_signals.update_one(
+        res = _hn_coll().update_one(
             {"message_id": message_id,
              "hn_comments": {"$elemMatch": {"comment_id": comment_id, "embedding": None}}},
             {"$set": {
@@ -2265,9 +2340,9 @@ def _hn_set_embedding_mongo(message_id: str, comment_id: str, vec) -> bool:
 def _hn_read_comments_mysql(message_id: str):
     """list of rec | None (story is sink mein nahi / read fail)."""
     def op(conn):
-        _ensure_mysql_table(conn)
+        _ensure_hn_mysql_table(conn)
         with conn.cursor() as cur:
-            cur.execute("SELECT hn_comments FROM flintel_signals WHERE message_id=%s", (message_id,))
+            cur.execute(f"SELECT hn_comments FROM {HN_MYSQL_TABLE} WHERE message_id=%s", (message_id,))
             return cur.fetchone()
     try:
         row = _with_mysql(op)
@@ -2283,13 +2358,13 @@ def _hn_mysql_modify(message_id: str, mutate) -> bool:
     """SELECT ... FOR UPDATE -> mutate(list) -> (sirf changed ho to) UPDATE.
     Pattern _attach_comment_to_post_mysql wala. Kabhi raise nahi karta."""
     def op(conn):
-        _ensure_mysql_table(conn)
+        _ensure_hn_mysql_table(conn)
         conn.begin()
         try:
             changed = False
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT hn_comments FROM flintel_signals WHERE message_id=%s FOR UPDATE",
+                    f"SELECT hn_comments FROM {HN_MYSQL_TABLE} WHERE message_id=%s FOR UPDATE",
                     (message_id,),
                 )
                 row = cur.fetchone()
@@ -2297,7 +2372,7 @@ def _hn_mysql_modify(message_id: str, mutate) -> bool:
                     current = _hn_json_list(row[0])
                     if mutate(current):
                         cur.execute(
-                            "UPDATE flintel_signals SET hn_comments=%s WHERE message_id=%s",
+                            f"UPDATE {HN_MYSQL_TABLE} SET hn_comments=%s WHERE message_id=%s",
                             (json.dumps(current, ensure_ascii=False), message_id),
                         )
                         changed = True
@@ -2714,7 +2789,7 @@ def _hn_refresh_targets() -> list:
 
     if mongo_on:
         try:
-            cursor = db.flintel_signals.find(
+            cursor = _hn_coll().find(
                 {"platform": "hackernews", "created_utc": {"$gte": cutoff}},
                 {"message_id": 1, "topic_key": 1, "search_keyword": 1},
             )
@@ -2724,10 +2799,10 @@ def _hn_refresh_targets() -> list:
 
     if mysql_on:
         def op(conn):
-            _ensure_mysql_table(conn)
+            _ensure_hn_mysql_table(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT message_id, topic_key, search_keyword FROM flintel_signals "
+                    f"SELECT message_id, topic_key, search_keyword FROM {HN_MYSQL_TABLE} "
                     "WHERE platform=%s AND created_utc>=%s",
                     ("hackernews", _to_utc_naive(cutoff)),
                 )
