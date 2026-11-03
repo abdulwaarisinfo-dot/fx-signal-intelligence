@@ -3523,7 +3523,7 @@ if __name__ == "__main__":
     log.info(f"  MySQL signals save : {'ENABLED' if _is_mysql_data_enabled() else 'DISABLED'} (MYSQL_DATA) | host={MYSQL_HOST or '-'} db={MYSQL_DATABASE or '-'}")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
     log.info("  Scoring           : NONE — raw messages only")
-    log.info("  Slack / HubSpot   : REMOVED")
+    log.info("  Slack / HubSpot   : REMOVED") 
     log.info("  Batching          : REMOVED — fetch and save immediately")
     log.info(f"  Worker concurrency: {WORKER_CONCURRENCY} parallel jobs (Twitter + job status) — a new search never waits on another")
     log.info(f"  MongoDB (signals) : {MONGODB_DB}")
