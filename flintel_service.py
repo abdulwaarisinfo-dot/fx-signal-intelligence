@@ -1037,12 +1037,15 @@ def _fetch_reddit_rapidapi_entries() -> list:
                 break
             time.sleep(REDDIT_RAPI_PAGE_GAP_SECONDS)
 
-        if do_backfill and first_page_ok:
+        if do_backfill and first_page_ok and entries:
             # keep ONLY the last N hours (the last page usually overshoots a bit)
             entries = [e for e in entries
                        if e.get("created_utc") is None or e["created_utc"] >= oldest_allowed]
-            _rapi_backfill_done = True
+            _rapi_backfill_done = True   # only after REAL posts came back; an empty page retries next cycle
             log.info(f"[REDDIT-API] {int(REDDIT_RAPI_BACKFILL_HOURS)}h backfill done | pages:{pages_done} | entries:{len(entries)}")
+        elif do_backfill and first_page_ok:
+            log.warning("[REDDIT-API] backfill: page 1 returned 0 posts — NOT marked done, will retry next cycle "
+                        "(check the 'sample of raw response' log line / your RapidAPI quota & subscription)")
         log.info(f"[REDDIT-API] cycle ok | entries:{len(entries)}")
     except Exception as exc:
         log.warning(f"[REDDIT-API] fetch failed: {exc}")
@@ -3523,7 +3526,7 @@ if __name__ == "__main__":
     log.info(f"  MySQL signals save : {'ENABLED' if _is_mysql_data_enabled() else 'DISABLED'} (MYSQL_DATA) | host={MYSQL_HOST or '-'} db={MYSQL_DATABASE or '-'}")
     log.info(f"  Lookback window   : {LOOKBACK_DAYS} days (mostly no-op on a live RSS feed)")
     log.info("  Scoring           : NONE — raw messages only")
-    log.info("  Slack / HubSpot   : REMOVED") 
+    log.info("  Slack / HubSpot   : REMOVED")
     log.info("  Batching          : REMOVED — fetch and save immediately")
     log.info(f"  Worker concurrency: {WORKER_CONCURRENCY} parallel jobs (Twitter + job status) — a new search never waits on another")
     log.info(f"  MongoDB (signals) : {MONGODB_DB}")
