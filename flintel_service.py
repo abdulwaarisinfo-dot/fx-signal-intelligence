@@ -802,6 +802,39 @@ REDDIT_RAPIDAPI_DEBUG = os.getenv("REDDIT_API_DEBUG", "false").strip().lower() i
 _rapi_blocked_until = 0.0
 _rapi_sample_logged = False
 
+# ── One-time 48h BACKFILL (rapidapi mode only) ───────────────────────────────
+# On the FIRST successful cycle after startup, the poller pages backwards
+# through the reddit34 feed until it reaches posts older than
+# REDDIT_API_BACKFILL_HOURS (default 48) or REDDIT_API_BACKFILL_MAX_PAGES is hit,
+# so roughly the last 48 hours get matched/embedded/saved. After that every
+# cycle is ONE call again (unchanged). Dedupe in _save_signal() means re-seen
+# posts never cost a second embedding. Pagination needs a cursor in the API
+# response; if the API returns none, the backfill simply stops after page 1.
+# Set REDDIT_API_BACKFILL_HOURS=0 to disable the backfill completely.
+REDDIT_RAPI_BACKFILL_HOURS = float(os.getenv("REDDIT_API_BACKFILL_HOURS", "48"))
+REDDIT_RAPI_BACKFILL_MAX_PAGES = int(os.getenv("REDDIT_API_BACKFILL_MAX_PAGES", "10"))
+REDDIT_RAPI_CURSOR_PARAM = os.getenv("REDDIT_API_CURSOR_PARAM", "cursor").strip() or "cursor"
+REDDIT_RAPI_PAGE_GAP_SECONDS = float(os.getenv("REDDIT_API_PAGE_GAP_SECONDS", "2"))
+_rapi_backfill_done = False
+_RAPI_CURSOR_KEYS = ["nextCursor", "next_cursor", "cursor", "after", "next", "nextPage", "next_page"]
+
+
+def _rapi_find_cursor(data):
+    """Next-page cursor/token from a reddit34 response (top level or one level
+    into 'data'/'meta'/'pagination'); None if there isn't one."""
+    if not isinstance(data, dict):
+        return None
+    holders = [data]
+    for k in ("data", "meta", "pagination", "paging"):
+        if isinstance(data.get(k), dict):
+            holders.append(data[k])
+    for h in holders:
+        for k in _RAPI_CURSOR_KEYS:
+            v = h.get(k)
+            if isinstance(v, (str, int)) and str(v).strip() and str(v).strip().lower() not in ("none", "null", "false", "0"):
+                return str(v).strip()
+    return None
+
 _RAPI_LIST_KEYS = ["posts", "children", "data", "results", "items", "response", "hits"]
 _RAPI_TITLE_KEYS = ["title", "postTitle", "post_title"]
 
@@ -927,9 +960,10 @@ def _rapi_post_to_entry(post: dict):
 
 
 def _fetch_reddit_rapidapi_entries() -> list:
-    """ONE RapidAPI call per cycle. Never raises; a failure just means zero
+    """ONE RapidAPI call per cycle (plus a one-time multi-page 48h backfill on
+    the first successful cycle). Never raises; a failure just means zero
     entries this cycle (the poller carries on)."""
-    global _rapi_blocked_until, _rapi_sample_logged
+    global _rapi_blocked_until, _rapi_sample_logged, _rapi_backfill_done
     entries = []
     if not REDDIT_RAPIDAPI_KEY:
         log.warning("[REDDIT-API] REDDIT_SOURCE=rapidapi but REDDIT_API_KEY is not set — nothing fetched.")
@@ -937,36 +971,79 @@ def _fetch_reddit_rapidapi_entries() -> list:
     if time.time() < _rapi_blocked_until:
         log.info(f"[REDDIT-API] cooling down {int(_rapi_blocked_until - time.time())}s")
         return entries
+
+    do_backfill = (not _rapi_backfill_done) and REDDIT_RAPI_BACKFILL_HOURS > 0
+    max_pages = max(1, REDDIT_RAPI_BACKFILL_MAX_PAGES) if do_backfill else 1
+    oldest_allowed = time.time() - REDDIT_RAPI_BACKFILL_HOURS * 3600.0
+    seen = set()
+    cursor = None
+    pages_done = 0
+    first_page_ok = False
+
     try:
-        r = requests.get(
-            f"https://{REDDIT_RAPIDAPI_HOST}{REDDIT_RAPIDAPI_ENDPOINT}",
-            headers={"x-rapidapi-key": REDDIT_RAPIDAPI_KEY, "x-rapidapi-host": REDDIT_RAPIDAPI_HOST},
-            params={"sort": REDDIT_RAPIDAPI_SORT},
-            timeout=REDDIT_RAPIDAPI_TIMEOUT,
-        )
-        if r.status_code != 200:
-            if r.status_code in (429, 403, 401):
-                _rapi_blocked_until = time.time() + 300   # quota / subscription problem — pause 5 min
-            log.warning(f"[REDDIT-API] HTTP {r.status_code} | {r.text[:200]!r}")
-            return entries
-        try:
-            data = r.json()
-        except ValueError:
-            log.warning(f"[REDDIT-API] non-JSON response | {r.text[:200]!r}")
-            return entries
+        for page in range(1, max_pages + 1):
+            params = {"sort": REDDIT_RAPIDAPI_SORT}
+            if cursor:
+                params[REDDIT_RAPI_CURSOR_PARAM] = cursor
+            r = requests.get(
+                f"https://{REDDIT_RAPIDAPI_HOST}{REDDIT_RAPIDAPI_ENDPOINT}",
+                headers={"x-rapidapi-key": REDDIT_RAPIDAPI_KEY, "x-rapidapi-host": REDDIT_RAPIDAPI_HOST},
+                params=params,
+                timeout=REDDIT_RAPIDAPI_TIMEOUT,
+            )
+            if r.status_code != 200:
+                if r.status_code in (429, 403, 401):
+                    _rapi_blocked_until = time.time() + 300   # quota / subscription problem — pause 5 min
+                log.warning(f"[REDDIT-API] HTTP {r.status_code} | {r.text[:200]!r}")
+                break
+            try:
+                data = r.json()
+            except ValueError:
+                log.warning(f"[REDDIT-API] non-JSON response | {r.text[:200]!r}")
+                break
 
-        posts = _rapi_find_posts(data)
-        seen = set()
-        for post in posts:
-            e = _rapi_post_to_entry(post)
-            if e and e["id"] not in seen:
-                seen.add(e["id"])
-                entries.append(e)
+            posts = _rapi_find_posts(data)
+            page_new = 0
+            page_oldest = None
+            for post in posts:
+                e = _rapi_post_to_entry(post)
+                if e and e["id"] not in seen:
+                    seen.add(e["id"])
+                    entries.append(e)
+                    page_new += 1
+                    c = e.get("created_utc")
+                    if c is not None and (page_oldest is None or c < page_oldest):
+                        page_oldest = c
+            pages_done = page
+            first_page_ok = True
 
-        if (REDDIT_RAPIDAPI_DEBUG or not entries) and not _rapi_sample_logged:
-            _rapi_sample_logged = True
-            log.info(f"[REDDIT-API] sample of raw response (for format check): {json.dumps(data)[:600]}")
-        log.info(f"[REDDIT-API] call ok | posts_in_response:{len(posts)} | entries:{len(entries)}")
+            if (REDDIT_RAPIDAPI_DEBUG or not entries) and not _rapi_sample_logged:
+                _rapi_sample_logged = True
+                log.info(f"[REDDIT-API] sample of raw response (for format check): {json.dumps(data)[:600]}")
+            log.info(f"[REDDIT-API] call ok | page:{page} | posts_in_response:{len(posts)} | new_entries:{page_new}")
+
+            if not do_backfill:
+                break
+            # Backfill stop conditions: reached 48h-old posts, nothing new, or no next page.
+            if page_oldest is not None and page_oldest < oldest_allowed:
+                break
+            if page_new == 0:
+                break
+            cursor = _rapi_find_cursor(data)
+            if not cursor:
+                if page == 1:
+                    log.info("[REDDIT-API] backfill: no next-page cursor in response — page 1 only "
+                             "(set REDDIT_API_CURSOR_PARAM if the API uses a different name)")
+                break
+            time.sleep(REDDIT_RAPI_PAGE_GAP_SECONDS)
+
+        if do_backfill and first_page_ok:
+            # keep ONLY the last N hours (the last page usually overshoots a bit)
+            entries = [e for e in entries
+                       if e.get("created_utc") is None or e["created_utc"] >= oldest_allowed]
+            _rapi_backfill_done = True
+            log.info(f"[REDDIT-API] {int(REDDIT_RAPI_BACKFILL_HOURS)}h backfill done | pages:{pages_done} | entries:{len(entries)}")
+        log.info(f"[REDDIT-API] cycle ok | entries:{len(entries)}")
     except Exception as exc:
         log.warning(f"[REDDIT-API] fetch failed: {exc}")
     return entries
