@@ -48,6 +48,11 @@ services:
         value: rapidapi
       - key: REDDIT_API_KEY
         sync: false
+      # getPopularPosts?sort=new returns "data not found" now; this endpoint works
+      - key: REDDIT_API_ENDPOINT
+        value: getBestPopularPosts
+      - key: REDDIT_API_SORT
+        value: none
       # one-time backfill of the last N hours on startup (0 = off)
       - key: REDDIT_API_BACKFILL_HOURS
         value: "48"
