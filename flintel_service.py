@@ -192,6 +192,7 @@ import array
 import base64
 import logging
 import threading
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -797,6 +798,10 @@ REDDIT_RAPIDAPI_KEY = os.getenv("REDDIT_API_KEY", "").strip()
 REDDIT_RAPIDAPI_HOST = os.getenv("REDDIT_API_HOST", "reddit34.p.rapidapi.com").strip()
 REDDIT_RAPIDAPI_ENDPOINT = "/" + os.getenv("REDDIT_API_ENDPOINT", "getPopularPosts").strip().lstrip("/")
 REDDIT_RAPIDAPI_SORT = os.getenv("REDDIT_API_SORT", "new").strip()
+# Some reddit34 endpoints (getBestPopularPosts / getTopPopularPosts) take NO sort
+# parameter: set REDDIT_API_SORT=none to omit it. Any other query params for the
+# endpoint go in REDDIT_API_EXTRA_PARAMS as "key=value&key2=value2" (e.g. time=day).
+REDDIT_RAPIDAPI_EXTRA_PARAMS = os.getenv("REDDIT_API_EXTRA_PARAMS", "").strip()
 REDDIT_RAPIDAPI_TIMEOUT = int(os.getenv("REDDIT_API_TIMEOUT_SECONDS", "30"))
 REDDIT_RAPIDAPI_DEBUG = os.getenv("REDDIT_API_DEBUG", "false").strip().lower() in ("1", "true", "yes", "on")
 _rapi_blocked_until = 0.0
@@ -982,7 +987,11 @@ def _fetch_reddit_rapidapi_entries() -> list:
 
     try:
         for page in range(1, max_pages + 1):
-            params = {"sort": REDDIT_RAPIDAPI_SORT}
+            params = {}
+            if REDDIT_RAPIDAPI_SORT and REDDIT_RAPIDAPI_SORT.lower() not in ("none", "off", "-"):
+                params["sort"] = REDDIT_RAPIDAPI_SORT
+            if REDDIT_RAPIDAPI_EXTRA_PARAMS:
+                params.update(dict(urllib.parse.parse_qsl(REDDIT_RAPIDAPI_EXTRA_PARAMS)))
             if cursor:
                 params[REDDIT_RAPI_CURSOR_PARAM] = cursor
             r = requests.get(
