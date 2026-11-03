@@ -41,11 +41,16 @@ services:
       - key: EMBEDDING_MODEL
         value: text-embedding-3-small
 
-      # ── Reddit (RSS, free) ────────────────────
+      # ── Reddit (RapidAPI reddit34) ────────────
       - key: REDDIT_ENABLED
         value: "true"
       - key: REDDIT_SOURCE
-        value: rss
+        value: rapidapi
+      - key: REDDIT_API_KEY
+        sync: false
+      # one-time backfill of the last N hours on startup (0 = off)
+      - key: REDDIT_API_BACKFILL_HOURS
+        value: "48"
       - key: REDDIT_POLL_INTERVAL_SECONDS
         value: "30"
       - key: REDDIT_USER_AGENT
